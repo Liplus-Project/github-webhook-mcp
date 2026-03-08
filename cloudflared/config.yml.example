@@ -1,0 +1,19 @@
+# Cloudflare Tunnel config example
+# Copy to ~/.cloudflared/config.yml and fill in your values.
+#
+# Setup steps:
+#   1. cloudflared tunnel login
+#   2. cloudflared tunnel create github-webhook-mcp
+#   3. Copy the tunnel ID below
+#   4. Add a CNAME record in Cloudflare DNS:
+#        Name: webhook.yourdomain.com
+#        Target: <tunnel-id>.cfargotunnel.com
+#   5. cloudflared tunnel run (or: cloudflared service install)
+
+tunnel: <your-tunnel-id>
+credentials-file: /path/to/.cloudflared/<your-tunnel-id>.json
+
+ingress:
+  - hostname: webhook.yourdomain.com
+    service: http://localhost:8080
+  - service: http_status:404
