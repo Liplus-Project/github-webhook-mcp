@@ -13,6 +13,9 @@ import hmac
 import json
 import os
 import uuid
+
+from dotenv import load_dotenv
+load_dotenv()
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
