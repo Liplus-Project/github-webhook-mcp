@@ -1,0 +1,55 @@
+{
+  "manifest_version": "0.3",
+  "name": "github-webhook-mcp",
+  "version": "0.2.0",
+  "description": "Browse pending GitHub webhook events. Pairs with a webhook receiver that writes events.json.",
+  "author": {
+    "name": "Liplus Project"
+  },
+  "license": "MIT",
+  "server": {
+    "type": "node",
+    "entry_point": "server/index.js",
+    "mcp_config": {
+      "command": "node",
+      "args": ["${__dirname}/server/index.js"],
+      "env": {
+        "EVENTS_JSON_PATH": "${user_config.events_json_path}"
+      }
+    }
+  },
+  "user_config": [
+    {
+      "id": "events_json_path",
+      "name": "Events JSON Path",
+      "description": "Absolute path to the events.json file written by the webhook receiver.",
+      "type": "string",
+      "required": true
+    }
+  ],
+  "tools": [
+    {
+      "name": "get_pending_status",
+      "description": "Get a lightweight snapshot of pending GitHub webhook events."
+    },
+    {
+      "name": "list_pending_events",
+      "description": "List lightweight summaries for pending GitHub webhook events."
+    },
+    {
+      "name": "get_event",
+      "description": "Get the full payload for a single webhook event by ID."
+    },
+    {
+      "name": "get_webhook_events",
+      "description": "Get pending (unprocessed) GitHub webhook events with full payloads."
+    },
+    {
+      "name": "mark_processed",
+      "description": "Mark a webhook event as processed so it won't appear again."
+    }
+  ],
+  "compatibility": {
+    "platforms": ["windows", "macos", "linux"]
+  }
+}

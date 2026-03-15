@@ -1,0 +1,40 @@
+{
+  "name": "github-webhook-mcp",
+  "version": "0.2.0",
+  "description": "MCP server for browsing GitHub webhook events",
+  "type": "module",
+  "bin": {
+    "github-webhook-mcp": "./server/index.js"
+  },
+  "main": "./server/index.js",
+  "files": [
+    "server/",
+    "manifest.json"
+  ],
+  "scripts": {
+    "start": "node server/index.js",
+    "test": "node --test test/",
+    "pack:mcpb": "mcpb pack"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "iconv-lite": "^0.6.3",
+    "zod": "^3.22.0"
+  },
+  "devDependencies": {
+    "@anthropic-ai/mcpb": "^2.1.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": [
+    "mcp",
+    "github",
+    "webhook"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Liplus-Project/github-webhook-mcp.git"
+  }
+}
