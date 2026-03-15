@@ -12,18 +12,27 @@ import hashlib
 import hmac
 import json
 import os
+import shlex
+import sys
 import uuid
 from collections import Counter
+from contextlib import asynccontextmanager
 
-from dotenv import load_dotenv
+try:
+    from dotenv import load_dotenv
+except ModuleNotFoundError:
+    def load_dotenv() -> bool:
+        return False
 load_dotenv()
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 DATA_FILE = Path(__file__).parent / "events.json"
+TRIGGER_EVENTS_DIR = Path(__file__).parent / "trigger-events"
 PRIMARY_ENCODING = "utf-8"
 LEGACY_ENCODINGS = ("utf-8-sig", "cp932", "shift_jis")
+NOTIFY_ONLY_EXIT_CODE = 86
 NOTIFICATION_EVENT_ACTIONS = {
     "issues": {"assigned", "closed", "opened", "reopened", "unassigned"},
     "issue_comment": {"created"},
@@ -87,6 +96,15 @@ def add_event(event_type: str, payload: dict) -> dict:
 def get_pending() -> list[dict]:
     return [e for e in _load() if not e["processed"]]
 
+def update_event(event_id: str, **updates: Any) -> bool:
+    events = _load()
+    for event in events:
+        if event["id"] == event_id:
+            event.update(updates)
+            _save(events)
+            return True
+    return False
+
 def _normalize_event_profile(profile: str) -> str:
     normalized = (profile or "all").strip().lower()
     if normalized not in {"all", "notifications"}:
@@ -136,6 +154,8 @@ def summarize_event(event: dict) -> dict:
         "type": event["type"],
         "received_at": event["received_at"],
         "processed": event["processed"],
+        "trigger_status": event.get("trigger_status"),
+        "last_triggered_at": event.get("last_triggered_at"),
         "action": payload.get("action"),
         "repo": (payload.get("repository") or {}).get("full_name"),
         "sender": (payload.get("sender") or {}).get("login"),
@@ -165,23 +185,213 @@ def get_event(event_id: str) -> dict | None:
     return None
 
 def mark_done(event_id: str) -> bool:
-    events = _load()
-    for e in events:
-        if e["id"] == event_id:
-            e["processed"] = True
-            _save(events)
-            return True
-    return False
+    return update_event(event_id, processed=True)
+
+
+# ── Direct Trigger Execution ───────────────────────────────────────────────────
+
+def parse_trigger_command(command: str) -> list[str]:
+    raw = (command or "").strip()
+    if not raw:
+        return []
+    windows_style = os.name == "nt" or ":\\" in raw or raw.startswith("\\\\")
+    return shlex.split(raw, posix=not windows_style)
+
+def resolve_trigger_command(
+    env_command: str,
+    cli_tokens: list[str] | None,
+) -> list[str]:
+    if not cli_tokens:
+        return parse_trigger_command(env_command)
+    if len(cli_tokens) == 1:
+        return parse_trigger_command(cli_tokens[0])
+    return cli_tokens
+
+def persist_trigger_event(event: dict) -> Path:
+    TRIGGER_EVENTS_DIR.mkdir(parents=True, exist_ok=True)
+    event_path = TRIGGER_EVENTS_DIR / f"{event['id']}.json"
+    event_path.write_text(
+        json.dumps(event, ensure_ascii=False, indent=2),
+        encoding=PRIMARY_ENCODING,
+    )
+    return event_path
+
+def _stringify_env(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value)
+
+def build_trigger_env(event: dict, event_path: Path) -> dict[str, str]:
+    payload = event.get("payload", {})
+    env = os.environ.copy()
+    env.update(
+        {
+            "GITHUB_WEBHOOK_EVENT_ID": event["id"],
+            "GITHUB_WEBHOOK_EVENT_TYPE": event["type"],
+            "GITHUB_WEBHOOK_EVENT_ACTION": _stringify_env(payload.get("action")),
+            "GITHUB_WEBHOOK_EVENT_REPO": _stringify_env(
+                (payload.get("repository") or {}).get("full_name")
+            ),
+            "GITHUB_WEBHOOK_EVENT_SENDER": _stringify_env(
+                (payload.get("sender") or {}).get("login")
+            ),
+            "GITHUB_WEBHOOK_EVENT_NUMBER": _stringify_env(_event_number(payload)),
+            "GITHUB_WEBHOOK_EVENT_TITLE": _stringify_env(_event_title(payload)),
+            "GITHUB_WEBHOOK_EVENT_URL": _stringify_env(_event_url(payload)),
+            "GITHUB_WEBHOOK_EVENT_PATH": str(event_path),
+            "GITHUB_WEBHOOK_RECEIVED_AT": event["received_at"],
+        }
+    )
+    return env
+
+def _summarize_process_output(stdout: bytes, stderr: bytes) -> str:
+    parts: list[str] = []
+    if stdout:
+        parts.append(f"stdout={stdout.decode(PRIMARY_ENCODING, errors='replace').strip()[:400]}")
+    if stderr:
+        parts.append(f"stderr={stderr.decode(PRIMARY_ENCODING, errors='replace').strip()[:400]}")
+    return " ".join(part for part in parts if part).strip()
+
+async def run_trigger_command(
+    command: list[str],
+    event: dict,
+    cwd: Path | None = None,
+) -> None:
+    if not command:
+        return
+    event_path = persist_trigger_event(event)
+    proc = await asyncio.create_subprocess_exec(
+        *command,
+        cwd=str(cwd) if cwd else None,
+        env=build_trigger_env(event, event_path),
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    payload_bytes = json.dumps(event, ensure_ascii=False, indent=2).encode(PRIMARY_ENCODING)
+    stdout, stderr = await proc.communicate(payload_bytes)
+    if proc.returncode != 0:
+        if proc.returncode == NOTIFY_ONLY_EXIT_CODE:
+            raise TriggerSkipped("trigger command requested notify-only fallback")
+        details = _summarize_process_output(stdout, stderr)
+        raise RuntimeError(
+            f"trigger command failed with exit code {proc.returncode}"
+            + (f" ({details})" if details else "")
+        )
+
+
+TriggerRunner = Callable[[list[str], dict, Path | None], Awaitable[None]]
+
+
+class TriggerSkipped(Exception):
+    """A trigger command chose not to handle the event directly."""
+
+
+class TriggerDispatcher:
+    def __init__(
+        self,
+        command: list[str],
+        *,
+        cwd: Path | None = None,
+        mark_processed_on_success: bool = True,
+        runner: TriggerRunner = run_trigger_command,
+    ) -> None:
+        self.command = command
+        self.cwd = cwd
+        self.mark_processed_on_success = mark_processed_on_success
+        self.runner = runner
+        self._queue: asyncio.Queue[dict | None] = asyncio.Queue()
+        self._worker_task: asyncio.Task[None] | None = None
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.command)
+
+    async def start(self) -> None:
+        if self.enabled and self._worker_task is None:
+            self._worker_task = asyncio.create_task(self._worker())
+
+    async def stop(self) -> None:
+        if self._worker_task is None:
+            return
+        await self._queue.put(None)
+        await self._worker_task
+        self._worker_task = None
+
+    async def enqueue(self, event: dict) -> None:
+        if not self.enabled:
+            return
+        await self._queue.put(event)
+
+    async def _worker(self) -> None:
+        while True:
+            event = await self._queue.get()
+            if event is None:
+                self._queue.task_done()
+                return
+            try:
+                await self.runner(self.command, event, self.cwd)
+            except TriggerSkipped as exc:
+                update_event(
+                    event["id"],
+                    trigger_status="skipped",
+                    trigger_error=str(exc),
+                    last_triggered_at=datetime.now(timezone.utc).isoformat(),
+                )
+            except Exception as exc:
+                update_event(
+                    event["id"],
+                    trigger_status="failed",
+                    trigger_error=str(exc),
+                    last_triggered_at=datetime.now(timezone.utc).isoformat(),
+                )
+                print(
+                    f"[github-webhook-mcp] trigger failed for {event['id']}: {exc}",
+                    file=sys.stderr,
+                )
+            else:
+                updates: dict[str, Any] = {
+                    "trigger_status": "succeeded",
+                    "trigger_error": "",
+                    "last_triggered_at": datetime.now(timezone.utc).isoformat(),
+                }
+                if self.mark_processed_on_success:
+                    updates["processed"] = True
+                update_event(event["id"], **updates)
+            finally:
+                self._queue.task_done()
 
 
 # ── Webhook Server (FastAPI) ──────────────────────────────────────────────────
 
-def run_webhook(port: int, secret: str, event_profile: str) -> None:
+def run_webhook(
+    port: int,
+    secret: str,
+    event_profile: str,
+    *,
+    trigger_command: list[str] | None = None,
+    trigger_cwd: Path | None = None,
+    mark_processed_on_trigger_success: bool = True,
+) -> None:
     from fastapi import FastAPI, Header, HTTPException, Request
     import uvicorn
 
-    app = FastAPI(title="github-webhook-mcp")
     normalized_profile = _normalize_event_profile(event_profile)
+    dispatcher = TriggerDispatcher(
+        trigger_command or [],
+        cwd=trigger_cwd,
+        mark_processed_on_success=mark_processed_on_trigger_success,
+    )
+
+    @asynccontextmanager
+    async def lifespan(_: Any):
+        await dispatcher.start()
+        try:
+            yield
+        finally:
+            await dispatcher.stop()
+
+    app = FastAPI(title="github-webhook-mcp", lifespan=lifespan)
 
     def _verify(body: bytes, sig: str) -> bool:
         if not secret:
@@ -208,6 +418,7 @@ def run_webhook(port: int, secret: str, event_profile: str) -> None:
         if not should_store_event(x_github_event, payload, normalized_profile):
             return {"ignored": True, "type": x_github_event, "profile": normalized_profile}
         event = add_event(x_github_event, payload)
+        await dispatcher.enqueue(event)
         return {"id": event["id"], "type": x_github_event}
 
     uvicorn.run(app, host="0.0.0.0", port=port)
@@ -371,12 +582,43 @@ if __name__ == "__main__":
         default=os.environ.get("WEBHOOK_EVENT_PROFILE", "all"),
         choices=["all", "notifications"],
     )
+    wp.add_argument(
+        "--trigger-command",
+        nargs=argparse.REMAINDER,
+        help=(
+            "Optional command to run for each stored event. "
+            "When provided on the CLI, put it last and pass the command tokens "
+            "after --trigger-command. "
+            "The event JSON is sent to stdin and metadata is provided via "
+            "GITHUB_WEBHOOK_* environment variables."
+        ),
+    )
+    wp.add_argument(
+        "--trigger-cwd",
+        default=os.environ.get("WEBHOOK_TRIGGER_CWD", ""),
+        help="Optional working directory for the trigger command.",
+    )
+    wp.add_argument(
+        "--keep-pending-on-trigger-success",
+        action="store_true",
+        help="Leave events pending even when the trigger command exits successfully.",
+    )
 
     sub.add_parser("mcp", help="Start MCP server (stdio transport)")
 
     args = parser.parse_args()
 
     if args.mode == "webhook":
-        run_webhook(port=args.port, secret=args.secret, event_profile=args.event_profile)
+        run_webhook(
+            port=args.port,
+            secret=args.secret,
+            event_profile=args.event_profile,
+            trigger_command=resolve_trigger_command(
+                os.environ.get("WEBHOOK_TRIGGER_COMMAND", ""),
+                args.trigger_command,
+            ),
+            trigger_cwd=Path(args.trigger_cwd).expanduser() if args.trigger_cwd else None,
+            mark_processed_on_trigger_success=not args.keep_pending_on_trigger_success,
+        )
     elif args.mode == "mcp":
         asyncio.run(run_mcp())
