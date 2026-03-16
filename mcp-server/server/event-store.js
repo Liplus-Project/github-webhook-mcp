@@ -7,7 +7,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const DEFAULT_DATA_FILE = resolve(__dirname, "..", "..", "events.json");
 const PRIMARY_ENCODING = "utf-8";
 const LEGACY_ENCODINGS = ["utf-8", "cp932", "shift_jis"];
-const DEFAULT_PURGE_DAYS = 7;
+const DEFAULT_PURGE_DAYS = 1;
 
 function purgeDays() {
   const env = process.env.PURGE_AFTER_DAYS;

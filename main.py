@@ -33,7 +33,7 @@ TRIGGER_EVENTS_DIR = Path(__file__).parent / "trigger-events"
 PRIMARY_ENCODING = "utf-8"
 LEGACY_ENCODINGS = ("utf-8-sig", "cp932", "shift_jis")
 NOTIFY_ONLY_EXIT_CODE = 86
-DEFAULT_PURGE_DAYS = 7
+DEFAULT_PURGE_DAYS = 1
 NOTIFICATION_EVENT_ACTIONS = {
     "issues": {"assigned", "closed", "opened", "reopened", "unassigned"},
     "issue_comment": {"created"},
