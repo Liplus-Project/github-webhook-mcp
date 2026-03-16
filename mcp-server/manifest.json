@@ -1,7 +1,7 @@
 {
   "manifest_version": "0.3",
   "name": "github-webhook-mcp",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Browse pending GitHub webhook events. Pairs with a webhook receiver that writes events.json.",
   "author": {
     "name": "Liplus Project"
@@ -12,21 +12,22 @@
     "entry_point": "server/index.js",
     "mcp_config": {
       "command": "node",
-      "args": ["${__dirname}/server/index.js"],
+      "args": [
+        "${__dirname}/server/index.js"
+      ],
       "env": {
         "EVENTS_JSON_PATH": "${user_config.events_json_path}"
       }
     }
   },
-  "user_config": [
-    {
-      "id": "events_json_path",
-      "name": "Events JSON Path",
+  "user_config": {
+    "events_json_path": {
       "description": "Absolute path to the events.json file written by the webhook receiver.",
       "type": "string",
-      "required": true
+      "required": true,
+      "title": "Events JSON Path"
     }
-  ],
+  },
   "tools": [
     {
       "name": "get_pending_status",
@@ -50,6 +51,10 @@
     }
   ],
   "compatibility": {
-    "platforms": ["windows", "macos", "linux"]
+    "platforms": [
+      "win32",
+      "darwin",
+      "linux"
+    ]
   }
 }

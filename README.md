@@ -75,7 +75,44 @@ If your webhook is temporarily set to `Send me everything`, start the receiver w
 
 ### 6. Configure MCP server
 
-Add to your Claude MCP config:
+#### Option A: Claude Desktop — Desktop Extension (.mcpb)
+
+Download `mcp-server.mcpb` from [Releases](https://github.com/Liplus-Project/github-webhook-mcp/releases), then:
+
+1. Open Claude Desktop → **Settings** → **Extensions** → **Advanced settings** → **Install Extension...**
+2. Select the `.mcpb` file
+3. Enter the path to your `events.json` when prompted
+
+#### Option B: Claude Desktop / Claude Code — npx
+
+Add to your Claude MCP config (`claude_desktop_config.json` or project settings):
+
+```json
+{
+  "mcpServers": {
+    "github-webhook-mcp": {
+      "command": "npx",
+      "args": ["github-webhook-mcp"],
+      "env": {
+        "EVENTS_JSON_PATH": "/path/to/events.json"
+      }
+    }
+  }
+}
+```
+
+#### Option C: Codex — config.toml
+
+```toml
+[mcp.github-webhook-mcp]
+command = "npx"
+args = ["github-webhook-mcp"]
+
+[mcp.github-webhook-mcp.env]
+EVENTS_JSON_PATH = "/path/to/events.json"
+```
+
+#### Option D: Python (legacy)
 
 ```json
 {
