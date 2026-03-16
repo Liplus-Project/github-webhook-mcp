@@ -92,10 +92,10 @@ server.tool(
     event_id: z.string().describe("The event ID to mark as processed"),
   },
   async ({ event_id }) => {
-    const success = markDone(event_id);
+    const result = markDone(event_id);
     return {
       content: [
-        { type: "text", text: JSON.stringify({ success, event_id }) },
+        { type: "text", text: JSON.stringify({ success: result.success, event_id, purged: result.purged }) },
       ],
     };
   }

@@ -33,6 +33,7 @@ TRIGGER_EVENTS_DIR = Path(__file__).parent / "trigger-events"
 PRIMARY_ENCODING = "utf-8"
 LEGACY_ENCODINGS = ("utf-8-sig", "cp932", "shift_jis")
 NOTIFY_ONLY_EXIT_CODE = 86
+DEFAULT_PURGE_DAYS = 7
 NOTIFICATION_EVENT_ACTIONS = {
     "issues": {"assigned", "closed", "opened", "reopened", "unassigned"},
     "issue_comment": {"created"},
@@ -104,6 +105,37 @@ def update_event(event_id: str, **updates: Any) -> bool:
             _save(events)
             return True
     return False
+
+def _purge_days() -> int:
+    env = os.environ.get("PURGE_AFTER_DAYS")
+    if env is not None:
+        try:
+            n = int(env)
+            if n >= 0:
+                return n
+        except ValueError:
+            pass
+    return DEFAULT_PURGE_DAYS
+
+def purge_processed(events: list[dict]) -> tuple[list[dict], int]:
+    days = _purge_days()
+    if days < 0:
+        return events, 0
+    cutoff = datetime.now(timezone.utc).timestamp() - days * 86400
+    before = len(events)
+    kept = []
+    for e in events:
+        if not e.get("processed"):
+            kept.append(e)
+            continue
+        try:
+            ts = datetime.fromisoformat(e["received_at"]).timestamp()
+        except (KeyError, ValueError):
+            kept.append(e)
+            continue
+        if ts > cutoff:
+            kept.append(e)
+    return kept, before - len(kept)
 
 def _normalize_event_profile(profile: str) -> str:
     normalized = (profile or "all").strip().lower()
@@ -184,8 +216,19 @@ def get_event(event_id: str) -> dict | None:
             return event
     return None
 
-def mark_done(event_id: str) -> bool:
-    return update_event(event_id, processed=True)
+def mark_done(event_id: str) -> dict:
+    events = _load()
+    found = False
+    for event in events:
+        if event["id"] == event_id:
+            event["processed"] = True
+            found = True
+            break
+    if not found:
+        return {"success": False, "purged": 0}
+    kept, purged = purge_processed(events)
+    _save(kept)
+    return {"success": True, "purged": purged}
 
 
 # ── Direct Trigger Execution ───────────────────────────────────────────────────
@@ -551,11 +594,11 @@ async def run_mcp() -> None:
             ]
         if name == "mark_processed":
             event_id = arguments.get("event_id", "")
-            ok = mark_done(event_id)
+            result = mark_done(event_id)
             return [
                 types.TextContent(
                     type="text",
-                    text=json.dumps({"success": ok, "event_id": event_id}),
+                    text=json.dumps({"success": result["success"], "event_id": event_id, "purged": result["purged"]}),
                 )
             ]
         raise ValueError(f"Unknown tool: {name}")

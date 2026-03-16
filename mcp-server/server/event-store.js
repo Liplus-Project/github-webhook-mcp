@@ -7,6 +7,16 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const DEFAULT_DATA_FILE = resolve(__dirname, "..", "..", "events.json");
 const PRIMARY_ENCODING = "utf-8";
 const LEGACY_ENCODINGS = ["utf-8", "cp932", "shift_jis"];
+const DEFAULT_PURGE_DAYS = 7;
+
+function purgeDays() {
+  const env = process.env.PURGE_AFTER_DAYS;
+  if (env !== undefined) {
+    const n = Number(env);
+    if (Number.isFinite(n) && n >= 0) return n;
+  }
+  return DEFAULT_PURGE_DAYS;
+}
 
 function dataFilePath() {
   return process.env.EVENTS_JSON_PATH || DEFAULT_DATA_FILE;
@@ -49,6 +59,21 @@ export function load() {
 export function save(events) {
   const filePath = dataFilePath();
   writeFileSync(filePath, JSON.stringify(events, null, 2), PRIMARY_ENCODING);
+}
+
+// ── Purge ──────────────────────────────────────────────────────────────────
+
+export function purgeProcessed(events) {
+  const days = purgeDays();
+  if (days < 0) return { kept: events, purged: 0 };
+  const cutoff = Date.now() - days * 86_400_000;
+  const before = events.length;
+  const kept = events.filter((e) => {
+    if (!e.processed) return true;
+    const ts = Date.parse(e.received_at);
+    return Number.isNaN(ts) || ts > cutoff;
+  });
+  return { kept, purged: before - kept.length };
 }
 
 // ── Query ───────────────────────────────────────────────────────────────────
@@ -141,12 +166,16 @@ export function getPendingSummaries(limit = 20) {
 
 export function markDone(eventId) {
   const events = load();
+  let found = false;
   for (const event of events) {
     if (event.id === eventId) {
       event.processed = true;
-      save(events);
-      return true;
+      found = true;
+      break;
     }
   }
-  return false;
+  if (!found) return { success: false, purged: 0 };
+  const { kept, purged } = purgeProcessed(events);
+  save(kept);
+  return { success: true, purged };
 }
