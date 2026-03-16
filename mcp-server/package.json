@@ -1,10 +1,10 @@
 {
   "name": "github-webhook-mcp",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "MCP server for browsing GitHub webhook events",
   "type": "module",
   "bin": {
-    "github-webhook-mcp": "./server/index.js"
+    "github-webhook-mcp": "server/index.js"
   },
   "main": "./server/index.js",
   "files": [
@@ -35,6 +35,6 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/Liplus-Project/github-webhook-mcp.git"
+    "url": "git+https://github.com/Liplus-Project/github-webhook-mcp.git"
   }
 }
