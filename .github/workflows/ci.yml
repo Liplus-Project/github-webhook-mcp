@@ -16,3 +16,53 @@ jobs:
           python-version: "3.12"
       - run: pip install -r requirements.txt
       - run: python -m unittest discover -v
+
+  build-mcpb:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: npm ci
+        working-directory: mcp-server
+      - run: npx mcpb pack
+        working-directory: mcp-server
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mcpb
+          path: mcp-server/*.mcpb
+
+  tag-build:
+    runs-on: ubuntu-latest
+    needs: [test, build-mcpb]
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Create build tag
+        run: |
+          DATE=$(date -u +%Y-%m-%d)
+          N=1
+          while git ls-remote --tags origin "refs/tags/build-${DATE}.${N}" | grep -q .; do
+            N=$((N + 1))
+          done
+          TAG="build-${DATE}.${N}"
+          git tag "$TAG"
+          git push origin "$TAG"
+          echo "BUILD_TAG=$TAG" >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@v4
+        with:
+          name: mcpb
+          path: dist/
+      - name: Upload .mcpb to build tag release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$BUILD_TAG" dist/*.mcpb \
+            --title "$BUILD_TAG" \
+            --notes "Automated build" \
+            --prerelease
