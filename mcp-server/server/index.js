@@ -2,17 +2,20 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
+import { watch } from "node:fs";
 import {
   getPendingStatus,
   getPendingSummaries,
   getEvent,
   getPending,
   markDone,
+  summarizeEvent,
+  dataFilePath,
 } from "./event-store.js";
 
 const server = new McpServer({
   name: "github-webhook-mcp",
-  version: "0.2.0",
+  version: "0.3.0",
 });
 
 // ── Tools ───────────────────────────────────────────────────────────────────
@@ -101,7 +104,74 @@ server.tool(
   }
 );
 
+// ── Channel notifications ────────────────────────────────────────────────────
+
+const CHANNEL_ENABLED = process.env.WEBHOOK_CHANNEL !== "0";
+
+if (CHANNEL_ENABLED) {
+  server.server.registerCapabilities({
+    experimental: { "claude/channel": {} },
+  });
+}
+
 // ── Start ───────────────────────────────────────────────────────────────────
 
 const transport = new StdioServerTransport();
 await server.connect(transport);
+
+// ── File watcher (after connect) ─────────────────────────────────────────────
+
+if (CHANNEL_ENABLED) {
+  const seenIds = new Set(getPending().map((e) => e.id));
+  let debounce = null;
+
+  function onFileChange() {
+    if (debounce) return;
+    debounce = setTimeout(() => {
+      debounce = null;
+      try {
+        const pending = getPending();
+        for (const event of pending) {
+          if (seenIds.has(event.id)) continue;
+          seenIds.add(event.id);
+          const summary = summarizeEvent(event);
+          const lines = [
+            `[${summary.type}] ${summary.repo ?? ""}`,
+            summary.action ? `action: ${summary.action}` : null,
+            summary.title ? `#${summary.number ?? ""} ${summary.title}` : null,
+            summary.sender ? `by ${summary.sender}` : null,
+            summary.url ?? null,
+          ].filter(Boolean);
+          server.server.notification({
+            method: "notifications/claude/channel",
+            params: {
+              content: lines.join("\n"),
+              meta: {
+                chat_id: "github",
+                message_id: event.id,
+                user: summary.sender ?? "github",
+                ts: summary.received_at,
+              },
+            },
+          });
+        }
+      } catch {
+        // file may be mid-write; ignore and retry on next change
+      }
+    }, 500);
+  }
+
+  try {
+    watch(dataFilePath(), onFileChange);
+  } catch {
+    // events.json may not exist yet; start polling fallback
+    const poll = setInterval(() => {
+      try {
+        watch(dataFilePath(), onFileChange);
+        clearInterval(poll);
+      } catch {
+        // keep waiting
+      }
+    }, 5000);
+  }
+}
