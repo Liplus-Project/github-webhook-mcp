@@ -6,6 +6,7 @@ Receives GitHub webhook events and enables Lin and Lay to autonomously handle PR
 It supports two operating styles:
 
 - MCP polling: store webhook events and let an AI poll lightweight summaries.
+- Channel push: push new events into a Claude Code session in real-time via `claude/channel`.
 - Direct trigger: run a command immediately for each stored event.
 
 Detailed behavior, event metadata, trigger semantics, and file responsibilities live in [docs/0-requirements.md](docs/0-requirements.md).
@@ -73,7 +74,17 @@ cloudflared tunnel run
 
 If your webhook is temporarily set to `Send me everything`, start the receiver with `--event-profile notifications` and it will ignore noisy events such as `workflow_job` or `check_suite`.
 
-### 6. Configure MCP server
+### 6. Enable channel push notifications (optional)
+
+The Node.js MCP server supports Claude Code's `claude/channel` capability (research preview, v2.1.80+). When enabled, new webhook events are pushed into your session automatically — no polling needed.
+
+```bash
+claude --dangerously-load-development-channels server:github-webhook-mcp
+```
+
+Channel notifications are enabled by default. To disable, set `WEBHOOK_CHANNEL=0` in the MCP server env.
+
+### 7. Configure MCP server
 
 #### Option A: Claude Desktop — Desktop Extension (.mcpb)
 
