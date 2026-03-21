@@ -1,7 +1,7 @@
 {
   "manifest_version": "0.3",
   "name": "github-webhook-mcp",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Browse pending GitHub webhook events. Pairs with a webhook receiver that writes events.json.",
   "author": {
     "name": "Liplus Project"
