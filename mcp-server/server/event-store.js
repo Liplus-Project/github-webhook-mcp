@@ -18,7 +18,7 @@ function purgeDays() {
   return DEFAULT_PURGE_DAYS;
 }
 
-function dataFilePath() {
+export function dataFilePath() {
   return process.env.EVENTS_JSON_PATH || DEFAULT_DATA_FILE;
 }
 
