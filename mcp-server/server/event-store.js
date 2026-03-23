@@ -1,5 +1,4 @@
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
-import { randomUUID } from "node:crypto";
+import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import iconv from "iconv-lite";
@@ -59,7 +58,6 @@ export function load() {
 
 export function save(events) {
   const filePath = dataFilePath();
-  mkdirSync(dirname(filePath), { recursive: true });
   writeFileSync(filePath, JSON.stringify(events, null, 2), PRIMARY_ENCODING);
 }
 
@@ -82,20 +80,6 @@ export function purgeProcessed(events) {
 
 export function getPending() {
   return load().filter((e) => !e.processed);
-}
-
-export function addEvent(eventType, payload) {
-  const events = load();
-  const event = {
-    id: randomUUID(),
-    type: eventType,
-    payload,
-    received_at: new Date().toISOString(),
-    processed: false,
-  };
-  events.push(event);
-  save(events);
-  return event;
 }
 
 export function getEvent(eventId) {

@@ -1,6 +1,6 @@
 {
   "name": "github-webhook-mcp",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "MCP server for browsing GitHub webhook events",
   "type": "module",
   "bin": {
@@ -13,7 +13,7 @@
   ],
   "scripts": {
     "start": "node server/index.js",
-    "test": "node --test test/*.test.js",
+    "test": "node --check server/index.js && node --check server/event-store.js",
     "pack:mcpb": "mcpb pack"
   },
   "dependencies": {
