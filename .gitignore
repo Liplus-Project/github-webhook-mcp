@@ -5,3 +5,4 @@ codex-runs/
 __pycache__/
 *.pyc
 mcp-server/node_modules/
+mcp-server/*.mcpb
