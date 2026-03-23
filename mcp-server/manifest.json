@@ -2,7 +2,7 @@
   "manifest_version": "0.3",
   "name": "github-webhook-mcp",
   "display_name": "GitHub Webhook MCP",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "description": "Browse pending GitHub webhook events and optionally receive them locally in standalone mode.",
   "long_description": "GitHub Webhook MCP helps Claude review and react to GitHub notifications from a local event store. In standalone mode it can also host a local webhook listener in the same process, so the extension can receive and persist GitHub events while Claude is running.",
   "author": {

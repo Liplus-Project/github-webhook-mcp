@@ -1,6 +1,6 @@
 {
   "name": "github-webhook-mcp",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "description": "MCP server for browsing GitHub webhook events",
   "type": "module",
   "bin": {
