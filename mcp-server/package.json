@@ -13,7 +13,7 @@
   ],
   "scripts": {
     "start": "node server/index.js",
-    "test": "node --test test/",
+    "test": "node --test test/*.test.js",
     "pack:mcpb": "mcpb pack"
   },
   "dependencies": {

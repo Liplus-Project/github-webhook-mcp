@@ -3,8 +3,8 @@
   "name": "github-webhook-mcp",
   "display_name": "GitHub Webhook MCP",
   "version": "0.3.1",
-  "description": "Browse pending GitHub webhook events. Pairs with a webhook receiver that writes events.json.",
-  "long_description": "GitHub Webhook MCP helps Claude review and react to GitHub notifications from a local event store. It surfaces lightweight pending-event summaries, exposes full webhook payloads on demand, and lets users mark handled events as processed without exposing the event file directly.",
+  "description": "Browse pending GitHub webhook events and optionally receive them locally in standalone mode.",
+  "long_description": "GitHub Webhook MCP helps Claude review and react to GitHub notifications from a local event store. In standalone mode it can also host a local webhook listener in the same process, so the extension can receive and persist GitHub events while Claude is running.",
   "author": {
     "name": "Liplus Project",
     "url": "https://github.com/Liplus-Project"
@@ -26,7 +26,11 @@
         "${__dirname}/server/index.js"
       ],
       "env": {
-        "EVENTS_JSON_PATH": "${user_config.events_json_path}"
+        "EVENTS_JSON_PATH": "${user_config.events_json_path}",
+        "WEBHOOK_PORT": "${user_config.webhook_port}",
+        "WEBHOOK_SECRET": "${user_config.webhook_secret}",
+        "WEBHOOK_EVENT_PROFILE": "notifications",
+        "WEBHOOK_HOST": "127.0.0.1"
       }
     }
   },
@@ -36,6 +40,18 @@
       "type": "string",
       "required": true,
       "title": "Events JSON Path"
+    },
+    "webhook_port": {
+      "description": "Optional local port for the embedded webhook listener. Leave empty to disable receiving.",
+      "type": "string",
+      "required": false,
+      "title": "Webhook Port"
+    },
+    "webhook_secret": {
+      "description": "Optional GitHub webhook secret used to verify incoming requests.",
+      "type": "string",
+      "required": false,
+      "title": "Webhook Secret"
     }
   },
   "tools": [
