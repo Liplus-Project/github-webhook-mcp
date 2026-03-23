@@ -17,6 +17,16 @@ Detailed behavior, event metadata, trigger semantics, and file responsibilities 
 - Supports direct trigger mode for immediate Codex reactions per event.
 - Ships as a Node-based `.mcpb` desktop extension and as an `npx` MCP server.
 
+## Prerequisites
+
+| Component | Required for | Install |
+|-----------|-------------|---------|
+| **Python 3.12+** | Webhook receiver | [python.org](https://www.python.org/downloads/) — check "Add python to PATH" during install |
+| **Node.js 18+** | MCP server (`npx`) | [nodejs.org](https://nodejs.org/) |
+| **NSSM** *(optional)* | Running receiver as a Windows service | [nssm.cc](https://nssm.cc/) — extract and add to PATH |
+
+> Only install what you need. If you only use the `.mcpb` desktop extension, Python alone is sufficient for the receiver.
+
 ## Installation
 
 ### Claude Desktop — Desktop Extension (.mcpb)
@@ -131,7 +141,42 @@ python codex_reaction.py --workspace /path/to/workspace --resume-session <thread
 If you want webhook delivery to stay notification-only for a workspace, create a `.codex-webhook-notify-only`
 file in that workspace. The bundled wrapper will skip direct Codex execution and leave the event pending.
 
-### 6. Optional channel push notifications
+### 6. Optional: Run the receiver as a Windows service (NSSM)
+
+[NSSM (Non-Sucking Service Manager)](https://nssm.cc/) wraps any executable as a Windows service, so the webhook receiver starts automatically on boot without a console window.
+
+```powershell
+# Install the service (opens a GUI)
+nssm install github-webhook-mcp
+
+# Set the following in the GUI:
+#   Path:        C:\Users\<you>\AppData\Local\Programs\Python\Python312\python.exe
+#   Startup dir: C:\Users\<you>\github-webhook-mcp
+#   Arguments:   main.py webhook --port 8080 --event-profile notifications
+```
+
+Or configure non-interactively from an **elevated** PowerShell:
+
+```powershell
+nssm install github-webhook-mcp "C:\Users\<you>\AppData\Local\Programs\Python\Python312\python.exe"
+nssm set github-webhook-mcp AppDirectory "C:\Users\<you>\github-webhook-mcp"
+nssm set github-webhook-mcp AppParameters "main.py webhook --port 8080 --event-profile notifications"
+nssm set github-webhook-mcp AppEnvironmentExtra "WEBHOOK_SECRET=your_secret"
+nssm start github-webhook-mcp
+```
+
+Common management commands:
+
+```powershell
+nssm status  github-webhook-mcp   # check status
+nssm restart github-webhook-mcp   # restart
+nssm edit    github-webhook-mcp   # re-open the GUI
+nssm remove  github-webhook-mcp confirm  # uninstall
+```
+
+> **Alternatives:** `sc create` with a `pywin32` service wrapper, or [WinSW](https://github.com/winsw/winsw) with an XML config, also work. NSSM requires no code changes.
+
+### 7. Optional channel push notifications
 
 The Node.js MCP server supports Claude Code's `claude/channel` capability (research preview, v2.1.80+). When enabled, new webhook events are pushed into your session automatically.
 
