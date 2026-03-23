@@ -7,15 +7,12 @@ GitHub webhook receiver and local MCP extension for GitHub notification workflow
 `github-webhook-mcp` receives GitHub webhook events, persists them to a local `events.json`, and exposes them to AI agents through MCP tools.
 It is designed for notification-style workflows where an AI can poll lightweight summaries, inspect a single event in detail, and mark handled events as processed.
 
-The standard mode is standalone: while the local MCP server is running, it can also host a local webhook listener in the same process.
-
 Detailed behavior, event metadata, trigger semantics, and file responsibilities live in [docs/0-requirements.md](docs/0-requirements.md).
 
 ## Features
 
 - Receives GitHub webhook events over HTTPS and persists them locally.
 - Exposes pending events to MCP clients through lightweight polling tools.
-- Can run as a standalone local MCP + webhook listener without a separate Windows service.
 - Supports real-time `claude/channel` notifications in Claude Code.
 - Supports direct trigger mode for immediate Codex reactions per event.
 - Ships as a Node-based `.mcpb` desktop extension and as an `npx` MCP server.
@@ -29,7 +26,6 @@ Download `mcp-server.mcpb` from [Releases](https://github.com/Liplus-Project/git
 1. Open Claude Desktop → **Settings** → **Extensions** → **Advanced settings** → **Install Extension...**
 2. Select the `.mcpb` file
 3. Enter the path to your `events.json` when prompted
-4. If you want the extension itself to receive GitHub webhooks, also fill in the local webhook port and webhook secret prompts
 
 ### Claude Desktop / Claude Code — npx
 
@@ -42,10 +38,7 @@ Add to your Claude MCP config (`claude_desktop_config.json` or project settings)
       "command": "npx",
       "args": ["github-webhook-mcp"],
       "env": {
-        "EVENTS_JSON_PATH": "/path/to/events.json",
-        "WEBHOOK_PORT": "8080",
-        "WEBHOOK_SECRET": "your_secret",
-        "WEBHOOK_EVENT_PROFILE": "notifications"
+        "EVENTS_JSON_PATH": "/path/to/events.json"
       }
     }
   }
@@ -61,9 +54,6 @@ args = ["github-webhook-mcp"]
 
 [mcp.github-webhook-mcp.env]
 EVENTS_JSON_PATH = "/path/to/events.json"
-WEBHOOK_PORT = "8080"
-WEBHOOK_SECRET = "your_secret"
-WEBHOOK_EVENT_PROFILE = "notifications"
 ```
 
 ### Python (legacy)
@@ -81,68 +71,19 @@ WEBHOOK_EVENT_PROFILE = "notifications"
 
 ## Configuration
 
-### Standard standalone mode
-
-When `WEBHOOK_PORT` is set, the Node.js MCP server starts a local webhook listener in the same process.
-This is the recommended mode for lightweight local use and plugin-style distribution.
-
-### 1. Configure the local MCP server
-
-Set at least:
-
-- `EVENTS_JSON_PATH`
-- `WEBHOOK_PORT`
-- `WEBHOOK_SECRET`
-
-Optionally set:
-
-- `WEBHOOK_EVENT_PROFILE=notifications`
-
-### 2. Set up Cloudflare Tunnel
-
-```bash
-cloudflared tunnel login
-cloudflared tunnel create github-webhook-mcp
-cp cloudflared/config.yml.example ~/.cloudflared/config.yml
-# Edit config.yml with your tunnel ID and domain
-cloudflared tunnel run
-```
-
-### 3. Configure the GitHub webhook
-
-- Payload URL: `https://webhook.yourdomain.com/webhook`
-- Content type: `application/json`
-- Secret: same value as `WEBHOOK_SECRET`
-- Recommended event profile:
-  - Issues
-  - Issue comments
-  - Pull requests
-  - Pull request reviews
-  - Pull request review comments
-  - Check runs
-  - Workflow runs
-  - Discussions
-  - Discussion comments
-
-If your webhook is temporarily set to `Send me everything`, set `WEBHOOK_EVENT_PROFILE=notifications` and the embedded receiver will ignore noisy events such as `workflow_job` or `check_suite`.
-
-### Legacy Python receiver mode
-
-Use this mode only if you want a separate long-running receiver process or direct trigger queue behavior.
-
-#### 1. Install receiver dependencies
+### 1. Install receiver dependencies
 
 ```bash
 pip install -r requirements.txt
 ```
 
-#### 2. Start the webhook receiver
+### 2. Start the webhook receiver
 
 ```bash
 WEBHOOK_SECRET=your_secret python main.py webhook --port 8080 --event-profile notifications
 ```
 
-#### 3. Set up Cloudflare Tunnel
+### 3. Set up Cloudflare Tunnel
 
 ```bash
 cloudflared tunnel login
@@ -152,7 +93,7 @@ cp cloudflared/config.yml.example ~/.cloudflared/config.yml
 cloudflared tunnel run
 ```
 
-#### 4. Configure the GitHub webhook
+### 4. Configure the GitHub webhook
 
 - Payload URL: `https://webhook.yourdomain.com/webhook`
 - Content type: `application/json`
@@ -170,7 +111,7 @@ cloudflared tunnel run
 
 If your webhook is temporarily set to `Send me everything`, start the receiver with `--event-profile notifications` and it will ignore noisy events such as `workflow_job` or `check_suite`.
 
-#### 5. Optional direct trigger mode
+### 5. Optional direct trigger mode
 
 Use the bundled Codex wrapper if you want the webhook to launch `codex exec` immediately.
 
@@ -190,7 +131,7 @@ python codex_reaction.py --workspace /path/to/workspace --resume-session <thread
 If you want webhook delivery to stay notification-only for a workspace, create a `.codex-webhook-notify-only`
 file in that workspace. The bundled wrapper will skip direct Codex execution and leave the event pending.
 
-### Optional channel push notifications
+### 6. Optional channel push notifications
 
 The Node.js MCP server supports Claude Code's `claude/channel` capability (research preview, v2.1.80+). When enabled, new webhook events are pushed into your session automatically.
 

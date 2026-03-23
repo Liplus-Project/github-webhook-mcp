@@ -14,15 +14,9 @@ import {
   markDone,
   summarizeEvent,
   dataFilePath,
-  addEvent,
 } from "./event-store.js";
-import { startWebhookServer } from "./webhook-server.js";
 
 const CHANNEL_ENABLED = process.env.WEBHOOK_CHANNEL !== "0";
-const WEBHOOK_HOST = process.env.WEBHOOK_HOST || "127.0.0.1";
-const WEBHOOK_PORT = Number.parseInt(process.env.WEBHOOK_PORT || "", 10);
-const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || "";
-const WEBHOOK_EVENT_PROFILE = process.env.WEBHOOK_EVENT_PROFILE || "all";
 
 const capabilities = {
   tools: {},
@@ -32,7 +26,7 @@ if (CHANNEL_ENABLED) {
 }
 
 const server = new Server(
-  { name: "github-webhook-mcp", version: "0.3.1" },
+  { name: "github-webhook-mcp", version: "0.4.1" },
   {
     capabilities,
     instructions: CHANNEL_ENABLED
@@ -184,34 +178,6 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
 });
 
 // ── Start ───────────────────────────────────────────────────────────────────
-
-let embeddedWebhookServer = null;
-let shuttingDown = false;
-
-async function shutdown(code = 0) {
-  if (shuttingDown) return;
-  shuttingDown = true;
-  if (embeddedWebhookServer) {
-    await new Promise((resolve) => embeddedWebhookServer.close(resolve));
-    embeddedWebhookServer = null;
-  }
-  process.exit(code);
-}
-
-if (Number.isFinite(WEBHOOK_PORT) && WEBHOOK_PORT > 0) {
-  embeddedWebhookServer = await startWebhookServer({
-    host: WEBHOOK_HOST,
-    port: WEBHOOK_PORT,
-    secret: WEBHOOK_SECRET,
-    eventProfile: WEBHOOK_EVENT_PROFILE,
-    onEvent: async (eventType, payload) => addEvent(eventType, payload),
-  });
-}
-
-process.stdin.on("end", () => void shutdown(0));
-process.stdin.on("close", () => void shutdown(0));
-process.on("SIGINT", () => void shutdown(0));
-process.on("SIGTERM", () => void shutdown(0));
 
 const transport = new StdioServerTransport();
 await server.connect(transport);
