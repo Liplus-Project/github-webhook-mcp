@@ -187,8 +187,11 @@ It may include issue titles, pull request metadata, discussion text, sender iden
 
 ### Submission Note
 
-The current policy text is mirrored in this README so the packaged extension can point to a public HTTPS URL immediately.
-If Anthropic review requires an extension-specific policy on your own domain, publish the same policy text there and update `mcp-server/manifest.json` before final submission.
+The extension-specific privacy policy is published at:
+
+- https://smgjp.com/privacy-policy-github-webhook-mcp/
+
+Keep the policy URL in `mcp-server/manifest.json` aligned with that public page before directory submission.
 
 ## Support
 
