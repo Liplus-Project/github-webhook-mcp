@@ -40,12 +40,18 @@ const server = new Server(
 const TOOLS = [
   {
     name: "get_pending_status",
+    title: "Get Pending Status",
     description:
       "Get a lightweight snapshot of pending GitHub webhook events. Use this for periodic polling before requesting details.",
     inputSchema: { type: "object", properties: {} },
+    annotations: {
+      title: "Get Pending Status",
+      readOnlyHint: true,
+    },
   },
   {
     name: "list_pending_events",
+    title: "List Pending Events",
     description:
       "List lightweight summaries for pending GitHub webhook events. Returns metadata only, without full payloads.",
     inputSchema: {
@@ -57,9 +63,14 @@ const TOOLS = [
         },
       },
     },
+    annotations: {
+      title: "List Pending Events",
+      readOnlyHint: true,
+    },
   },
   {
     name: "get_event",
+    title: "Get Event Payload",
     description: "Get the full payload for a single webhook event by ID.",
     inputSchema: {
       type: "object",
@@ -68,15 +79,25 @@ const TOOLS = [
       },
       required: ["event_id"],
     },
+    annotations: {
+      title: "Get Event Payload",
+      readOnlyHint: true,
+    },
   },
   {
     name: "get_webhook_events",
+    title: "Get Webhook Events",
     description:
       "Get pending (unprocessed) GitHub webhook events with full payloads. Prefer get_pending_status or list_pending_events for polling.",
     inputSchema: { type: "object", properties: {} },
+    annotations: {
+      title: "Get Webhook Events",
+      readOnlyHint: true,
+    },
   },
   {
     name: "mark_processed",
+    title: "Mark Event Processed",
     description: "Mark a webhook event as processed so it won't appear again.",
     inputSchema: {
       type: "object",
@@ -87,6 +108,10 @@ const TOOLS = [
         },
       },
       required: ["event_id"],
+    },
+    annotations: {
+      title: "Mark Event Processed",
+      destructiveHint: true,
     },
   },
 ];
