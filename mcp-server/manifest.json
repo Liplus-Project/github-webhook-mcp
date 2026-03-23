@@ -2,7 +2,7 @@
   "manifest_version": "0.3",
   "name": "github-webhook-mcp",
   "display_name": "GitHub Webhook MCP",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Browse pending GitHub webhook events. Pairs with a webhook receiver that writes events.json.",
   "long_description": "GitHub Webhook MCP helps Claude review and react to GitHub notifications from a local event store. It surfaces lightweight pending-event summaries, exposes full webhook payloads on demand, and lets users mark handled events as processed without exposing the event file directly.",
   "author": {
