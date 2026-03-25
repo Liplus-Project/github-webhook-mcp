@@ -1,0 +1,12 @@
+name = "github-webhook-mcp"
+main = "src/index.ts"
+compatibility_date = "2025-03-26"
+
+[durable_objects]
+bindings = [
+  { name = "WEBHOOK_DO", class_name = "WebhookMcpAgent" }
+]
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["WebhookMcpAgent"]
