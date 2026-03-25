@@ -15,4 +15,4 @@ jobs:
         with:
           node-version: "22"
       - run: node --check mcp-server/server/index.js
-      - run: cd worker && npm ci && npx tsc --noEmit
+      - run: cd worker && npm ci && npx wrangler deploy --dry-run --outdir dist
