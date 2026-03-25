@@ -10,9 +10,9 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
-          python-version: "3.12"
-      - run: pip install -r requirements.txt
-      - run: python -m unittest discover -v
+          node-version: "22"
+      - run: node --check mcp-server/server/index.js
+      - run: cd worker && npm ci && npx tsc --noEmit
