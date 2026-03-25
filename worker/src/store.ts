@@ -146,6 +146,26 @@ export class WebhookStore extends DurableObject {
       return Response.json(summaries);
     }
 
+    // ── get_webhook_events (full payloads) ──
+    if (url.pathname === "/webhook-events") {
+      const limit = Number(url.searchParams.get("limit") || "20");
+      const rows = this.ctx.storage.sql.exec(
+        `SELECT * FROM events WHERE processed = 0 ORDER BY received_at DESC LIMIT ?`,
+        limit,
+      ).toArray();
+
+      const events: WebhookEvent[] = rows.map((row) => ({
+        id: row.id as string,
+        type: row.type as string,
+        received_at: row.received_at as string,
+        processed: (row.processed as number) === 1,
+        trigger_status: row.trigger_status as string | null,
+        last_triggered_at: row.last_triggered_at as string | null,
+        payload: JSON.parse(row.payload as string),
+      }));
+      return Response.json(events);
+    }
+
     // ── get_event ──
     if (url.pathname === "/event") {
       const eventId = url.searchParams.get("id");

@@ -64,6 +64,20 @@ export class WebhookMcpAgent extends McpAgent<Env> {
     );
 
     this.server.tool(
+      "get_webhook_events",
+      "Get pending (unprocessed) GitHub webhook events with full payloads",
+      { limit: z.number().min(1).max(100).default(20).optional() },
+      async ({ limit }) => {
+        const l = limit ?? 20;
+        const res = await this.getStore().fetch(
+          new Request(`https://store/webhook-events?limit=${l}`),
+        );
+        const data = await res.json();
+        return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+      },
+    );
+
+    this.server.tool(
       "mark_processed",
       "Mark a webhook event as processed",
       { event_id: z.string() },
