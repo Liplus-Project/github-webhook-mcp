@@ -1,10 +1,10 @@
-#!/usr/bin/env bun
+#!/usr/bin/env node
 /**
  * Local stdio MCP bridge for github-webhook-mcp
  *
  * - Connects to Cloudflare Worker's /events SSE endpoint
  * - Forwards new events as Claude Code channel notifications
- * - Proxies MCP tool calls to the Worker's /mcp endpoint
+ * - Queries webhook data via WebhookStore DO REST endpoints
  *
  * Discord MCP pattern: data lives in the cloud, local MCP is a thin bridge.
  */
@@ -14,9 +14,9 @@ import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import type { SSEEvent } from "../../shared/src/types.js";
+import EventSource from "eventsource";
 
-const WORKER_URL = process.env.WEBHOOK_WORKER_URL || "https://github-webhook-mcp.workers.dev";
+const WORKER_URL = process.env.WEBHOOK_WORKER_URL || "https://github-webhook-mcp.smileygames2021.workers.dev";
 
 // ── MCP Server Setup ─────────────────────────────────────────────────────────
 
@@ -37,7 +37,7 @@ const mcp = new Server(
   },
 );
 
-// ── Tool Definitions (proxied to Worker) ─────────────────────────────────────
+// ── Tool Definitions ─────────────────────────────────────────────────────────
 
 const TOOLS = [
   {
@@ -84,26 +84,111 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
 mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
 
-  // Proxy tool call to Worker's MCP endpoint
-  // For now, use a simple REST-style proxy until full MCP client is set up
   try {
-    const response = await fetch(`${WORKER_URL}/mcp`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        jsonrpc: "2.0",
-        method: "tools/call",
-        params: { name, arguments: args },
-        id: crypto.randomUUID(),
-      }),
-    });
+    let url: string;
+    let options: RequestInit = {};
 
-    const result = await response.json() as Record<string, unknown>;
+    switch (name) {
+      case "get_pending_status":
+        url = `${WORKER_URL}/webhooks/github`;
+        // Use a direct REST query to the store via Worker proxy
+        // For now, use the MCP endpoint with proper session handling
+        // Simplified: query the store endpoints directly
+        url = `${WORKER_URL}/events`; // placeholder
+        break;
+      default:
+        break;
+    }
+
+    // Direct proxy to Worker's webhook store endpoints
+    // The Worker routes these to WebhookStore DO internally
+    let response: Response;
+
+    switch (name) {
+      case "get_pending_status": {
+        // Initialize MCP session and call tool
+        const initRes = await fetch(`${WORKER_URL}/mcp`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+          },
+          body: JSON.stringify({
+            jsonrpc: "2.0",
+            method: "initialize",
+            params: {
+              protocolVersion: "2024-11-05",
+              capabilities: {},
+              clientInfo: { name: "local-bridge", version: "1.0.0" },
+            },
+            id: "init",
+          }),
+        });
+        const sessionId = initRes.headers.get("mcp-session-id") || "";
+
+        response = await fetch(`${WORKER_URL}/mcp`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+            "mcp-session-id": sessionId,
+          },
+          body: JSON.stringify({
+            jsonrpc: "2.0",
+            method: "tools/call",
+            params: { name, arguments: args || {} },
+            id: crypto.randomUUID(),
+          }),
+        });
+        break;
+      }
+      default: {
+        // Same pattern for all tools
+        const initRes = await fetch(`${WORKER_URL}/mcp`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+          },
+          body: JSON.stringify({
+            jsonrpc: "2.0",
+            method: "initialize",
+            params: {
+              protocolVersion: "2024-11-05",
+              capabilities: {},
+              clientInfo: { name: "local-bridge", version: "1.0.0" },
+            },
+            id: "init",
+          }),
+        });
+        const sessionId = initRes.headers.get("mcp-session-id") || "";
+
+        response = await fetch(`${WORKER_URL}/mcp`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+            "mcp-session-id": sessionId,
+          },
+          body: JSON.stringify({
+            jsonrpc: "2.0",
+            method: "tools/call",
+            params: { name, arguments: args || {} },
+            id: crypto.randomUUID(),
+          }),
+        });
+      }
+    }
+
+    // Parse SSE response (Streamable HTTP returns SSE format)
+    const text = await response!.text();
+    const dataLine = text.split("\n").find(l => l.startsWith("data: "));
+    if (!dataLine) {
+      return { content: [{ type: "text", text: text }], isError: true };
+    }
+    const result = JSON.parse(dataLine.slice(6));
     if (result.error) {
-      return {
-        content: [{ type: "text", text: JSON.stringify(result.error) }],
-        isError: true,
-      };
+      return { content: [{ type: "text", text: JSON.stringify(result.error) }], isError: true };
     }
     return result.result as { content: Array<{ type: string; text: string }> };
   } catch (err) {
@@ -117,22 +202,20 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
 // ── SSE Listener → Channel Notifications ─────────────────────────────────────
 
 function connectSSE() {
-  const EventSource = globalThis.EventSource ?? (await import("eventsource")).default;
   const es = new EventSource(`${WORKER_URL}/events`);
 
-  es.onmessage = (event: MessageEvent) => {
+  es.onmessage = (event) => {
     try {
-      const data = JSON.parse(event.data) as SSEEvent | { heartbeat?: number; status?: string };
+      const data = JSON.parse(event.data);
 
       // Skip heartbeats and status messages
       if ("heartbeat" in data || "status" in data) return;
+      if (!data.summary) return;
 
-      const sseEvent = data as SSEEvent;
-      if (!sseEvent.summary) return;
+      const summary = data.summary;
 
       // Push channel notification to Claude Code
       if (CHANNEL_ENABLED) {
-        const summary = sseEvent.summary;
         const parts = [summary.type];
         if (summary.action) parts.push(summary.action);
         if (summary.repo) parts.push(`in ${summary.repo}`);

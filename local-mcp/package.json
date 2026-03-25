@@ -8,14 +8,14 @@
     "github-webhook-bridge": "./src/index.ts"
   },
   "scripts": {
-    "start": "bun src/index.ts"
+    "start": "npx tsx src/index.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
-    "eventsource": "^3.0.0"
+    "eventsource": "^2.0.2"
   },
   "devDependencies": {
     "typescript": "^5.5.0",
-    "@types/eventsource": "^3.0.0"
+    "tsx": "^4.0.0"
   }
 }
