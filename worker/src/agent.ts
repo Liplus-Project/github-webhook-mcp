@@ -2,7 +2,7 @@
  * McpAgent Durable Object — stores webhook events in SQLite,
  * exposes MCP tools for querying them.
  */
-import { McpAgent } from "@cloudflare/agents/mcp";
+import { McpAgent } from "agents/mcp";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { WebhookEvent, EventSummary, PendingStatus } from "../../shared/src/types.js";

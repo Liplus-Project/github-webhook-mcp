@@ -11,7 +11,7 @@ import { WebhookMcpAgent } from "./agent.js";
 export { WebhookMcpAgent };
 
 interface Env {
-  WEBHOOK_DO: DurableObjectNamespace;
+  MCP_OBJECT: DurableObjectNamespace;
   GITHUB_WEBHOOK_SECRET?: string;
 }
 
@@ -35,8 +35,11 @@ async function verifyGitHubSignature(
   return expected === signature;
 }
 
+// McpAgent.serve() returns a fetch handler for MCP protocol
+const mcpHandler = WebhookMcpAgent.serve("/mcp");
+
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
 
     // ── Webhook receiver ───────────────────────────────────
@@ -55,10 +58,10 @@ export default {
       const eventType = request.headers.get("X-GitHub-Event") || "unknown";
       const deliveryId = request.headers.get("X-GitHub-Delivery") || crypto.randomUUID();
 
-      // Forward to DO via RPC-style fetch
-      const doId = env.WEBHOOK_DO.idFromName("singleton");
-      const stub = env.WEBHOOK_DO.get(doId);
-      const doResponse = await stub.fetch(
+      // Forward to DO via fetch
+      const doId = env.MCP_OBJECT.idFromName("ingest");
+      const stub = env.MCP_OBJECT.get(doId);
+      await stub.fetch(
         new Request("https://do/ingest", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -83,14 +86,12 @@ export default {
 
     // ── SSE stream ─────────────────────────────────────────
     if (url.pathname === "/events" && request.method === "GET") {
-      // TODO: implement SSE with DO event notifications
       const encoder = new TextEncoder();
       const stream = new ReadableStream({
         start(controller) {
           controller.enqueue(
             encoder.encode(`data: ${JSON.stringify({ status: "connected" })}\n\n`),
           );
-          // Heartbeat to keep connection alive
           const interval = setInterval(() => {
             try {
               controller.enqueue(
@@ -112,9 +113,9 @@ export default {
       });
     }
 
-    // ── MCP endpoint ───────────────────────────────────────
+    // ── MCP endpoint (delegate to McpAgent.serve handler) ──
     if (url.pathname.startsWith("/mcp")) {
-      return WebhookMcpAgent.serve("/mcp").fetch(request, env);
+      return mcpHandler.fetch(request, env, ctx);
     }
 
     return new Response("Not found", { status: 404 });

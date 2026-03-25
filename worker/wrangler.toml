@@ -1,10 +1,11 @@
 name = "github-webhook-mcp"
 main = "src/index.ts"
 compatibility_date = "2025-03-26"
+compatibility_flags = ["nodejs_compat"]
 
 [durable_objects]
 bindings = [
-  { name = "WEBHOOK_DO", class_name = "WebhookMcpAgent" }
+  { name = "MCP_OBJECT", class_name = "WebhookMcpAgent" }
 ]
 
 [[migrations]]
