@@ -17,7 +17,7 @@ import {
 
 const WORKER_URL =
   process.env.WEBHOOK_WORKER_URL ||
-  "https://github-webhook-mcp.smileygames2021.workers.dev";
+  "https://github-webhook-mcp.liplus.workers.dev";
 const CHANNEL_ENABLED = process.env.WEBHOOK_CHANNEL !== "0";
 
 // ── Remote MCP Session (lazy, reused) ────────────────────────────────────────

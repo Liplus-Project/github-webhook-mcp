@@ -16,7 +16,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import EventSource from "eventsource";
 
-const WORKER_URL = process.env.WEBHOOK_WORKER_URL || "https://github-webhook-mcp.smileygames2021.workers.dev";
+const WORKER_URL = process.env.WEBHOOK_WORKER_URL || "https://github-webhook-mcp.liplus.workers.dev";
 const CHANNEL_ENABLED = process.env.WEBHOOK_CHANNEL !== "0";
 
 // ── Remote MCP Session (lazy, reused) ────────────────────────────────────────
