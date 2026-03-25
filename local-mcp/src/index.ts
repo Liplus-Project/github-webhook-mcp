@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 /**
- * GitHub Webhook MCP — Cloudflare Worker bridge
+ * Local stdio MCP bridge for github-webhook-mcp
  *
- * Thin stdio MCP server that proxies tool calls to a remote
- * Cloudflare Worker + Durable Object backend via Streamable HTTP.
- * Optionally listens to SSE for real-time channel notifications.
+ * - Connects to Cloudflare Worker's /events SSE endpoint
+ * - Forwards new events as Claude Code channel notifications
+ * - Proxies MCP tool calls to the remote Worker (reuses a single session)
  *
  * Discord MCP pattern: data lives in the cloud, local MCP is a thin bridge.
  */
@@ -14,24 +14,23 @@ import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
+import EventSource from "eventsource";
 
-const WORKER_URL =
-  process.env.WEBHOOK_WORKER_URL ||
-  "https://github-webhook-mcp.smileygames2021.workers.dev";
+const WORKER_URL = process.env.WEBHOOK_WORKER_URL || "https://github-webhook-mcp.smileygames2021.workers.dev";
 const CHANNEL_ENABLED = process.env.WEBHOOK_CHANNEL !== "0";
 
 // ── Remote MCP Session (lazy, reused) ────────────────────────────────────────
 
-let _sessionId = null;
+let _sessionId: string | null = null;
 
-async function getSessionId() {
+async function getSessionId(): Promise<string> {
   if (_sessionId) return _sessionId;
 
   const res = await fetch(`${WORKER_URL}/mcp`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      Accept: "application/json, text/event-stream",
+      "Accept": "application/json, text/event-stream",
     },
     body: JSON.stringify({
       jsonrpc: "2.0",
@@ -49,14 +48,14 @@ async function getSessionId() {
   return _sessionId;
 }
 
-async function callRemoteTool(name, args) {
+async function callRemoteTool(name: string, args: Record<string, unknown>): Promise<{ content: Array<{ type: string; text: string }> }> {
   const sessionId = await getSessionId();
 
   const res = await fetch(`${WORKER_URL}/mcp`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      Accept: "application/json, text/event-stream",
+      "Accept": "application/json, text/event-stream",
       "mcp-session-id": sessionId,
     },
     body: JSON.stringify({
@@ -70,7 +69,7 @@ async function callRemoteTool(name, args) {
   const text = await res.text();
 
   // Streamable HTTP may return SSE format
-  const dataLine = text.split("\n").find((l) => l.startsWith("data: "));
+  const dataLine = text.split("\n").find(l => l.startsWith("data: "));
   const json = dataLine ? JSON.parse(dataLine.slice(6)) : JSON.parse(text);
 
   if (json.error) {
@@ -87,17 +86,17 @@ async function callRemoteTool(name, args) {
 
 // ── MCP Server Setup ─────────────────────────────────────────────────────────
 
-const capabilities = { tools: {} };
+const capabilities: Record<string, unknown> = { tools: {} };
 if (CHANNEL_ENABLED) {
   capabilities.experimental = { "claude/channel": {} };
 }
 
-const server = new Server(
+const mcp = new Server(
   { name: "github-webhook-mcp", version: "1.0.0" },
   {
     capabilities,
     instructions: CHANNEL_ENABLED
-      ? 'GitHub webhook events arrive as <channel source="github-webhook-mcp" ...>. They are one-way: read them and act, no reply expected.'
+      ? "GitHub webhook events arrive as <channel source=\"github-webhook-mcp\" ...>. They are one-way: read them and act, no reply expected."
       : undefined,
   },
 );
@@ -107,88 +106,47 @@ const server = new Server(
 const TOOLS = [
   {
     name: "get_pending_status",
-    title: "Get Pending Status",
-    description:
-      "Get a lightweight snapshot of pending GitHub webhook events. Use this for periodic polling before requesting details.",
-    inputSchema: { type: "object", properties: {} },
-    annotations: {
-      title: "Get Pending Status",
-      readOnlyHint: true,
-    },
+    description: "Get a lightweight snapshot of pending GitHub webhook events",
+    inputSchema: { type: "object" as const, properties: {} },
   },
   {
     name: "list_pending_events",
-    title: "List Pending Events",
-    description:
-      "List lightweight summaries for pending GitHub webhook events. Returns metadata only, without full payloads.",
+    description: "List lightweight summaries for pending GitHub webhook events",
     inputSchema: {
-      type: "object",
+      type: "object" as const,
       properties: {
-        limit: {
-          type: "number",
-          description:
-            "Maximum number of pending events to return (1-100, default 20)",
-        },
+        limit: { type: "number", description: "Max events to return (1-100, default 20)" },
       },
-    },
-    annotations: {
-      title: "List Pending Events",
-      readOnlyHint: true,
     },
   },
   {
     name: "get_event",
-    title: "Get Event Payload",
-    description: "Get the full payload for a single webhook event by ID.",
+    description: "Get the full payload for a single webhook event by ID",
     inputSchema: {
-      type: "object",
+      type: "object" as const,
       properties: {
         event_id: { type: "string", description: "The event ID to retrieve" },
       },
       required: ["event_id"],
     },
-    annotations: {
-      title: "Get Event Payload",
-      readOnlyHint: true,
-    },
-  },
-  {
-    name: "get_webhook_events",
-    title: "Get Webhook Events",
-    description:
-      "Get pending (unprocessed) GitHub webhook events with full payloads. Prefer get_pending_status or list_pending_events for polling.",
-    inputSchema: { type: "object", properties: {} },
-    annotations: {
-      title: "Get Webhook Events",
-      readOnlyHint: true,
-    },
   },
   {
     name: "mark_processed",
-    title: "Mark Event Processed",
-    description:
-      "Mark a webhook event as processed so it won't appear again.",
+    description: "Mark a webhook event as processed",
     inputSchema: {
-      type: "object",
+      type: "object" as const,
       properties: {
-        event_id: {
-          type: "string",
-          description: "The event ID to mark as processed",
-        },
+        event_id: { type: "string", description: "The event ID to mark" },
       },
       required: ["event_id"],
-    },
-    annotations: {
-      title: "Mark Event Processed",
-      destructiveHint: true,
     },
   },
 ];
 
-server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
+mcp.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
 
-server.setRequestHandler(CallToolRequestSchema, async (req) => {
-  const { name, arguments: args } = req.params;
+mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
+  const { name, arguments: args } = request.params;
   try {
     return await callRemoteTool(name, args ?? {});
   } catch (err) {
@@ -201,16 +159,8 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
 
 // ── SSE Listener → Channel Notifications ─────────────────────────────────────
 
-async function connectSSE() {
-  let EventSourceImpl;
-  try {
-    EventSourceImpl = (await import("eventsource")).default;
-  } catch {
-    // eventsource not installed — skip SSE
-    return;
-  }
-
-  const es = new EventSourceImpl(`${WORKER_URL}/events`);
+function connectSSE() {
+  const es = new EventSource(`${WORKER_URL}/events`);
 
   es.onmessage = (event) => {
     try {
@@ -219,23 +169,21 @@ async function connectSSE() {
       if (!data.summary) return;
 
       const s = data.summary;
-      const lines = [
-        `[${s.type}] ${s.repo ?? ""}`,
-        s.action ? `action: ${s.action}` : null,
-        s.title ? `#${s.number ?? ""} ${s.title}` : null,
-        s.sender ? `by ${s.sender}` : null,
-        s.url ?? null,
-      ].filter(Boolean);
+      const parts = [s.type];
+      if (s.action) parts.push(s.action);
+      if (s.repo) parts.push(`in ${s.repo}`);
+      if (s.title) parts.push(`"${s.title}"`);
+      if (s.sender) parts.push(`by ${s.sender}`);
 
-      server.notification({
+      void mcp.notification({
         method: "notifications/claude/channel",
         params: {
-          content: lines.join("\n"),
+          content: parts.join(" "),
           meta: {
-            chat_id: "github",
-            message_id: s.id,
-            user: s.sender ?? "github",
-            ts: s.received_at,
+            event_id: s.id,
+            type: s.type,
+            ...(s.repo ? { repo: s.repo } : {}),
+            ...(s.action ? { action: s.action } : {}),
           },
         },
       });
@@ -247,12 +195,13 @@ async function connectSSE() {
   es.onerror = () => {
     // EventSource auto-reconnects
   };
+
+  return es;
 }
 
-// ── Start ────────────────────────────────────────────────────────────────────
+// ── Main ─────────────────────────────────────────────────────────────────────
 
-const transport = new StdioServerTransport();
-await server.connect(transport);
+await mcp.connect(new StdioServerTransport());
 
 if (CHANNEL_ENABLED) {
   connectSSE();

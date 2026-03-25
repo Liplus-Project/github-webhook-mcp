@@ -6,3 +6,6 @@ __pycache__/
 *.pyc
 mcp-server/node_modules/
 mcp-server/*.mcpb
+worker/node_modules/
+worker/.wrangler/
+local-mcp/node_modules/
