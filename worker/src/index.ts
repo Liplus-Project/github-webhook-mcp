@@ -7,11 +7,13 @@
  *   *    /mcp              — McpAgent DO handles MCP protocol (Streamable HTTP)
  */
 import { WebhookMcpAgent } from "./agent.js";
+import { WebhookStore } from "./store.js";
 
-export { WebhookMcpAgent };
+export { WebhookMcpAgent, WebhookStore };
 
 interface Env {
   MCP_OBJECT: DurableObjectNamespace;
+  WEBHOOK_STORE: DurableObjectNamespace;
   GITHUB_WEBHOOK_SECRET?: string;
 }
 
@@ -58,9 +60,9 @@ export default {
       const eventType = request.headers.get("X-GitHub-Event") || "unknown";
       const deliveryId = request.headers.get("X-GitHub-Delivery") || crypto.randomUUID();
 
-      // Forward to DO via fetch
-      const doId = env.MCP_OBJECT.idFromName("ingest");
-      const stub = env.MCP_OBJECT.get(doId);
+      // Forward to WebhookStore DO
+      const doId = env.WEBHOOK_STORE.idFromName("singleton");
+      const stub = env.WEBHOOK_STORE.get(doId);
       await stub.fetch(
         new Request("https://do/ingest", {
           method: "POST",

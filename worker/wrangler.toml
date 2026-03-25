@@ -5,9 +5,10 @@ compatibility_flags = ["nodejs_compat"]
 
 [durable_objects]
 bindings = [
-  { name = "MCP_OBJECT", class_name = "WebhookMcpAgent" }
+  { name = "MCP_OBJECT", class_name = "WebhookMcpAgent" },
+  { name = "WEBHOOK_STORE", class_name = "WebhookStore" }
 ]
 
 [[migrations]]
-tag = "v1"
-new_sqlite_classes = ["WebhookMcpAgent"]
+tag = "v2"
+new_sqlite_classes = ["WebhookMcpAgent", "WebhookStore"]
