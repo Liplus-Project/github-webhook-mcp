@@ -8,6 +8,8 @@ import { summarizeEvent } from "../../shared/src/summarize.js";
 
 export class WebhookStore extends DurableObject {
   private initialized = false;
+  private sseClients: Set<WritableStreamDefaultWriter<Uint8Array>> = new Set();
+  private encoder = new TextEncoder();
 
   private ensureTable() {
     if (this.initialized) return;
@@ -43,7 +45,58 @@ export class WebhookStore extends DurableObject {
         event.last_triggered_at ?? null,
         JSON.stringify(event.payload),
       );
+
+      // Broadcast to SSE clients
+      const summary = summarizeEvent(event);
+      const sseData = this.encoder.encode(
+        `data: ${JSON.stringify({ event_id: event.id, type: event.type, summary })}\n\n`,
+      );
+      for (const writer of this.sseClients) {
+        try {
+          writer.write(sseData);
+        } catch {
+          this.sseClients.delete(writer);
+        }
+      }
+
       return Response.json({ stored: true });
+    }
+
+    // ── SSE stream ──
+    if (url.pathname === "/events" && request.method === "GET") {
+      const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
+      const writer = writable.getWriter();
+
+      // Send initial connected message
+      writer.write(this.encoder.encode(`data: ${JSON.stringify({ status: "connected" })}\n\n`));
+
+      // Register client
+      this.sseClients.add(writer);
+
+      // Heartbeat
+      const heartbeat = setInterval(() => {
+        try {
+          writer.write(this.encoder.encode(`data: ${JSON.stringify({ heartbeat: Date.now() })}\n\n`));
+        } catch {
+          clearInterval(heartbeat);
+          this.sseClients.delete(writer);
+        }
+      }, 30000);
+
+      // Cleanup on close
+      request.signal.addEventListener("abort", () => {
+        clearInterval(heartbeat);
+        this.sseClients.delete(writer);
+        writer.close().catch(() => {});
+      });
+
+      return new Response(readable, {
+        headers: {
+          "Content-Type": "text/event-stream",
+          "Cache-Control": "no-cache",
+          "Connection": "keep-alive",
+        },
+      });
     }
 
     // ── get_pending_status ──

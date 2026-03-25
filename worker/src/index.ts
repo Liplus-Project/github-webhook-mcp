@@ -86,33 +86,11 @@ export default {
       );
     }
 
-    // ── SSE stream ─────────────────────────────────────────
+    // ── SSE stream (routed to WebhookStore DO) ─────────────
     if (url.pathname === "/events" && request.method === "GET") {
-      const encoder = new TextEncoder();
-      const stream = new ReadableStream({
-        start(controller) {
-          controller.enqueue(
-            encoder.encode(`data: ${JSON.stringify({ status: "connected" })}\n\n`),
-          );
-          const interval = setInterval(() => {
-            try {
-              controller.enqueue(
-                encoder.encode(`data: ${JSON.stringify({ heartbeat: Date.now() })}\n\n`),
-              );
-            } catch {
-              clearInterval(interval);
-            }
-          }, 30000);
-        },
-      });
-
-      return new Response(stream, {
-        headers: {
-          "Content-Type": "text/event-stream",
-          "Cache-Control": "no-cache",
-          "Connection": "keep-alive",
-        },
-      });
+      const doId = env.WEBHOOK_STORE.idFromName("singleton");
+      const stub = env.WEBHOOK_STORE.get(doId);
+      return stub.fetch(request);
     }
 
     // ── MCP endpoint (delegate to McpAgent.serve handler) ──
