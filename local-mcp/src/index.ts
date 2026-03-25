@@ -4,7 +4,7 @@
  *
  * - Connects to Cloudflare Worker's /events SSE endpoint
  * - Forwards new events as Claude Code channel notifications
- * - Queries webhook data via WebhookStore DO REST endpoints
+ * - Proxies MCP tool calls to the remote Worker (reuses a single session)
  *
  * Discord MCP pattern: data lives in the cloud, local MCP is a thin bridge.
  */
@@ -17,10 +17,74 @@ import {
 import EventSource from "eventsource";
 
 const WORKER_URL = process.env.WEBHOOK_WORKER_URL || "https://github-webhook-mcp.smileygames2021.workers.dev";
+const CHANNEL_ENABLED = process.env.WEBHOOK_CHANNEL !== "0";
+
+// ── Remote MCP Session (lazy, reused) ────────────────────────────────────────
+
+let _sessionId: string | null = null;
+
+async function getSessionId(): Promise<string> {
+  if (_sessionId) return _sessionId;
+
+  const res = await fetch(`${WORKER_URL}/mcp`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Accept": "application/json, text/event-stream",
+    },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      method: "initialize",
+      params: {
+        protocolVersion: "2024-11-05",
+        capabilities: {},
+        clientInfo: { name: "local-bridge", version: "1.0.0" },
+      },
+      id: "init",
+    }),
+  });
+
+  _sessionId = res.headers.get("mcp-session-id") || "";
+  return _sessionId;
+}
+
+async function callRemoteTool(name: string, args: Record<string, unknown>): Promise<{ content: Array<{ type: string; text: string }> }> {
+  const sessionId = await getSessionId();
+
+  const res = await fetch(`${WORKER_URL}/mcp`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Accept": "application/json, text/event-stream",
+      "mcp-session-id": sessionId,
+    },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      method: "tools/call",
+      params: { name, arguments: args },
+      id: crypto.randomUUID(),
+    }),
+  });
+
+  const text = await res.text();
+
+  // Streamable HTTP may return SSE format
+  const dataLine = text.split("\n").find(l => l.startsWith("data: "));
+  const json = dataLine ? JSON.parse(dataLine.slice(6)) : JSON.parse(text);
+
+  if (json.error) {
+    // Session expired — retry once with a fresh session
+    if (json.error.code === -32600 || json.error.code === -32001) {
+      _sessionId = null;
+      return callRemoteTool(name, args);
+    }
+    return { content: [{ type: "text", text: JSON.stringify(json.error) }] };
+  }
+
+  return json.result;
+}
 
 // ── MCP Server Setup ─────────────────────────────────────────────────────────
-
-const CHANNEL_ENABLED = process.env.WEBHOOK_CHANNEL !== "0";
 
 const capabilities: Record<string, unknown> = { tools: {} };
 if (CHANNEL_ENABLED) {
@@ -83,114 +147,8 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
 
 mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
-
   try {
-    let url: string;
-    let options: RequestInit = {};
-
-    switch (name) {
-      case "get_pending_status":
-        url = `${WORKER_URL}/webhooks/github`;
-        // Use a direct REST query to the store via Worker proxy
-        // For now, use the MCP endpoint with proper session handling
-        // Simplified: query the store endpoints directly
-        url = `${WORKER_URL}/events`; // placeholder
-        break;
-      default:
-        break;
-    }
-
-    // Direct proxy to Worker's webhook store endpoints
-    // The Worker routes these to WebhookStore DO internally
-    let response: Response;
-
-    switch (name) {
-      case "get_pending_status": {
-        // Initialize MCP session and call tool
-        const initRes = await fetch(`${WORKER_URL}/mcp`, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "Accept": "application/json, text/event-stream",
-          },
-          body: JSON.stringify({
-            jsonrpc: "2.0",
-            method: "initialize",
-            params: {
-              protocolVersion: "2024-11-05",
-              capabilities: {},
-              clientInfo: { name: "local-bridge", version: "1.0.0" },
-            },
-            id: "init",
-          }),
-        });
-        const sessionId = initRes.headers.get("mcp-session-id") || "";
-
-        response = await fetch(`${WORKER_URL}/mcp`, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "Accept": "application/json, text/event-stream",
-            "mcp-session-id": sessionId,
-          },
-          body: JSON.stringify({
-            jsonrpc: "2.0",
-            method: "tools/call",
-            params: { name, arguments: args || {} },
-            id: crypto.randomUUID(),
-          }),
-        });
-        break;
-      }
-      default: {
-        // Same pattern for all tools
-        const initRes = await fetch(`${WORKER_URL}/mcp`, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "Accept": "application/json, text/event-stream",
-          },
-          body: JSON.stringify({
-            jsonrpc: "2.0",
-            method: "initialize",
-            params: {
-              protocolVersion: "2024-11-05",
-              capabilities: {},
-              clientInfo: { name: "local-bridge", version: "1.0.0" },
-            },
-            id: "init",
-          }),
-        });
-        const sessionId = initRes.headers.get("mcp-session-id") || "";
-
-        response = await fetch(`${WORKER_URL}/mcp`, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "Accept": "application/json, text/event-stream",
-            "mcp-session-id": sessionId,
-          },
-          body: JSON.stringify({
-            jsonrpc: "2.0",
-            method: "tools/call",
-            params: { name, arguments: args || {} },
-            id: crypto.randomUUID(),
-          }),
-        });
-      }
-    }
-
-    // Parse SSE response (Streamable HTTP returns SSE format)
-    const text = await response!.text();
-    const dataLine = text.split("\n").find(l => l.startsWith("data: "));
-    if (!dataLine) {
-      return { content: [{ type: "text", text: text }], isError: true };
-    }
-    const result = JSON.parse(dataLine.slice(6));
-    if (result.error) {
-      return { content: [{ type: "text", text: JSON.stringify(result.error) }], isError: true };
-    }
-    return result.result as { content: Array<{ type: string; text: string }> };
+    return await callRemoteTool(name, args ?? {});
   } catch (err) {
     return {
       content: [{ type: "text", text: `Failed to reach worker: ${err}` }],
@@ -207,41 +165,35 @@ function connectSSE() {
   es.onmessage = (event) => {
     try {
       const data = JSON.parse(event.data);
-
-      // Skip heartbeats and status messages
       if ("heartbeat" in data || "status" in data) return;
       if (!data.summary) return;
 
-      const summary = data.summary;
+      const s = data.summary;
+      const parts = [s.type];
+      if (s.action) parts.push(s.action);
+      if (s.repo) parts.push(`in ${s.repo}`);
+      if (s.title) parts.push(`"${s.title}"`);
+      if (s.sender) parts.push(`by ${s.sender}`);
 
-      // Push channel notification to Claude Code
-      if (CHANNEL_ENABLED) {
-        const parts = [summary.type];
-        if (summary.action) parts.push(summary.action);
-        if (summary.repo) parts.push(`in ${summary.repo}`);
-        if (summary.title) parts.push(`"${summary.title}"`);
-        if (summary.sender) parts.push(`by ${summary.sender}`);
-
-        void mcp.notification({
-          method: "notifications/claude/channel",
-          params: {
-            content: parts.join(" "),
-            meta: {
-              event_id: summary.id,
-              type: summary.type,
-              ...(summary.repo ? { repo: summary.repo } : {}),
-              ...(summary.action ? { action: summary.action } : {}),
-            },
+      void mcp.notification({
+        method: "notifications/claude/channel",
+        params: {
+          content: parts.join(" "),
+          meta: {
+            event_id: s.id,
+            type: s.type,
+            ...(s.repo ? { repo: s.repo } : {}),
+            ...(s.action ? { action: s.action } : {}),
           },
-        });
-      }
+        },
+      });
     } catch {
       // Ignore parse errors
     }
   };
 
   es.onerror = () => {
-    // EventSource auto-reconnects by default
+    // EventSource auto-reconnects
   };
 
   return es;

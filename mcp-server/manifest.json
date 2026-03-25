@@ -2,9 +2,9 @@
   "manifest_version": "0.3",
   "name": "github-webhook-mcp",
   "display_name": "GitHub Webhook MCP",
-  "version": "0.4.1",
-  "description": "Browse pending GitHub webhook events. Pairs with a webhook receiver that writes events.json.",
-  "long_description": "GitHub Webhook MCP helps Claude review and react to GitHub notifications from a local event store. It surfaces lightweight pending-event summaries, exposes full webhook payloads on demand, and lets users mark handled events as processed without exposing the event file directly.",
+  "version": "1.0.0",
+  "description": "Real-time GitHub webhook notifications via Cloudflare Worker + Durable Object.",
+  "long_description": "GitHub Webhook MCP bridges GitHub webhook events to Claude via a Cloudflare Worker backend. Events are stored in a Durable Object with SQLite, queried through MCP tools, and optionally pushed in real-time via SSE channel notifications. No local webhook receiver needed — just point your GitHub webhook at the Worker URL.",
   "author": {
     "name": "Liplus Project",
     "url": "https://github.com/Liplus-Project"
@@ -26,16 +26,24 @@
         "${__dirname}/server/index.js"
       ],
       "env": {
-        "EVENTS_JSON_PATH": "${user_config.events_json_path}"
+        "WEBHOOK_WORKER_URL": "${user_config.worker_url}",
+        "WEBHOOK_CHANNEL": "${user_config.channel_enabled}"
       }
     }
   },
   "user_config": {
-    "events_json_path": {
-      "description": "Absolute path to the events.json file written by the webhook receiver.",
+    "worker_url": {
+      "description": "URL of the Cloudflare Worker endpoint (e.g. https://github-webhook-mcp.example.workers.dev)",
       "type": "string",
       "required": true,
-      "title": "Events JSON Path"
+      "title": "Worker URL"
+    },
+    "channel_enabled": {
+      "description": "Enable SSE channel notifications for Claude Code CLI (set to '0' to disable, '1' to enable)",
+      "type": "string",
+      "required": false,
+      "title": "Channel Notifications",
+      "default": "0"
     }
   },
   "tools": [
@@ -75,6 +83,7 @@
     "github",
     "webhook",
     "notifications",
+    "cloudflare",
     "mcp",
     "claude"
   ],

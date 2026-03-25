@@ -1,7 +1,7 @@
 {
   "name": "github-webhook-mcp",
-  "version": "0.4.1",
-  "description": "MCP server for browsing GitHub webhook events",
+  "version": "1.0.0",
+  "description": "MCP server bridging GitHub webhooks via Cloudflare Worker",
   "type": "module",
   "bin": {
     "github-webhook-mcp": "server/index.js"
@@ -13,13 +13,12 @@
   ],
   "scripts": {
     "start": "node server/index.js",
-    "test": "node --check server/index.js && node --check server/event-store.js",
+    "test": "node --check server/index.js",
     "pack:mcpb": "mcpb pack"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
-    "iconv-lite": "^0.6.3",
-    "zod": "^3.22.0"
+    "eventsource": "^2.0.2"
   },
   "devDependencies": {
     "@anthropic-ai/mcpb": "^2.1.0"
@@ -30,7 +29,8 @@
   "keywords": [
     "mcp",
     "github",
-    "webhook"
+    "webhook",
+    "cloudflare"
   ],
   "license": "MIT",
   "repository": {
