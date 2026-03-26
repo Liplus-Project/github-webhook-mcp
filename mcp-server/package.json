@@ -1,6 +1,6 @@
 {
   "name": "github-webhook-mcp",
-  "version": "1.0.0",
+  "version": "0.5.1",
   "description": "MCP server bridging GitHub webhooks via Cloudflare Worker",
   "type": "module",
   "bin": {
@@ -18,7 +18,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
-    "eventsource": "^2.0.2"
+    "ws": "^8.18.0"
   },
   "devDependencies": {
     "@anthropic-ai/mcpb": "^2.1.0"

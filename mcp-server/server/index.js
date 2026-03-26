@@ -4,7 +4,7 @@
  *
  * Thin stdio MCP server that proxies tool calls to a remote
  * Cloudflare Worker + Durable Object backend via Streamable HTTP.
- * Optionally listens to SSE for real-time channel notifications.
+ * Listens to WebSocket for real-time channel notifications.
  *
  * Discord MCP pattern: data lives in the cloud, local MCP is a thin bridge.
  */
@@ -14,6 +14,7 @@ import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
+import WebSocket from "ws";
 
 const WORKER_URL =
   process.env.WEBHOOK_WORKER_URL ||
@@ -199,54 +200,71 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
   }
 });
 
-// ── SSE Listener → Channel Notifications ─────────────────────────────────────
+// ── WebSocket Listener → Channel Notifications ──────────────────────────────
 
-async function connectSSE() {
-  let EventSourceImpl;
-  try {
-    EventSourceImpl = (await import("eventsource")).default;
-  } catch {
-    // eventsource not installed — skip SSE
-    return;
+function connectWebSocket() {
+  const wsUrl = WORKER_URL.replace(/^http/, "ws") + "/events";
+  let ws;
+  let pingTimer = null;
+
+  function connect() {
+    ws = new WebSocket(wsUrl);
+
+    ws.on("open", () => {
+      // Send periodic pings to keep connection alive
+      pingTimer = setInterval(() => {
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send("ping");
+        }
+      }, 25000);
+    });
+
+    ws.on("message", (raw) => {
+      try {
+        const data = JSON.parse(raw.toString());
+
+        // Skip status, pong, heartbeat messages
+        if ("status" in data || "pong" in data || "heartbeat" in data) return;
+        if (!data.summary) return;
+
+        const s = data.summary;
+        const lines = [
+          `[${s.type}] ${s.repo ?? ""}`,
+          s.action ? `action: ${s.action}` : null,
+          s.title ? `#${s.number ?? ""} ${s.title}` : null,
+          s.sender ? `by ${s.sender}` : null,
+          s.url ?? null,
+        ].filter(Boolean);
+
+        server.notification({
+          method: "notifications/claude/channel",
+          params: {
+            content: lines.join("\n"),
+            meta: {
+              chat_id: "github",
+              message_id: s.id,
+              user: s.sender ?? "github",
+              ts: s.received_at,
+            },
+          },
+        });
+      } catch {
+        // Ignore parse errors
+      }
+    });
+
+    ws.on("close", () => {
+      if (pingTimer) clearInterval(pingTimer);
+      // Reconnect after 5 seconds
+      setTimeout(connect, 5000);
+    });
+
+    ws.on("error", () => {
+      // Will trigger close event, which handles reconnect
+    });
   }
 
-  const es = new EventSourceImpl(`${WORKER_URL}/events`);
-
-  es.onmessage = (event) => {
-    try {
-      const data = JSON.parse(event.data);
-      if ("heartbeat" in data || "status" in data) return;
-      if (!data.summary) return;
-
-      const s = data.summary;
-      const lines = [
-        `[${s.type}] ${s.repo ?? ""}`,
-        s.action ? `action: ${s.action}` : null,
-        s.title ? `#${s.number ?? ""} ${s.title}` : null,
-        s.sender ? `by ${s.sender}` : null,
-        s.url ?? null,
-      ].filter(Boolean);
-
-      server.notification({
-        method: "notifications/claude/channel",
-        params: {
-          content: lines.join("\n"),
-          meta: {
-            chat_id: "github",
-            message_id: s.id,
-            user: s.sender ?? "github",
-            ts: s.received_at,
-          },
-        },
-      });
-    } catch {
-      // Ignore parse errors
-    }
-  };
-
-  es.onerror = () => {
-    // EventSource auto-reconnects
-  };
+  connect();
 }
 
 // ── Start ────────────────────────────────────────────────────────────────────
@@ -255,5 +273,5 @@ const transport = new StdioServerTransport();
 await server.connect(transport);
 
 if (CHANNEL_ENABLED) {
-  connectSSE();
+  connectWebSocket();
 }
