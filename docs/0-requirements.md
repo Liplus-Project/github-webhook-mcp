@@ -197,13 +197,15 @@ Node.js >= 18.0.0 が必要。
 |---------|--------|------|
 | `v*` タグ push | build-mcpb | `mcpb pack` で .mcpb 生成 |
 | `v*` タグ push | release | GitHub Release 作成 + .mcpb 添付 |
+| `v*` タグ push | npm-publish | npm レジストリに公開 |
 
 リリースフロー:
-1. `npm version patch/minor/major` で package.json 更新 + `v*` タグ作成
-2. `git push origin main --tags` でタグ push
-3. CD が自動実行: .mcpb 生成 → release 作成 → .mcpb 添付
+1. `v*` タグを push する
+2. CD が自動実行: .mcpb 生成 → release 作成 → .mcpb 添付 → npm publish
+3. npm publish 時にタグ名から自動でバージョンを同期する（package.json の手動更新不要）
+4. プレリリースタグ（`-` を含む）は `next` dist-tag で公開、正式リリースは `latest` で公開
 
-バージョン管理は npm (package.json) が正。manifest.json のバージョンも一致させる。
+manifest.json のバージョンも一致させる。
 
 ## Infrastructure
 
