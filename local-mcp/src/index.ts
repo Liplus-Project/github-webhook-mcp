@@ -2,7 +2,7 @@
 /**
  * Local stdio MCP bridge for github-webhook-mcp
  *
- * - Connects to Cloudflare Worker's /events SSE endpoint
+ * - Connects to Cloudflare Worker's /events WebSocket endpoint
  * - Forwards new events as Claude Code channel notifications
  * - Proxies MCP tool calls to the remote Worker (reuses a single session)
  *
@@ -14,7 +14,7 @@ import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import EventSource from "eventsource";
+import WebSocket from "ws";
 
 const WORKER_URL = process.env.WEBHOOK_WORKER_URL || "https://github-webhook-mcp.liplus.workers.dev";
 const CHANNEL_ENABLED = process.env.WEBHOOK_CHANNEL !== "0";
@@ -157,46 +157,70 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
   }
 });
 
-// ── SSE Listener → Channel Notifications ─────────────────────────────────────
+// ── WebSocket Listener → Channel Notifications ──────────────────────────────
 
-function connectSSE() {
-  const es = new EventSource(`${WORKER_URL}/events`);
+function connectWebSocket() {
+  const wsUrl = WORKER_URL.replace(/^http/, "ws") + "/events";
+  let ws: WebSocket;
+  let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  let pingTimer: ReturnType<typeof setInterval> | null = null;
 
-  es.onmessage = (event) => {
-    try {
-      const data = JSON.parse(event.data);
-      if ("heartbeat" in data || "status" in data) return;
-      if (!data.summary) return;
+  function connect() {
+    ws = new WebSocket(wsUrl);
 
-      const s = data.summary;
-      const parts = [s.type];
-      if (s.action) parts.push(s.action);
-      if (s.repo) parts.push(`in ${s.repo}`);
-      if (s.title) parts.push(`"${s.title}"`);
-      if (s.sender) parts.push(`by ${s.sender}`);
+    ws.on("open", () => {
+      // Send periodic pings to keep connection alive
+      pingTimer = setInterval(() => {
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send("ping");
+        }
+      }, 25000);
+    });
 
-      void mcp.notification({
-        method: "notifications/claude/channel",
-        params: {
-          content: parts.join(" "),
-          meta: {
-            event_id: s.id,
-            type: s.type,
-            ...(s.repo ? { repo: s.repo } : {}),
-            ...(s.action ? { action: s.action } : {}),
+    ws.on("message", (raw: Buffer | string) => {
+      try {
+        const data = JSON.parse(raw.toString());
+
+        // Skip status, pong, heartbeat messages
+        if ("status" in data || "pong" in data || "heartbeat" in data) return;
+        if (!data.summary) return;
+
+        const s = data.summary;
+        const parts = [s.type];
+        if (s.action) parts.push(s.action);
+        if (s.repo) parts.push(`in ${s.repo}`);
+        if (s.title) parts.push(`"${s.title}"`);
+        if (s.sender) parts.push(`by ${s.sender}`);
+
+        void mcp.notification({
+          method: "notifications/claude/channel",
+          params: {
+            content: parts.join(" "),
+            meta: {
+              event_id: s.id,
+              type: s.type,
+              ...(s.repo ? { repo: s.repo } : {}),
+              ...(s.action ? { action: s.action } : {}),
+            },
           },
-        },
-      });
-    } catch {
-      // Ignore parse errors
-    }
-  };
+        });
+      } catch {
+        // Ignore parse errors
+      }
+    });
 
-  es.onerror = () => {
-    // EventSource auto-reconnects
-  };
+    ws.on("close", () => {
+      if (pingTimer) clearInterval(pingTimer);
+      // Reconnect after 5 seconds
+      reconnectTimer = setTimeout(connect, 5000);
+    });
 
-  return es;
+    ws.on("error", () => {
+      // Will trigger close event, which handles reconnect
+    });
+  }
+
+  connect();
 }
 
 // ── Main ─────────────────────────────────────────────────────────────────────
@@ -204,5 +228,5 @@ function connectSSE() {
 await mcp.connect(new StdioServerTransport());
 
 if (CHANNEL_ENABLED) {
-  connectSSE();
+  connectWebSocket();
 }

@@ -1,6 +1,7 @@
 /**
  * WebhookStore Durable Object — single-instance event storage.
  * Webhook data is ingested here and queried by McpAgent tools.
+ * Uses Hibernatable WebSocket API for real-time event delivery.
  */
 import { DurableObject } from "cloudflare:workers";
 import type { WebhookEvent, EventSummary, PendingStatus } from "../../shared/src/types.js";
@@ -8,8 +9,6 @@ import { summarizeEvent } from "../../shared/src/summarize.js";
 
 export class WebhookStore extends DurableObject {
   private initialized = false;
-  private sseClients: Set<WritableStreamDefaultWriter<Uint8Array>> = new Set();
-  private encoder = new TextEncoder();
 
   private ensureTable() {
     if (this.initialized) return;
@@ -27,9 +26,62 @@ export class WebhookStore extends DurableObject {
     this.initialized = true;
   }
 
+  /** Broadcast to all connected WebSocket clients */
+  private broadcast(data: unknown) {
+    const msg = JSON.stringify(data);
+    for (const ws of this.ctx.getWebSockets()) {
+      try {
+        ws.send(msg);
+      } catch {
+        // Client disconnected; will be cleaned up by webSocketClose
+      }
+    }
+  }
+
   async fetch(request: Request): Promise<Response> {
     this.ensureTable();
     const url = new URL(request.url);
+
+    // ── WebSocket upgrade ──
+    if (url.pathname === "/events" && request.headers.get("Upgrade") === "websocket") {
+      const pair = new WebSocketPair();
+      this.ctx.acceptWebSocket(pair[1]);
+      // Send initial connected message
+      pair[1].send(JSON.stringify({ status: "connected" }));
+      return new Response(null, { status: 101, webSocket: pair[0] });
+    }
+
+    // ── SSE fallback (for EventSource clients) ──
+    if (url.pathname === "/events" && request.method === "GET") {
+      // Upgrade hint: clients should use WebSocket for reliable delivery.
+      // SSE fallback kept for compatibility but may miss events during DO hibernation.
+      const encoder = new TextEncoder();
+      const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
+      const writer = writable.getWriter();
+      writer.write(encoder.encode(`data: ${JSON.stringify({ status: "connected", hint: "use WebSocket for reliable delivery" })}\n\n`));
+
+      // Heartbeat to keep connection alive
+      const heartbeat = setInterval(() => {
+        try {
+          writer.write(encoder.encode(`data: ${JSON.stringify({ heartbeat: Date.now() })}\n\n`));
+        } catch {
+          clearInterval(heartbeat);
+        }
+      }, 30000);
+
+      request.signal.addEventListener("abort", () => {
+        clearInterval(heartbeat);
+        writer.close().catch(() => {});
+      });
+
+      return new Response(readable, {
+        headers: {
+          "Content-Type": "text/event-stream",
+          "Cache-Control": "no-cache",
+          "Connection": "keep-alive",
+        },
+      });
+    }
 
     // ── Ingest ──
     if (url.pathname === "/ingest" && request.method === "POST") {
@@ -46,57 +98,11 @@ export class WebhookStore extends DurableObject {
         JSON.stringify(event.payload),
       );
 
-      // Broadcast to SSE clients
+      // Broadcast to WebSocket clients (survives hibernation)
       const summary = summarizeEvent(event);
-      const sseData = this.encoder.encode(
-        `data: ${JSON.stringify({ event_id: event.id, type: event.type, summary })}\n\n`,
-      );
-      for (const writer of this.sseClients) {
-        try {
-          writer.write(sseData);
-        } catch {
-          this.sseClients.delete(writer);
-        }
-      }
+      this.broadcast({ event_id: event.id, type: event.type, summary });
 
       return Response.json({ stored: true });
-    }
-
-    // ── SSE stream ──
-    if (url.pathname === "/events" && request.method === "GET") {
-      const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
-      const writer = writable.getWriter();
-
-      // Send initial connected message
-      writer.write(this.encoder.encode(`data: ${JSON.stringify({ status: "connected" })}\n\n`));
-
-      // Register client
-      this.sseClients.add(writer);
-
-      // Heartbeat
-      const heartbeat = setInterval(() => {
-        try {
-          writer.write(this.encoder.encode(`data: ${JSON.stringify({ heartbeat: Date.now() })}\n\n`));
-        } catch {
-          clearInterval(heartbeat);
-          this.sseClients.delete(writer);
-        }
-      }, 30000);
-
-      // Cleanup on close
-      request.signal.addEventListener("abort", () => {
-        clearInterval(heartbeat);
-        this.sseClients.delete(writer);
-        writer.close().catch(() => {});
-      });
-
-      return new Response(readable, {
-        headers: {
-          "Content-Type": "text/event-stream",
-          "Cache-Control": "no-cache",
-          "Connection": "keep-alive",
-        },
-      });
     }
 
     // ── get_pending_status ──
@@ -200,5 +206,21 @@ export class WebhookStore extends DurableObject {
     }
 
     return new Response("Not found", { status: 404 });
+  }
+
+  // ── Hibernatable WebSocket handlers ──
+  async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer) {
+    // Clients can send ping; respond with pong
+    if (message === "ping") {
+      ws.send(JSON.stringify({ pong: Date.now() }));
+    }
+  }
+
+  async webSocketClose(ws: WebSocket, code: number, reason: string, wasClean: boolean) {
+    // Cloudflare automatically removes from getWebSockets()
+  }
+
+  async webSocketError(ws: WebSocket, error: unknown) {
+    ws.close(1011, "WebSocket error");
   }
 }
