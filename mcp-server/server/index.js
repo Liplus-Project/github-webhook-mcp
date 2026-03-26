@@ -19,6 +19,14 @@ const WORKER_URL =
   process.env.WEBHOOK_WORKER_URL ||
   "https://github-webhook-mcp.liplus.workers.dev";
 const CHANNEL_ENABLED = process.env.WEBHOOK_CHANNEL !== "0";
+const AUTH_TOKEN = process.env.WEBHOOK_AUTH_TOKEN || "";
+
+/** Build common headers with optional Bearer auth */
+function authHeaders(extra) {
+  const h = { ...extra };
+  if (AUTH_TOKEN) h["Authorization"] = `Bearer ${AUTH_TOKEN}`;
+  return h;
+}
 
 // ── Remote MCP Session (lazy, reused) ────────────────────────────────────────
 
@@ -29,10 +37,10 @@ async function getSessionId() {
 
   const res = await fetch(`${WORKER_URL}/mcp`, {
     method: "POST",
-    headers: {
+    headers: authHeaders({
       "Content-Type": "application/json",
       Accept: "application/json, text/event-stream",
-    },
+    }),
     body: JSON.stringify({
       jsonrpc: "2.0",
       method: "initialize",
@@ -54,11 +62,11 @@ async function callRemoteTool(name, args) {
 
   const res = await fetch(`${WORKER_URL}/mcp`, {
     method: "POST",
-    headers: {
+    headers: authHeaders({
       "Content-Type": "application/json",
       Accept: "application/json, text/event-stream",
       "mcp-session-id": sessionId,
-    },
+    }),
     body: JSON.stringify({
       jsonrpc: "2.0",
       method: "tools/call",
@@ -210,7 +218,10 @@ async function connectSSE() {
     return;
   }
 
-  const es = new EventSourceImpl(`${WORKER_URL}/events`);
+  const sseUrl = AUTH_TOKEN
+    ? `${WORKER_URL}/events?token=${encodeURIComponent(AUTH_TOKEN)}`
+    : `${WORKER_URL}/events`;
+  const es = new EventSourceImpl(sseUrl);
 
   es.onmessage = (event) => {
     try {

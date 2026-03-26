@@ -18,6 +18,14 @@ import WebSocket from "ws";
 
 const WORKER_URL = process.env.WEBHOOK_WORKER_URL || "https://github-webhook-mcp.liplus.workers.dev";
 const CHANNEL_ENABLED = process.env.WEBHOOK_CHANNEL !== "0";
+const AUTH_TOKEN = process.env.WEBHOOK_AUTH_TOKEN || "";
+
+/** Build common headers with optional Bearer auth */
+function authHeaders(extra?: Record<string, string>): Record<string, string> {
+  const h: Record<string, string> = { ...extra };
+  if (AUTH_TOKEN) h["Authorization"] = `Bearer ${AUTH_TOKEN}`;
+  return h;
+}
 
 // ── Remote MCP Session (lazy, reused) ────────────────────────────────────────
 
@@ -28,10 +36,10 @@ async function getSessionId(): Promise<string> {
 
   const res = await fetch(`${WORKER_URL}/mcp`, {
     method: "POST",
-    headers: {
+    headers: authHeaders({
       "Content-Type": "application/json",
       "Accept": "application/json, text/event-stream",
-    },
+    }),
     body: JSON.stringify({
       jsonrpc: "2.0",
       method: "initialize",
@@ -53,11 +61,11 @@ async function callRemoteTool(name: string, args: Record<string, unknown>): Prom
 
   const res = await fetch(`${WORKER_URL}/mcp`, {
     method: "POST",
-    headers: {
+    headers: authHeaders({
       "Content-Type": "application/json",
       "Accept": "application/json, text/event-stream",
       "mcp-session-id": sessionId,
-    },
+    }),
     body: JSON.stringify({
       jsonrpc: "2.0",
       method: "tools/call",
@@ -166,7 +174,8 @@ function connectWebSocket() {
   let pingTimer: ReturnType<typeof setInterval> | null = null;
 
   function connect() {
-    ws = new WebSocket(wsUrl);
+    const wsOptions = AUTH_TOKEN ? { headers: { "Authorization": `Bearer ${AUTH_TOKEN}` } } : undefined;
+    ws = new WebSocket(wsUrl, wsOptions);
 
     ws.on("open", () => {
       // Send periodic pings to keep connection alive
