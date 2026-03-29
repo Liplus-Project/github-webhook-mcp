@@ -1,6 +1,10 @@
 /**
  * McpAgent Durable Object — exposes MCP tools that read from WebhookStore DO.
  * This DO handles MCP protocol; data lives in the separate WebhookStore DO.
+ *
+ * Per-tenant: each tenant gets its own McpAgent instance via
+ * getAgentByName("tenant-{accountId}"). The agent routes getStore()
+ * to a tenant-specific WebhookStore DO using idFromName("store-{accountId}").
  */
 import { McpAgent } from "agents/mcp";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -9,16 +13,37 @@ import { z } from "zod";
 interface Env {
   MCP_OBJECT: DurableObjectNamespace;
   WEBHOOK_STORE: DurableObjectNamespace;
+  TENANT_REGISTRY: DurableObjectNamespace;
 }
 
-export class WebhookMcpAgent extends McpAgent<Env> {
+/** Tenant context passed via props when creating per-tenant instances */
+export interface TenantProps {
+  account_id?: number;
+  account_login?: string;
+  account_type?: string;
+}
+
+export class WebhookMcpAgent extends McpAgent<Env, unknown, TenantProps> {
   server = new McpServer({
     name: "github-webhook-mcp",
     version: "1.0.0",
   });
 
+  /**
+   * Resolve the store name for this agent instance.
+   * Per-tenant instances use "store-{accountId}".
+   * Falls back to "singleton" for backward compatibility (no tenant context).
+   */
+  private getStoreName(): string {
+    const accountId = this.props?.account_id;
+    if (accountId !== undefined) {
+      return `store-${accountId}`;
+    }
+    return "singleton";
+  }
+
   private getStore() {
-    const id = this.env.WEBHOOK_STORE.idFromName("singleton");
+    const id = this.env.WEBHOOK_STORE.idFromName(this.getStoreName());
     return this.env.WEBHOOK_STORE.get(id);
   }
 
