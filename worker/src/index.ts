@@ -1,47 +1,40 @@
 /**
  * Cloudflare Worker entrypoint for github-webhook-mcp
  *
- * Routes:
- *   POST /webhooks/github  — receive GitHub webhooks, verify signature, store in DO
- *   GET  /events           — SSE stream of new events (Worker-level, not inside DO)
- *   *    /mcp              — McpAgent DO handles MCP protocol (Streamable HTTP)
+ * Routes (handled by OAuthProvider wrapper):
+ *   /.well-known/oauth-authorization-server — RFC 8414 metadata discovery
+ *   /oauth/register  — RFC 7591 dynamic client registration
+ *   /oauth/token     — Token issuance and refresh
+ *
+ * Routes (OAuth-protected API, validated by OAuthProvider):
+ *   POST /mcp   — McpAgent DO (Streamable HTTP MCP protocol)
+ *   GET  /events — SSE/WebSocket stream via tenant WebhookStore DO
+ *
+ * Routes (defaultHandler, no OAuth token required):
+ *   POST /webhooks/github — GitHub webhook receiver (IP allowlist + signature)
+ *   GET  /oauth/authorize  — Start GitHub OAuth flow
+ *   GET  /oauth/callback   — GitHub OAuth callback
  */
 import { WebhookMcpAgent } from "./agent.js";
 import { WebhookStore } from "./store.js";
+import { TenantRegistry } from "./tenant.js";
+import {
+  createOAuthProvider,
+  handleAuthorize,
+  handleGitHubCallback,
+  type OAuthEnv,
+  type GitHubUserProps,
+} from "./oauth.js";
 import { isGitHubWebhookIP } from "./github-ip.js";
 import { checkWebhookRateLimit, checkApiRateLimit, rateLimitResponse } from "./rate-limit.js";
 
-export { WebhookMcpAgent, WebhookStore };
+export { WebhookMcpAgent, WebhookStore, TenantRegistry };
 
-interface Env {
+interface Env extends OAuthEnv {
   MCP_OBJECT: DurableObjectNamespace;
   WEBHOOK_STORE: DurableObjectNamespace;
+  TENANT_REGISTRY: DurableObjectNamespace;
   GITHUB_WEBHOOK_SECRET?: string;
-  MCP_AUTH_TOKEN?: string;
-}
-
-/**
- * Check Bearer token authentication.
- * Returns a 401 Response if auth fails, or null if auth passes.
- * Skips check when MCP_AUTH_TOKEN is not configured (backward compatible).
- */
-function checkBearerAuth(request: Request, env: Env): Response | null {
-  if (!env.MCP_AUTH_TOKEN) return null;
-
-  // Check Authorization header first
-  const auth = request.headers.get("Authorization") || "";
-  if (auth.startsWith("Bearer ") && auth.slice(7) === env.MCP_AUTH_TOKEN) {
-    return null;
-  }
-
-  // Fall back to ?token= query parameter (for WebSocket clients)
-  const url = new URL(request.url);
-  const tokenParam = url.searchParams.get("token");
-  if (tokenParam === env.MCP_AUTH_TOKEN) {
-    return null;
-  }
-
-  return new Response("Unauthorized", { status: 401 });
 }
 
 async function verifyGitHubSignature(
@@ -64,14 +57,90 @@ async function verifyGitHubSignature(
   return expected === signature;
 }
 
-// McpAgent.serve() returns a fetch handler for MCP protocol
+/**
+ * Resolve installation_id to account_id via TenantRegistry DO.
+ * On installation.created, registers the mapping first.
+ */
+async function resolveInstallationTenant(
+  env: Env,
+  installationId: number,
+  payload: Record<string, unknown>,
+  eventType: string,
+): Promise<{ account_id: number; account_login: string } | null> {
+  const registryId = env.TENANT_REGISTRY.idFromName("global");
+  const registry = env.TENANT_REGISTRY.get(registryId);
+
+  // Handle installation lifecycle events
+  if (eventType === "installation") {
+    const action = (payload as { action?: string }).action;
+    const installation = payload.installation as {
+      id: number;
+      account: { id: number; login: string; type: string };
+    } | undefined;
+
+    if (action === "created" && installation) {
+      await registry.fetch(
+        new Request("https://registry/installation-created", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            installation_id: installation.id,
+            account_id: installation.account.id,
+            account_login: installation.account.login,
+            account_type: installation.account.type,
+          }),
+        }),
+      );
+      return {
+        account_id: installation.account.id,
+        account_login: installation.account.login,
+      };
+    }
+
+    if (action === "deleted" && installation) {
+      await registry.fetch(
+        new Request("https://registry/installation-deleted", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ installation_id: installation.id }),
+        }),
+      );
+      return {
+        account_id: installation.account.id,
+        account_login: installation.account.login,
+      };
+    }
+  }
+
+  // Normal resolution: lookup installation_id -> account_id
+  const resolveRes = await registry.fetch(
+    new Request(`https://registry/resolve?installation_id=${installationId}`),
+  );
+
+  if (!resolveRes.ok) return null;
+
+  const info = await resolveRes.json() as { account_id: number; account_login: string };
+  return info;
+}
+
+// McpAgent.serve() returns a fetch handler for MCP protocol.
+// It reads ctx.props (set by OAuthProvider) and passes them to the DO via getAgentByName.
 const mcpHandler = WebhookMcpAgent.serve("/mcp");
 
-export default {
+/**
+ * Inner handler — processes requests after OAuthProvider routing.
+ *
+ * For API routes (/mcp, /events): OAuthProvider has already validated the
+ * access token and set ctx.props with GitHubUserProps.
+ *
+ * For default routes: OAuthProvider passes through without token validation.
+ * env.OAUTH_PROVIDER is set with OAuthHelpers for the authorize/callback flow.
+ */
+const innerHandler: ExportedHandler<Env> = {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
 
-    // ── Webhook receiver ───────────────────────────────────
+    // ── Webhook receiver (no OAuth required) ──────────────────
     if (url.pathname === "/webhooks/github" && request.method === "POST") {
       // IP allowlist — block non-GitHub IPs before any processing
       if (!(await isGitHubWebhookIP(request))) {
@@ -96,8 +165,35 @@ export default {
       const eventType = request.headers.get("X-GitHub-Event") || "unknown";
       const deliveryId = request.headers.get("X-GitHub-Delivery") || crypto.randomUUID();
 
-      // Forward to WebhookStore DO
-      const doId = env.WEBHOOK_STORE.idFromName("singleton");
+      let payload: Record<string, unknown>;
+      try {
+        payload = JSON.parse(body);
+      } catch {
+        return new Response("Invalid JSON payload", { status: 400 });
+      }
+
+      // Resolve installation_id → tenant via TenantRegistry
+      const installation = payload.installation as { id: number } | undefined;
+      const installationId = installation?.id;
+
+      if (!installationId) {
+        return new Response(
+          JSON.stringify({ error: "missing installation.id in payload" }),
+          { status: 400, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      const tenant = await resolveInstallationTenant(env, installationId, payload, eventType);
+      if (!tenant) {
+        return new Response(
+          JSON.stringify({ error: "unknown installation", installation_id: installationId }),
+          { status: 404, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      // Forward to tenant-specific WebhookStore DO (store-{accountId})
+      const storeName = `store-${tenant.account_id}`;
+      const doId = env.WEBHOOK_STORE.idFromName(storeName);
       const stub = env.WEBHOOK_STORE.get(doId);
       await stub.fetch(
         new Request("https://do/ingest", {
@@ -108,7 +204,7 @@ export default {
             type: eventType,
             received_at: new Date().toISOString(),
             processed: false,
-            payload: JSON.parse(body),
+            payload,
           }),
         }),
       );
@@ -122,28 +218,59 @@ export default {
       );
     }
 
-    // ── Rate limit for API endpoints ───────────────────────
+    // ── Rate limit for API endpoints ─────────────────────────
     const apiIP = request.headers.get("CF-Connecting-IP") || "unknown";
     if (!checkApiRateLimit(apiIP)) return rateLimitResponse();
 
-    // ── SSE stream (routed to WebhookStore DO) ─────────────
-    if (url.pathname === "/events" && request.method === "GET") {
-      const authError = checkBearerAuth(request, env);
-      if (authError) return authError;
+    // ── SSE/WebSocket stream (OAuth-protected, ctx.props set) ─
+    if (url.pathname === "/events" && (request.method === "GET" || request.headers.get("Upgrade") === "websocket")) {
+      const props = (ctx as unknown as { props: GitHubUserProps }).props;
+      if (!props?.githubUserId) {
+        return new Response("Unauthorized", { status: 401 });
+      }
 
-      const doId = env.WEBHOOK_STORE.idFromName("singleton");
+      // Route to tenant-specific WebhookStore DO
+      const storeName = `store-${props.githubUserId}`;
+      const doId = env.WEBHOOK_STORE.idFromName(storeName);
       const stub = env.WEBHOOK_STORE.get(doId);
       return stub.fetch(request);
     }
 
-    // ── MCP endpoint (delegate to McpAgent.serve handler) ──
+    // ── MCP endpoint (OAuth-protected, ctx.props set) ────────
+    // McpAgent.serve() handler reads ctx.props automatically and passes
+    // them to the DO via getAgentByName. The agent uses props.account_id
+    // to resolve its tenant-specific WebhookStore.
     if (url.pathname.startsWith("/mcp")) {
-      const authError = checkBearerAuth(request, env);
-      if (authError) return authError;
+      const props = (ctx as unknown as { props: GitHubUserProps }).props;
+      if (!props?.githubUserId) {
+        return new Response("Unauthorized", { status: 401 });
+      }
+
+      // Rewrite ctx.props to TenantProps shape expected by WebhookMcpAgent
+      (ctx as unknown as { props: { account_id: number; account_login: string } }).props = {
+        account_id: props.githubUserId,
+        account_login: props.githubLogin,
+      };
 
       return mcpHandler.fetch(request, env, ctx);
+    }
+
+    // ── OAuth authorize (redirect to GitHub) ─────────────────
+    if (url.pathname === "/oauth/authorize") {
+      const oauthHelpers = (env as unknown as { OAUTH_PROVIDER: Parameters<typeof handleAuthorize>[2] }).OAUTH_PROVIDER;
+      return handleAuthorize(request, env, oauthHelpers);
+    }
+
+    // ── OAuth callback (GitHub redirects back here) ──────────
+    if (url.pathname === "/oauth/callback") {
+      const oauthHelpers = (env as unknown as { OAUTH_PROVIDER: Parameters<typeof handleGitHubCallback>[2] }).OAUTH_PROVIDER;
+      return handleGitHubCallback(request, env, oauthHelpers);
     }
 
     return new Response("Not found", { status: 404 });
   },
 };
+
+// OAuthProvider wraps the inner handler, adding OAuth endpoints
+// and protecting /mcp and /events routes with access token validation.
+export default createOAuthProvider(innerHandler as unknown as ExportedHandler<OAuthEnv & Record<string, unknown>>);

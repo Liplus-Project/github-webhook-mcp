@@ -6,12 +6,17 @@ compatibility_flags = ["nodejs_compat"]
 [durable_objects]
 bindings = [
   { name = "MCP_OBJECT", class_name = "WebhookMcpAgent" },
-  { name = "WEBHOOK_STORE", class_name = "WebhookStore" }
+  { name = "WEBHOOK_STORE", class_name = "WebhookStore" },
+  { name = "TENANT_REGISTRY", class_name = "TenantRegistry" }
 ]
 
 [[migrations]]
 tag = "v2"
 new_sqlite_classes = ["WebhookMcpAgent", "WebhookStore"]
+
+[[migrations]]
+tag = "v3"
+new_sqlite_classes = ["TenantRegistry"]
 
 # KV namespace for OAuth provider (token, client, grant storage)
 [[kv_namespaces]]
