@@ -27,6 +27,25 @@ GitHub ──POST──▶ Cloudflare Worker ──▶ Durable Object (SQLite)
 | **Node.js 18+** | MCP server |
 | **Cloudflare account** | Worker deployment (self-hosting) |
 
+## Getting Started
+
+### 1. Install the GitHub App
+
+Install the **GitHub Webhook MCP** app on your GitHub organization or account:
+
+1. Visit the [GitHub App installation page](https://github.com/apps/YOUR_APP_SLUG) ← placeholder
+2. Select the organization or account to install on
+3. Choose which repositories to grant access to (or all repositories)
+4. Approve the requested permissions
+
+> **Note:** When the app requests new permissions after an update, you must approve them in your GitHub notification or the app's installation settings. Webhooks will not be delivered until permissions are accepted.
+
+> **Important:** Do not create a separate repository webhook for the same endpoint. The GitHub App handles all webhook delivery — a repository webhook would cause duplicate or malformed requests.
+
+### 2. Set up the MCP client
+
+Continue to [Installation](#installation) below to connect your AI assistant to the webhook service.
+
 ## Installation
 
 ### Claude Desktop — Desktop Extension (.mcpb)
