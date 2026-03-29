@@ -31,6 +31,12 @@ export interface GitHubUserProps {
   githubAccessToken: string;
   /** GitHub refresh token (ghr_ prefix, 6mo TTL) */
   githubRefreshToken: string;
+  /**
+   * All account IDs (user + orgs) whose App installations the user can access.
+   * Populated via GET /user/installations at OAuth time.
+   * Used by McpAgent to aggregate events across user and org stores.
+   */
+  accessibleAccountIds: number[];
 }
 
 /**
@@ -147,12 +153,42 @@ export async function handleGitHubCallback(
 
   const user = await userRes.json() as { id: number; login: string };
 
+  // Fetch all App installations the user has access to (user + orgs).
+  // GET /user/installations returns installations of this GitHub App that the
+  // authenticated user has explicit access to. No extra OAuth scope required.
+  let accessibleAccountIds: number[] = [user.id];
+  try {
+    const installRes = await fetch(
+      "https://api.github.com/user/installations?per_page=100",
+      {
+        headers: {
+          "Authorization": `Bearer ${tokenData.access_token}`,
+          "User-Agent": "github-webhook-mcp",
+          "Accept": "application/vnd.github+json",
+        },
+      },
+    );
+    if (installRes.ok) {
+      const installData = await installRes.json() as {
+        installations?: Array<{ account: { id: number } }>;
+      };
+      if (installData.installations) {
+        const ids = installData.installations.map((i) => i.account.id);
+        // Deduplicate: user.id may already be in the list
+        accessibleAccountIds = [...new Set([user.id, ...ids])];
+      }
+    }
+  } catch {
+    // Non-fatal: fall back to user-only access
+  }
+
   // Complete the original OAuth authorization with our provider
   const props: GitHubUserProps = {
     githubUserId: user.id,
     githubLogin: user.login,
     githubAccessToken: tokenData.access_token,
     githubRefreshToken: tokenData.refresh_token || "",
+    accessibleAccountIds,
   };
 
   const { redirectTo } = await oauthHelpers.completeAuthorization({
