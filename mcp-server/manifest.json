@@ -27,13 +27,14 @@
       ],
       "env": {
         "WEBHOOK_WORKER_URL": "${user_config.worker_url}",
-        "WEBHOOK_CHANNEL": "${user_config.channel_enabled}"
+        "WEBHOOK_CHANNEL": "${user_config.channel_enabled}",
+        "WEBHOOK_AUTH_TOKEN": "${user_config.auth_token}"
       }
     }
   },
   "user_config": {
     "worker_url": {
-      "description": "URL of the Cloudflare Worker endpoint (e.g. https://github-webhook-mcp.example.workers.dev)",
+      "description": "URL of the Cloudflare Worker endpoint (e.g. https://github-webhook-mcp.example.workers.dev). Authentication is handled automatically via OAuth.",
       "type": "string",
       "required": true,
       "title": "Worker URL"
@@ -44,6 +45,13 @@
       "required": false,
       "title": "Channel Notifications",
       "default": "0"
+    },
+    "auth_token": {
+      "description": "Legacy Bearer token for self-hosted workers without OAuth. Leave empty to use OAuth authentication (recommended).",
+      "type": "string",
+      "required": false,
+      "title": "Auth Token (Legacy)",
+      "default": ""
     }
   },
   "tools": [

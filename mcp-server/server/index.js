@@ -5,6 +5,7 @@
  * Thin stdio MCP server that proxies tool calls to a remote
  * Cloudflare Worker + Durable Object backend via Streamable HTTP.
  * Optionally listens to SSE for real-time channel notifications.
+ * Authenticates via OAuth 2.1 with PKCE (localhost callback).
  *
  * Discord MCP pattern: data lives in the cloud, local MCP is a thin bridge.
  */
@@ -14,17 +15,275 @@ import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
+import { createServer } from "node:http";
+import { randomBytes, createHash } from "node:crypto";
+import { readFile, writeFile, mkdir } from "node:fs/promises";
+import { homedir } from "node:os";
+import { join } from "node:path";
+import { exec } from "node:child_process";
 
 const WORKER_URL =
   process.env.WEBHOOK_WORKER_URL ||
   "https://github-webhook-mcp.liplus.workers.dev";
 const CHANNEL_ENABLED = process.env.WEBHOOK_CHANNEL !== "0";
-const AUTH_TOKEN = process.env.WEBHOOK_AUTH_TOKEN || "";
+// Legacy auth support: if WEBHOOK_AUTH_TOKEN is set, use Bearer token directly
+const LEGACY_AUTH_TOKEN = process.env.WEBHOOK_AUTH_TOKEN || "";
 
-/** Build common headers with optional Bearer auth */
-function authHeaders(extra) {
+// ── OAuth Token Storage ──────────────────────────────────────────────────────
+
+const TOKEN_DIR = join(homedir(), ".github-webhook-mcp");
+const TOKEN_FILE = join(TOKEN_DIR, "oauth-tokens.json");
+const CLIENT_REG_FILE = join(TOKEN_DIR, "oauth-client.json");
+
+async function loadTokens() {
+  try {
+    const data = await readFile(TOKEN_FILE, "utf-8");
+    return JSON.parse(data);
+  } catch {
+    return null;
+  }
+}
+
+async function saveTokens(tokens) {
+  await mkdir(TOKEN_DIR, { recursive: true });
+  await writeFile(TOKEN_FILE, JSON.stringify(tokens, null, 2), { mode: 0o600 });
+}
+
+let _cachedTokens = null;
+
+// ── PKCE Utilities ───────────────────────────────────────────────────────────
+
+function generateCodeVerifier() {
+  return randomBytes(32).toString("base64url");
+}
+
+function generateCodeChallenge(verifier) {
+  return createHash("sha256").update(verifier).digest("base64url");
+}
+
+// ── OAuth Discovery & Registration ───────────────────────────────────────────
+
+async function discoverOAuthMetadata() {
+  const res = await fetch(`${WORKER_URL}/.well-known/oauth-authorization-server`);
+  if (!res.ok) {
+    throw new Error(`OAuth discovery failed: ${res.status}`);
+  }
+  return await res.json();
+}
+
+async function loadClientRegistration() {
+  try {
+    const data = await readFile(CLIENT_REG_FILE, "utf-8");
+    return JSON.parse(data);
+  } catch {
+    return null;
+  }
+}
+
+async function saveClientRegistration(reg) {
+  await mkdir(TOKEN_DIR, { recursive: true });
+  await writeFile(CLIENT_REG_FILE, JSON.stringify(reg, null, 2), { mode: 0o600 });
+}
+
+async function ensureClientRegistration(metadata, redirectUris) {
+  const existing = await loadClientRegistration();
+  if (existing) return existing;
+
+  if (!metadata.registration_endpoint) {
+    throw new Error("OAuth server does not support dynamic client registration");
+  }
+
+  const res = await fetch(metadata.registration_endpoint, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      client_name: "github-webhook-mcp-cli",
+      redirect_uris: redirectUris,
+      grant_types: ["authorization_code", "refresh_token"],
+      response_types: ["code"],
+      token_endpoint_auth_method: "none",
+    }),
+  });
+
+  if (!res.ok) {
+    throw new Error(`Client registration failed: ${res.status} ${await res.text()}`);
+  }
+
+  const reg = await res.json();
+  await saveClientRegistration(reg);
+  return reg;
+}
+
+// ── OAuth Localhost Callback Flow ────────────────────────────────────────────
+
+async function performOAuthFlow() {
+  const metadata = await discoverOAuthMetadata();
+
+  const callbackServer = createServer();
+  await new Promise((resolve) => {
+    callbackServer.listen(0, "127.0.0.1", () => resolve());
+  });
+  const port = callbackServer.address().port;
+  const redirectUri = `http://127.0.0.1:${port}/callback`;
+
+  const client = await ensureClientRegistration(metadata, [
+    redirectUri,
+    `http://localhost:${port}/callback`,
+  ]);
+
+  const codeVerifier = generateCodeVerifier();
+  const codeChallenge = generateCodeChallenge(codeVerifier);
+  const state = randomBytes(16).toString("hex");
+
+  const authUrl = new URL(metadata.authorization_endpoint);
+  authUrl.searchParams.set("response_type", "code");
+  authUrl.searchParams.set("client_id", client.client_id);
+  authUrl.searchParams.set("redirect_uri", redirectUri);
+  authUrl.searchParams.set("state", state);
+  authUrl.searchParams.set("code_challenge", codeChallenge);
+  authUrl.searchParams.set("code_challenge_method", "S256");
+
+  const authCode = await new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      callbackServer.close();
+      reject(new Error("OAuth callback timed out after 5 minutes"));
+    }, 5 * 60 * 1000);
+
+    callbackServer.on("request", (req, res) => {
+      const url = new URL(req.url || "/", `http://127.0.0.1:${port}`);
+      if (url.pathname !== "/callback") {
+        res.writeHead(404);
+        res.end("Not found");
+        return;
+      }
+
+      const code = url.searchParams.get("code");
+      const returnedState = url.searchParams.get("state");
+      const error = url.searchParams.get("error");
+
+      if (error) {
+        res.writeHead(200, { "Content-Type": "text/html" });
+        res.end("<html><body><h1>Authorization failed</h1><p>You can close this tab.</p></body></html>");
+        clearTimeout(timeout);
+        callbackServer.close();
+        reject(new Error(`OAuth authorization failed: ${error}`));
+        return;
+      }
+
+      if (!code || returnedState !== state) {
+        res.writeHead(400, { "Content-Type": "text/html" });
+        res.end("<html><body><h1>Invalid callback</h1></body></html>");
+        return;
+      }
+
+      res.writeHead(200, { "Content-Type": "text/html" });
+      res.end("<html><body><h1>Authorization successful</h1><p>You can close this tab.</p></body></html>");
+      clearTimeout(timeout);
+      callbackServer.close();
+      resolve(code);
+    });
+
+    const openCmd = process.platform === "win32" ? "start" :
+                    process.platform === "darwin" ? "open" : "xdg-open";
+    exec(`${openCmd} "${authUrl.toString()}"`);
+
+    process.stderr.write(
+      `\n[github-webhook-mcp] Open this URL to authenticate:\n${authUrl.toString()}\n\n`,
+    );
+  });
+
+  const tokenRes = await fetch(metadata.token_endpoint, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type: "authorization_code",
+      code: authCode,
+      redirect_uri: redirectUri,
+      client_id: client.client_id,
+      code_verifier: codeVerifier,
+    }),
+  });
+
+  if (!tokenRes.ok) {
+    throw new Error(`Token exchange failed: ${tokenRes.status} ${await tokenRes.text()}`);
+  }
+
+  const tokenData = await tokenRes.json();
+
+  const tokens = {
+    access_token: tokenData.access_token,
+    refresh_token: tokenData.refresh_token,
+    expires_at: tokenData.expires_in
+      ? Date.now() + tokenData.expires_in * 1000
+      : undefined,
+  };
+
+  await saveTokens(tokens);
+  return tokens;
+}
+
+async function refreshAccessToken(refreshToken) {
+  const metadata = await discoverOAuthMetadata();
+  const client = await loadClientRegistration();
+  if (!client) throw new Error("No client registration found");
+
+  const res = await fetch(metadata.token_endpoint, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type: "refresh_token",
+      refresh_token: refreshToken,
+      client_id: client.client_id,
+    }),
+  });
+
+  if (!res.ok) {
+    throw new Error(`Token refresh failed: ${res.status}`);
+  }
+
+  const data = await res.json();
+
+  const tokens = {
+    access_token: data.access_token,
+    refresh_token: data.refresh_token || refreshToken,
+    expires_at: data.expires_in ? Date.now() + data.expires_in * 1000 : undefined,
+  };
+
+  await saveTokens(tokens);
+  return tokens;
+}
+
+async function getAccessToken() {
+  if (LEGACY_AUTH_TOKEN) return LEGACY_AUTH_TOKEN;
+
+  if (!_cachedTokens) {
+    _cachedTokens = await loadTokens();
+  }
+
+  if (_cachedTokens) {
+    if (!_cachedTokens.expires_at || _cachedTokens.expires_at > Date.now() + 60_000) {
+      return _cachedTokens.access_token;
+    }
+
+    if (_cachedTokens.refresh_token) {
+      try {
+        _cachedTokens = await refreshAccessToken(_cachedTokens.refresh_token);
+        return _cachedTokens.access_token;
+      } catch {
+        // Refresh failed, fall through to full OAuth flow
+      }
+    }
+  }
+
+  _cachedTokens = await performOAuthFlow();
+  return _cachedTokens.access_token;
+}
+
+/** Build common headers with OAuth Bearer auth */
+async function authHeaders(extra) {
   const h = { ...extra };
-  if (AUTH_TOKEN) h["Authorization"] = `Bearer ${AUTH_TOKEN}`;
+  const token = await getAccessToken();
+  if (token) h["Authorization"] = `Bearer ${token}`;
   return h;
 }
 
@@ -37,7 +296,7 @@ async function getSessionId() {
 
   const res = await fetch(`${WORKER_URL}/mcp`, {
     method: "POST",
-    headers: authHeaders({
+    headers: await authHeaders({
       "Content-Type": "application/json",
       Accept: "application/json, text/event-stream",
     }),
@@ -62,7 +321,7 @@ async function callRemoteTool(name, args) {
 
   const res = await fetch(`${WORKER_URL}/mcp`, {
     method: "POST",
-    headers: authHeaders({
+    headers: await authHeaders({
       "Content-Type": "application/json",
       Accept: "application/json, text/event-stream",
       "mcp-session-id": sessionId,
@@ -74,6 +333,13 @@ async function callRemoteTool(name, args) {
       id: crypto.randomUUID(),
     }),
   });
+
+  // 401 = token expired or revoked, re-authenticate and retry
+  if (res.status === 401) {
+    _cachedTokens = null;
+    _sessionId = null;
+    return callRemoteTool(name, args);
+  }
 
   const text = await res.text();
 
@@ -218,8 +484,9 @@ async function connectSSE() {
     return;
   }
 
-  const sseUrl = AUTH_TOKEN
-    ? `${WORKER_URL}/events?token=${encodeURIComponent(AUTH_TOKEN)}`
+  const token = await getAccessToken();
+  const sseUrl = token
+    ? `${WORKER_URL}/events?token=${encodeURIComponent(token)}`
     : `${WORKER_URL}/events`;
   const es = new EventSourceImpl(sseUrl);
 
