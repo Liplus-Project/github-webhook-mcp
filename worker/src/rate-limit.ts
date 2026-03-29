@@ -65,6 +65,49 @@ export function checkApiRateLimit(ip: string): boolean {
   return check(`api:${ip}`, MAX_API);
 }
 
+/**
+ * Check per-tenant quota via TenantRegistry DO.
+ * Returns { allowed: true } or { allowed: false, response: Response }.
+ *
+ * This calls the DO's /quota-check endpoint which atomically checks
+ * and increments the counter if within limit.
+ */
+export async function checkTenantQuota(
+  registry: DurableObjectStub,
+  accountId: number,
+): Promise<{ allowed: true } | { allowed: false; response: Response }> {
+  const res = await registry.fetch(
+    new Request("https://registry/quota-check", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ account_id: accountId }),
+    }),
+  );
+
+  if (res.ok) {
+    return { allowed: true };
+  }
+
+  if (res.status === 429) {
+    return {
+      allowed: false,
+      response: new Response(
+        JSON.stringify({ error: "tenant quota exceeded" }),
+        {
+          status: 429,
+          headers: {
+            "Content-Type": "application/json",
+            "Retry-After": "3600",
+          },
+        },
+      ),
+    };
+  }
+
+  // 404 = unknown tenant — pass through (will be caught by tenant resolution)
+  return { allowed: true };
+}
+
 /** Build a 429 response with Retry-After header. */
 export function rateLimitResponse(): Response {
   return new Response("Too Many Requests", {

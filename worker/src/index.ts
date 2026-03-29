@@ -11,7 +11,8 @@
  *   GET  /events — SSE/WebSocket stream via tenant WebhookStore DO
  *
  * Routes (defaultHandler, no OAuth token required):
- *   POST /webhooks/github — GitHub webhook receiver (IP allowlist + signature)
+ *   POST /webhooks/github — GitHub webhook receiver
+ *     Auth chain: IP allowlist → rate limit → signature → tenant → quota
  *   GET  /oauth/authorize  — Start GitHub OAuth flow
  *   GET  /oauth/callback   — GitHub OAuth callback
  */
@@ -26,7 +27,7 @@ import {
   type GitHubUserProps,
 } from "./oauth.js";
 import { isGitHubWebhookIP } from "./github-ip.js";
-import { checkWebhookRateLimit, checkApiRateLimit, rateLimitResponse } from "./rate-limit.js";
+import { checkWebhookRateLimit, checkApiRateLimit, checkTenantQuota, rateLimitResponse } from "./rate-limit.js";
 
 export { WebhookMcpAgent, WebhookStore, TenantRegistry };
 
@@ -141,19 +142,27 @@ const innerHandler: ExportedHandler<Env> = {
     const url = new URL(request.url);
 
     // ── Webhook receiver (no OAuth required) ──────────────────
+    // Authentication check order:
+    //   1. IP allowlist (cheapest — no body read, no crypto)
+    //   2. Per-IP rate limit (in-memory, no I/O)
+    //   3. Signature verification (requires body read + HMAC)
+    //   4. Tenant resolution (DO call)
+    //   5. Per-tenant quota check (DO call, atomic increment)
+    //   6. Forward to WebhookStore DO
+    // Each layer blocks before the next to minimize DO calls on invalid requests.
     if (url.pathname === "/webhooks/github" && request.method === "POST") {
-      // IP allowlist — block non-GitHub IPs before any processing
+      // 1. IP allowlist — block non-GitHub IPs before any processing
       if (!(await isGitHubWebhookIP(request))) {
         return new Response("Forbidden", { status: 403 });
       }
 
-      // Rate limit per IP
+      // 2. Rate limit per IP — lightweight in-memory check
       const webhookIP = request.headers.get("CF-Connecting-IP") || "unknown";
       if (!checkWebhookRateLimit(webhookIP)) return rateLimitResponse();
 
+      // 3. Signature verification — read body and verify HMAC
       const body = await request.text();
 
-      // Signature verification
       if (env.GITHUB_WEBHOOK_SECRET) {
         const sig = request.headers.get("X-Hub-Signature-256") || "";
         const valid = await verifyGitHubSignature(env.GITHUB_WEBHOOK_SECRET, body, sig);
@@ -172,7 +181,7 @@ const innerHandler: ExportedHandler<Env> = {
         return new Response("Invalid JSON payload", { status: 400 });
       }
 
-      // Resolve installation_id → tenant via TenantRegistry
+      // 4. Tenant resolution — resolve installation_id → account via TenantRegistry DO
       const installation = payload.installation as { id: number } | undefined;
       const installationId = installation?.id;
 
@@ -191,7 +200,19 @@ const innerHandler: ExportedHandler<Env> = {
         );
       }
 
-      // Forward to tenant-specific WebhookStore DO (store-{accountId})
+      // 5. Per-tenant quota check — atomic check-and-increment in TenantRegistry DO
+      //    Prevents a single tenant from consuming unbounded storage.
+      //    Skip for installation lifecycle events (created/deleted) to avoid blocking registration.
+      if (eventType !== "installation") {
+        const registryId = env.TENANT_REGISTRY.idFromName("global");
+        const registry = env.TENANT_REGISTRY.get(registryId);
+        const quotaResult = await checkTenantQuota(registry, tenant.account_id);
+        if (!quotaResult.allowed) {
+          return quotaResult.response;
+        }
+      }
+
+      // 6. Forward to tenant-specific WebhookStore DO (store-{accountId})
       const storeName = `store-${tenant.account_id}`;
       const doId = env.WEBHOOK_STORE.idFromName(storeName);
       const stub = env.WEBHOOK_STORE.get(doId);

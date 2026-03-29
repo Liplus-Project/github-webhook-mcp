@@ -173,6 +173,47 @@ export class TenantRegistry extends DurableObject {
       return Response.json(quota);
     }
 
+    // ── Check quota and atomically increment if within limit ──
+    // Returns { allowed: true/false, events_stored, events_limit }
+    // Used by the Worker to gate webhook ingestion before forwarding to WebhookStore DO.
+    if (url.pathname === "/quota-check" && request.method === "POST") {
+      const body = await request.json() as { account_id: number };
+
+      const rows = this.ctx.storage.sql.exec(
+        `SELECT events_stored, events_limit FROM quotas WHERE account_id = ?`,
+        body.account_id,
+      ).toArray();
+
+      if (rows.length === 0) {
+        // Unknown tenant — reject (tenant must be registered via installation.created)
+        return Response.json({ allowed: false, reason: "tenant not found" }, { status: 404 });
+      }
+
+      const stored = rows[0].events_stored as number;
+      const limit = rows[0].events_limit as number;
+
+      if (stored >= limit) {
+        return Response.json({
+          allowed: false,
+          events_stored: stored,
+          events_limit: limit,
+          reason: "quota exceeded",
+        }, { status: 429 });
+      }
+
+      // Atomically increment
+      this.ctx.storage.sql.exec(
+        `UPDATE quotas SET events_stored = events_stored + 1 WHERE account_id = ?`,
+        body.account_id,
+      );
+
+      return Response.json({
+        allowed: true,
+        events_stored: stored + 1,
+        events_limit: limit,
+      });
+    }
+
     // ── Increment event counter ──
     if (url.pathname === "/quota-increment" && request.method === "POST") {
       const body = await request.json() as { account_id: number; delta?: number };
