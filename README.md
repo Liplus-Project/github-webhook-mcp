@@ -33,7 +33,7 @@ GitHub ──POST──▶ Cloudflare Worker ──▶ Durable Object (SQLite)
 
 Install the **GitHub Webhook MCP** app on your GitHub organization or account:
 
-1. Visit the [GitHub App installation page](https://github.com/apps/YOUR_APP_SLUG) ← placeholder
+1. Visit the [GitHub App installation page](https://github.com/apps/liplus-webhook-mcp)
 2. Select the organization or account to install on
 3. Choose which repositories to grant access to (or all repositories)
 4. Approve the requested permissions
