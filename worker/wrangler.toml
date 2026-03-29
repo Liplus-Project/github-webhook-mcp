@@ -28,3 +28,42 @@ id = "PLACEHOLDER_KV_ID"
 # Required secrets (set via `wrangler secret put <NAME>`):
 # GITHUB_CLIENT_ID      — GitHub App OAuth client ID
 # GITHUB_CLIENT_SECRET   — GitHub App OAuth client secret
+# GITHUB_WEBHOOK_SECRET  — Webhook HMAC secret (shared with GitHub App settings)
+
+# ─── WAF / Firewall Rule Setup (Cloudflare Dashboard) ───────────────
+#
+# The Worker already performs GitHub IP allowlist checks (github-ip.ts),
+# but a Cloudflare WAF rule provides an additional outer defense layer
+# that blocks traffic before it reaches the Worker, saving CPU billing.
+#
+# Recommended WAF custom rule (Security > WAF > Custom rules):
+#
+#   Rule name: "Allow only GitHub IPs to webhook endpoint"
+#   Expression:
+#     (http.request.uri.path eq "/webhooks/github")
+#     and not (
+#       ip.src in { 140.82.112.0/20 185.199.108.0/22 192.30.252.0/22 143.55.64.0/20 }
+#     )
+#   Action: Block
+#
+#   Note: Update the IP ranges periodically from https://api.github.com/meta
+#   (the "hooks" field). The Worker's github-ip.ts fetches these dynamically,
+#   but WAF rules use static IPs and must be updated manually.
+#
+# Additional recommended rules:
+#
+#   Rate limiting rule (Security > WAF > Rate limiting rules):
+#     "Rate limit webhook endpoint"
+#     Expression: (http.request.uri.path eq "/webhooks/github")
+#     Rate: 300 requests per 1 minute per IP
+#     Action: Block for 60 seconds
+#
+#   "Rate limit API endpoints"
+#     Expression: (http.request.uri.path in {"/mcp" "/events"})
+#     Rate: 120 requests per 1 minute per IP
+#     Action: Block for 60 seconds
+#
+# Usage alerts (Account Home > Notifications):
+#   Set up "Usage Based Billing" notifications for Workers requests
+#   to detect billing anomalies early.
+# ────────────────────────────────────────────────────────────────────
