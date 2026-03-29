@@ -116,7 +116,29 @@ async function ensureClientRegistration(metadata, redirectUris) {
 
 // ── OAuth Localhost Callback Flow ────────────────────────────────────────────
 
-async function performOAuthFlow() {
+// Pending OAuth state: kept alive across tool calls so the callback server
+// can receive the authorization code even if the first tool call returns early.
+let _pendingOAuth = null;
+
+class OAuthPendingError extends Error {
+  constructor(authUrl) {
+    super("OAuth authentication required");
+    this.authUrl = authUrl;
+  }
+}
+
+function openBrowser(url) {
+  if (process.platform === "win32") {
+    // Windows `start` treats the first quoted arg as a window title.
+    // Pass an empty title so the URL is opened correctly.
+    exec(`start "" "${url}"`);
+  } else {
+    const openCmd = process.platform === "darwin" ? "open" : "xdg-open";
+    exec(`${openCmd} "${url}"`);
+  }
+}
+
+async function startOAuthFlow() {
   const metadata = await discoverOAuthMetadata();
 
   const callbackServer = createServer();
@@ -143,13 +165,15 @@ async function performOAuthFlow() {
   authUrl.searchParams.set("code_challenge", codeChallenge);
   authUrl.searchParams.set("code_challenge_method", "S256");
 
-  const authCode = await new Promise((resolve, reject) => {
+  // Promise that resolves when the callback is received
+  const tokenPromise = new Promise((resolve, reject) => {
     const timeout = setTimeout(() => {
       callbackServer.close();
+      _pendingOAuth = null;
       reject(new Error("OAuth callback timed out after 5 minutes"));
     }, 5 * 60 * 1000);
 
-    callbackServer.on("request", (req, res) => {
+    callbackServer.on("request", async (req, res) => {
       const url = new URL(req.url || "/", `http://127.0.0.1:${port}`);
       if (url.pathname !== "/callback") {
         res.writeHead(404);
@@ -166,6 +190,7 @@ async function performOAuthFlow() {
         res.end("<html><body><h1>Authorization failed</h1><p>You can close this tab.</p></body></html>");
         clearTimeout(timeout);
         callbackServer.close();
+        _pendingOAuth = null;
         reject(new Error(`OAuth authorization failed: ${error}`));
         return;
       }
@@ -180,46 +205,81 @@ async function performOAuthFlow() {
       res.end("<html><body><h1>Authorization successful</h1><p>You can close this tab.</p></body></html>");
       clearTimeout(timeout);
       callbackServer.close();
-      resolve(code);
+
+      try {
+        const tokenRes = await fetch(metadata.token_endpoint, {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body: new URLSearchParams({
+            grant_type: "authorization_code",
+            code,
+            redirect_uri: redirectUri,
+            client_id: client.client_id,
+            code_verifier: codeVerifier,
+          }),
+        });
+
+        if (!tokenRes.ok) {
+          _pendingOAuth = null;
+          reject(new Error(`Token exchange failed: ${tokenRes.status} ${await tokenRes.text()}`));
+          return;
+        }
+
+        const tokenData = await tokenRes.json();
+        const tokens = {
+          access_token: tokenData.access_token,
+          refresh_token: tokenData.refresh_token,
+          expires_at: tokenData.expires_in
+            ? Date.now() + tokenData.expires_in * 1000
+            : undefined,
+        };
+
+        await saveTokens(tokens);
+        _pendingOAuth = null;
+        resolve(tokens);
+      } catch (err) {
+        _pendingOAuth = null;
+        reject(err);
+      }
     });
-
-    const openCmd = process.platform === "win32" ? "start" :
-                    process.platform === "darwin" ? "open" : "xdg-open";
-    exec(`${openCmd} "${authUrl.toString()}"`);
-
-    process.stderr.write(
-      `\n[github-webhook-mcp] Open this URL to authenticate:\n${authUrl.toString()}\n\n`,
-    );
   });
 
-  const tokenRes = await fetch(metadata.token_endpoint, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
-      grant_type: "authorization_code",
-      code: authCode,
-      redirect_uri: redirectUri,
-      client_id: client.client_id,
-      code_verifier: codeVerifier,
-    }),
-  });
+  // Try to open the browser
+  openBrowser(authUrl.toString());
+  process.stderr.write(
+    `\n[github-webhook-mcp] Open this URL to authenticate:\n${authUrl.toString()}\n\n`,
+  );
 
-  if (!tokenRes.ok) {
-    throw new Error(`Token exchange failed: ${tokenRes.status} ${await tokenRes.text()}`);
+  // Store pending state so subsequent tool calls can await or re-surface the URL
+  _pendingOAuth = { authUrl: authUrl.toString(), tokenPromise };
+
+  return _pendingOAuth;
+}
+
+async function performOAuthFlow() {
+  // If an OAuth flow is already in progress, check if it completed
+  if (_pendingOAuth) {
+    // Race: either the token is ready or we return the URL again
+    const result = await Promise.race([
+      _pendingOAuth.tokenPromise,
+      new Promise((resolve) => setTimeout(() => resolve(null), 2000)),
+    ]);
+    if (result && result.access_token) return result;
+    throw new OAuthPendingError(_pendingOAuth.authUrl);
   }
 
-  const tokenData = await tokenRes.json();
+  // Start a new OAuth flow
+  const pending = await startOAuthFlow();
 
-  const tokens = {
-    access_token: tokenData.access_token,
-    refresh_token: tokenData.refresh_token,
-    expires_at: tokenData.expires_in
-      ? Date.now() + tokenData.expires_in * 1000
-      : undefined,
-  };
+  // Wait briefly for the browser-opened flow to complete (e.g. auto-open worked)
+  const result = await Promise.race([
+    pending.tokenPromise,
+    new Promise((resolve) => setTimeout(() => resolve(null), 3000)),
+  ]);
+  if (result && result.access_token) return result;
 
-  await saveTokens(tokens);
-  return tokens;
+  // Browser likely didn't open or user hasn't authenticated yet — surface the URL
+  throw new OAuthPendingError(pending.authUrl);
 }
 
 async function refreshAccessToken(refreshToken) {
@@ -466,6 +526,17 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
   try {
     return await callRemoteTool(name, args ?? {});
   } catch (err) {
+    if (err instanceof OAuthPendingError) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Authentication required. Please open this URL to authorize:\n${err.authUrl}\n\nAfter authorizing in the browser, retry the tool call.`,
+          },
+        ],
+        isError: true,
+      };
+    }
     return {
       content: [{ type: "text", text: `Failed to reach worker: ${err}` }],
       isError: true,
