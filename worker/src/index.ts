@@ -267,10 +267,13 @@ const innerHandler: ExportedHandler<Env> = {
         return new Response("Unauthorized", { status: 401 });
       }
 
-      // Rewrite ctx.props to TenantProps shape expected by WebhookMcpAgent
-      (ctx as unknown as { props: { account_id: number; account_login: string } }).props = {
+      // Rewrite ctx.props to TenantProps shape expected by WebhookMcpAgent.
+      // accessible_account_ids includes the user's own ID plus any org IDs
+      // whose App installations the user has access to, enabling cross-org event visibility.
+      (ctx as unknown as { props: { account_id: number; account_login: string; accessible_account_ids: number[] } }).props = {
         account_id: props.githubUserId,
         account_login: props.githubLogin,
+        accessible_account_ids: props.accessibleAccountIds ?? [props.githubUserId],
       };
 
       return mcpHandler.fetch(request, env, ctx);
