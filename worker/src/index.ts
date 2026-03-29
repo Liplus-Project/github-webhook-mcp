@@ -8,14 +8,16 @@
  */
 import { WebhookMcpAgent } from "./agent.js";
 import { WebhookStore } from "./store.js";
+import { TenantRegistry } from "./tenant.js";
 import { isGitHubWebhookIP } from "./github-ip.js";
 import { checkWebhookRateLimit, checkApiRateLimit, rateLimitResponse } from "./rate-limit.js";
 
-export { WebhookMcpAgent, WebhookStore };
+export { WebhookMcpAgent, WebhookStore, TenantRegistry };
 
 interface Env {
   MCP_OBJECT: DurableObjectNamespace;
   WEBHOOK_STORE: DurableObjectNamespace;
+  TENANT_REGISTRY: DurableObjectNamespace;
   GITHUB_WEBHOOK_SECRET?: string;
   MCP_AUTH_TOKEN?: string;
 }
