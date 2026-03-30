@@ -12,7 +12,7 @@
  *
  * Routes (defaultHandler, no OAuth token required):
  *   POST /webhooks/github — GitHub webhook receiver
- *     Auth chain: IP allowlist → rate limit → signature → tenant → quota → self-action → store
+ *     Auth chain: IP allowlist → rate limit → signature → tenant → quota
  *   GET  /oauth/authorize  — Start GitHub OAuth flow
  *   GET  /oauth/callback   — GitHub OAuth callback
  */
@@ -36,7 +36,6 @@ interface Env extends OAuthEnv {
   WEBHOOK_STORE: DurableObjectNamespace;
   TENANT_REGISTRY: DurableObjectNamespace;
   GITHUB_WEBHOOK_SECRET?: string;
-  GITHUB_APP_SLUG?: string;
 }
 
 async function verifyGitHubSignature(
@@ -57,37 +56,6 @@ async function verifyGitHubSignature(
     .map((b) => b.toString(16).padStart(2, "0"))
     .join("");
   return expected === signature;
-}
-
-/**
- * Determine whether a webhook event is a self-action (triggered by the
- * GitHub App's bot account or the installation owner account).
- *
- * Self-action events are still stored for audit/history, but marked as
- * processed immediately so they don't appear in pending lists.
- *
- * @param senderLogin  - payload.sender.login
- * @param senderType   - payload.sender.type ("User" | "Bot" | "Organization" | ...)
- * @param accountLogin - installation owner account login (from TenantRegistry)
- * @param appSlug      - optional GITHUB_APP_SLUG env var
- */
-function isSelfAction(
-  senderLogin: string | undefined,
-  senderType: string | undefined,
-  accountLogin: string,
-  appSlug: string | undefined,
-): boolean {
-  if (!senderLogin) return false;
-
-  // Match: installation owner triggered the event
-  if (senderLogin === accountLogin) return true;
-
-  // Match: GitHub App bot account — follows the pattern "{app-slug}[bot]"
-  if (appSlug && senderType === "Bot" && senderLogin === `${appSlug}[bot]`) {
-    return true;
-  }
-
-  return false;
 }
 
 /**
@@ -180,8 +148,7 @@ const innerHandler: ExportedHandler<Env> = {
     //   3. Signature verification (requires body read + HMAC)
     //   4. Tenant resolution (DO call)
     //   5. Per-tenant quota check (DO call, atomic increment)
-    //   6. Self-action detection
-    //   7. Forward to WebhookStore DO
+    //   6. Forward to WebhookStore DO
     // Each layer blocks before the next to minimize DO calls on invalid requests.
     if (url.pathname === "/webhooks/github" && request.method === "POST") {
       // 1. IP allowlist — block non-GitHub IPs before any processing
@@ -245,17 +212,7 @@ const innerHandler: ExportedHandler<Env> = {
         }
       }
 
-      // 6. Self-action detection — mark bot / installation-owner events as processed
-      //    Events are still stored for audit/history but won't appear in pending lists.
-      const sender = payload.sender as { login?: string; type?: string } | undefined;
-      const selfAction = isSelfAction(
-        sender?.login,
-        sender?.type,
-        tenant.account_login,
-        env.GITHUB_APP_SLUG,
-      );
-
-      // 7. Forward to tenant-specific WebhookStore DO (store-{accountId})
+      // 6. Forward to tenant-specific WebhookStore DO (store-{accountId})
       const storeName = `store-${tenant.account_id}`;
       const doId = env.WEBHOOK_STORE.idFromName(storeName);
       const stub = env.WEBHOOK_STORE.get(doId);
@@ -267,14 +224,14 @@ const innerHandler: ExportedHandler<Env> = {
             id: deliveryId,
             type: eventType,
             received_at: new Date().toISOString(),
-            processed: selfAction,
+            processed: false,
             payload,
           }),
         }),
       );
 
       return new Response(
-        JSON.stringify({ accepted: true, id: deliveryId, self_action: selfAction }),
+        JSON.stringify({ accepted: true, id: deliveryId }),
         {
           status: 202,
           headers: { "Content-Type": "application/json" },
