@@ -28,6 +28,10 @@ export interface EventSummary {
   number: number | null;
   title: string | null;
   url: string | null;
+  /** workflow_run specific fields (null for other event types) */
+  head_branch: string | null;
+  head_sha: string | null;
+  conclusion: string | null;
 }
 
 /** Response from get_pending_status */

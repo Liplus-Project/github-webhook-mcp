@@ -36,6 +36,16 @@ function eventUrl(payload: Record<string, unknown>): string | null {
   ) as string | null;
 }
 
+function extractWorkflowRunField(
+  eventType: string,
+  payload: Record<string, unknown>,
+  field: string,
+): string | null {
+  if (eventType !== "workflow_run") return null;
+  const workflowRun = payload.workflow_run as Record<string, unknown> | undefined;
+  return (workflowRun?.[field] as string) ?? null;
+}
+
 export function summarizeEvent(event: WebhookEvent): EventSummary {
   const payload = event.payload || {};
   return {
@@ -51,5 +61,8 @@ export function summarizeEvent(event: WebhookEvent): EventSummary {
     number: eventNumber(payload),
     title: eventTitle(payload),
     url: eventUrl(payload),
+    head_branch: extractWorkflowRunField(event.type, payload, "head_branch"),
+    head_sha: extractWorkflowRunField(event.type, payload, "head_sha"),
+    conclusion: extractWorkflowRunField(event.type, payload, "conclusion"),
   };
 }
