@@ -1,9 +1,4 @@
 .env
-events.json
-trigger-events/
-codex-runs/
-__pycache__/
-*.pyc
 mcp-server/node_modules/
 mcp-server/*.mcpb
 worker/node_modules/

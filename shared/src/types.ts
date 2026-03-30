@@ -40,10 +40,3 @@ export interface PendingStatus {
   latest_received_at: string | null;
   types: Record<string, number>;
 }
-
-/** SSE event pushed from Worker to local bridge */
-export interface SSEEvent {
-  event_id: string;
-  type: string;
-  summary: EventSummary;
-}

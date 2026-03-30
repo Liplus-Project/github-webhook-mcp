@@ -458,6 +458,20 @@ const TOOLS = [
     },
   },
   {
+    name: "get_webhook_events",
+    description:
+      "Get pending (unprocessed) GitHub webhook events with full payloads. Prefer get_pending_status or list_pending_events for polling.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        limit: {
+          type: "number",
+          description: "Max events to return (1-100, default 20)",
+        },
+      },
+    },
+  },
+  {
     name: "mark_processed",
     description: "Mark a webhook event as processed",
     inputSchema: {

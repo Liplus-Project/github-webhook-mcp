@@ -104,7 +104,7 @@ Enter the secret value when prompted. Keep this value -- you will need it when c
 If your deployment uses OAuth-based authentication:
 
 1. In the GitHub App settings, set the **Callback URL** to:
-   `https://github-webhook-mcp.example.workers.dev/auth/callback`
+   `https://github-webhook-mcp.example.workers.dev/oauth/callback`
 2. Generate a client secret and store it as a Cloudflare secret
 
 ### 5. Custom domain (optional)
