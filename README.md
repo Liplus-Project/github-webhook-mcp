@@ -33,7 +33,7 @@ GitHub ──POST──▶ Cloudflare Worker ──▶ Durable Object (SQLite)
 
 Install the **GitHub Webhook MCP** app on your GitHub organization or account:
 
-1. Visit the [GitHub App installation page](https://github.com/apps/YOUR_APP_SLUG) ← placeholder
+1. Visit the [GitHub App installation page](https://github.com/apps/liplus-webhook-mcp)
 2. Select the organization or account to install on
 3. Choose which repositories to grant access to (or all repositories)
 4. Approve the requested permissions
@@ -44,79 +44,15 @@ Install the **GitHub Webhook MCP** app on your GitHub organization or account:
 
 ### 2. Set up the MCP client
 
-Continue to [Installation](#installation) below to connect your AI assistant to the webhook service.
+Continue to the [Installation guide](docs/installation.md) to connect your AI assistant to the webhook service.
 
 ## Installation
 
-### Claude Desktop — Desktop Extension (.mcpb)
+See [docs/installation.md](docs/installation.md) for the full setup guide, including:
 
-Download `mcp-server.mcpb` from [Releases](https://github.com/Liplus-Project/github-webhook-mcp/releases), then:
-
-1. Open Claude Desktop → **Settings** → **Extensions** → **Install Extension...**
-2. Select the `.mcpb` file
-3. Enter your Worker URL when prompted (e.g. `https://github-webhook-mcp.example.workers.dev`)
-
-### Claude Code CLI — npx
-
-```json
-{
-  "mcpServers": {
-    "github-webhook-mcp": {
-      "command": "npx",
-      "args": ["github-webhook-mcp"],
-      "env": {
-        "WEBHOOK_WORKER_URL": "https://github-webhook-mcp.example.workers.dev",
-        "WEBHOOK_CHANNEL": "1"
-      }
-    }
-  }
-}
-```
-
-Set `WEBHOOK_CHANNEL=1` to enable real-time channel notifications (Claude Code CLI only).
-
-### Codex — config.toml
-
-```toml
-[mcp.github-webhook-mcp]
-command = "npx"
-args = ["github-webhook-mcp"]
-
-[mcp.github-webhook-mcp.env]
-WEBHOOK_WORKER_URL = "https://github-webhook-mcp.example.workers.dev"
-WEBHOOK_CHANNEL = "0"
-```
-
-## Self-Hosting the Worker
-
-### 1. Deploy to Cloudflare
-
-```bash
-cd worker
-npm install
-npx wrangler deploy
-```
-
-### 2. Set the webhook secret
-
-```bash
-npx wrangler secret put GITHUB_WEBHOOK_SECRET
-```
-
-### 3. Configure the GitHub webhook
-
-- Payload URL: `https://your-worker.workers.dev/webhooks/github`
-- Content type: `application/json`
-- Secret: same value as the Cloudflare secret
-- Events: select the events you want to receive
-
-### 4. Optional: Channel notifications
-
-The local MCP bridge supports Claude Code's `claude/channel` capability. When enabled, new webhook events are pushed into your session via SSE in real-time.
-
-```bash
-claude --dangerously-load-development-channels server:github-webhook-mcp
-```
+- **Quick Start** with the preview instance
+- **MCP Client Setup** for Claude Desktop, Claude Code CLI, and Codex
+- **Self-Hosting Guide** for Cloudflare Workers deployment
 
 ## MCP Tools
 
