@@ -24,7 +24,6 @@ interface Env {
 export interface TenantProps {
   account_id?: number;
   account_login?: string;
-  account_type?: string;
   /** All account IDs (user + orgs) whose stores this session can read */
   accessible_account_ids?: number[];
 }
