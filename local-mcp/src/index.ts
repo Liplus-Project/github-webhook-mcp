@@ -22,7 +22,7 @@ import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-const WORKER_URL = process.env.WEBHOOK_WORKER_URL || "https://github-webhook-mcp.liplus.workers.dev";
+const WORKER_URL = process.env.WEBHOOK_WORKER_URL || "https://github-webhook.smgjp.com";
 const CHANNEL_ENABLED = process.env.WEBHOOK_CHANNEL !== "0";
 // Legacy auth support: if WEBHOOK_AUTH_TOKEN is set, use Bearer token directly
 const LEGACY_AUTH_TOKEN = process.env.WEBHOOK_AUTH_TOKEN || "";
