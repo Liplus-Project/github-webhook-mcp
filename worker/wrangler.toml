@@ -29,8 +29,6 @@ id = "PLACEHOLDER_KV_ID"
 # GITHUB_CLIENT_ID      — GitHub App OAuth client ID
 # GITHUB_CLIENT_SECRET   — GitHub App OAuth client secret
 # GITHUB_WEBHOOK_SECRET  — Webhook HMAC secret (shared with GitHub App settings)
-# GITHUB_APP_SLUG        — (optional) GitHub App slug for self-action detection
-#                          When set, webhooks from {slug}[bot] are auto-processed
 
 # ─── WAF / Firewall Rule Setup (Cloudflare Dashboard) ───────────────
 #
