@@ -247,7 +247,7 @@ async function startOAuthFlow() {
   // Try to open the browser
   openBrowser(authUrl.toString());
   process.stderr.write(
-    `\n[github-webhook-mcp] Open this URL to authenticate:\n${authUrl.toString()}\n\n`,
+    `\n[github-webhook-mcp] Opening browser for authentication...\n`,
   );
 
   // Store pending state so subsequent tool calls can await or re-surface the URL
@@ -531,7 +531,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         content: [
           {
             type: "text",
-            text: `Authentication required. Please open this URL to authorize:\n${err.authUrl}\n\nAfter authorizing in the browser, retry the tool call.`,
+            text: `Authentication required. A browser window should have opened for authorization. After authorizing in the browser, retry the tool call.`,
           },
         ],
         isError: true,
