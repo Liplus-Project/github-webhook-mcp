@@ -15,7 +15,7 @@
   },
   "homepage": "https://github.com/Liplus-Project/github-webhook-mcp",
   "documentation": "https://github.com/Liplus-Project/github-webhook-mcp#readme",
-  "support": "https://github.com/Liplus-Project/github-webhook-mcp/issues",
+  "support": "https://github.com/Liplus-Project/github-webhook-mcp/discussions",
   "license": "MIT",
   "server": {
     "type": "node",
