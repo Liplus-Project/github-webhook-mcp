@@ -221,7 +221,7 @@ async function performOAuthFlow(): Promise<TokenData> {
     });
 
     process.stderr.write(
-      `\n[github-webhook-mcp] Open this URL to authenticate:\n${authUrl.toString()}\n\n`,
+      `\n[github-webhook-mcp] Opening browser for authentication...\n`,
     );
   });
 
