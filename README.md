@@ -44,11 +44,11 @@ Install the **GitHub Webhook MCP** app on your GitHub organization or account:
 
 ### 2. Set up the MCP client
 
-Continue to the [Installation guide](docs/installation.md) to connect your AI assistant to the webhook service.
+Continue to the [Installation guide](https://github.com/Liplus-Project/github-webhook-mcp/wiki/Installation) to connect your AI assistant to the webhook service.
 
 ## Installation
 
-See [docs/installation.md](docs/installation.md) for the full setup guide, including:
+See the [Installation wiki page](https://github.com/Liplus-Project/github-webhook-mcp/wiki/Installation) for the full setup guide, including:
 
 - **Quick Start** with the preview instance
 - **MCP Client Setup** for Claude Desktop, Claude Code CLI, and Codex
@@ -82,6 +82,7 @@ Events are stored in a Cloudflare Durable Object (edge storage). The local MCP b
 ## Support
 
 - GitHub Issues: https://github.com/Liplus-Project/github-webhook-mcp/issues
+- [Wiki](https://github.com/Liplus-Project/github-webhook-mcp/wiki) (EN / JA)
 - Requirements: [docs/0-requirements.md](docs/0-requirements.md)
 
 ## Related
