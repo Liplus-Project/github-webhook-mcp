@@ -27,8 +27,7 @@
       ],
       "env": {
         "WEBHOOK_WORKER_URL": "${user_config.worker_url}",
-        "WEBHOOK_CHANNEL": "${user_config.channel_enabled}",
-        "WEBHOOK_AUTH_TOKEN": "${user_config.auth_token}"
+        "WEBHOOK_CHANNEL": "${user_config.channel_enabled}"
       }
     }
   },
@@ -45,13 +44,6 @@
       "required": false,
       "title": "Channel Notifications",
       "default": "0"
-    },
-    "auth_token": {
-      "description": "Legacy Bearer token for self-hosted workers without OAuth. Leave empty to use OAuth authentication (recommended).",
-      "type": "string",
-      "required": false,
-      "title": "Auth Token (Legacy)",
-      "default": ""
     }
   },
   "tools": [
