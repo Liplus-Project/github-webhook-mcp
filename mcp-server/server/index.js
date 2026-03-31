@@ -26,8 +26,6 @@ const WORKER_URL =
   process.env.WEBHOOK_WORKER_URL ||
   "https://github-webhook.smgjp.com";
 const CHANNEL_ENABLED = process.env.WEBHOOK_CHANNEL !== "0";
-// Legacy auth support: if WEBHOOK_AUTH_TOKEN is set, use Bearer token directly
-const LEGACY_AUTH_TOKEN = process.env.WEBHOOK_AUTH_TOKEN || "";
 
 // ── OAuth Token Storage ──────────────────────────────────────────────────────
 
@@ -314,8 +312,6 @@ async function refreshAccessToken(refreshToken) {
 }
 
 async function getAccessToken() {
-  if (LEGACY_AUTH_TOKEN) return LEGACY_AUTH_TOKEN;
-
   if (!_cachedTokens) {
     _cachedTokens = await loadTokens();
   }
