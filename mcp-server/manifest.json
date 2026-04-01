@@ -43,7 +43,7 @@
       "type": "string",
       "required": false,
       "title": "Channel Notifications",
-      "default": "0"
+      "default": "1"
     }
   },
   "tools": [
