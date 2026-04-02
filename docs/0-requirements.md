@@ -221,19 +221,26 @@ Node.js >= 18.0.0 が必要。
 |---------|--------|------|
 | PR to main / push to main | test | Node.js syntax check |
 
-### リリース（CD）
+### リリース作成（Release）
 
 | トリガー | ジョブ | 内容 |
 |---------|--------|------|
 | `v*` タグ push | build-mcpb | `mcpb pack` で .mcpb 生成 |
-| `v*` タグ push | release | GitHub Release 作成 + .mcpb 添付 |
-| `v*` タグ push | npm-publish | npm レジストリに公開 |
+| `v*` タグ push | create-release | GitHub Release 作成 + .mcpb 添付 |
+
+### デプロイ（CD）
+
+| トリガー | ジョブ | 内容 |
+|---------|--------|------|
+| release published | build-mcpb | `mcpb pack` で .mcpb 生成 |
+| release published | npm-publish | npm レジストリに公開 |
 
 リリースフロー:
 1. `v*` タグを push する
-2. CD が自動実行: .mcpb 生成 → release 作成 → .mcpb 添付 → npm publish
-3. npm publish 時にタグ名から自動でバージョンを同期する（package.json の手動更新不要）
-4. プレリリースタグ（`-` を含む）は `next` dist-tag で公開、正式リリースは `latest` で公開
+2. Release ワークフローが自動実行: .mcpb 生成 → GitHub Release 作成 + .mcpb 添付
+3. Release published イベントで CD ワークフローが発火: .mcpb 生成 → npm publish
+4. npm publish 時にリリースタグ名から自動でバージョンを同期する（package.json の手動更新不要）
+5. プレリリースタグ（`-` を含む）は `next` dist-tag で公開、正式リリースは `latest` で公開
 
 manifest.json のバージョンも一致させる。
 
