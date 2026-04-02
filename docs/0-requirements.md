@@ -221,13 +221,6 @@ Node.js >= 18.0.0 が必要。
 |---------|--------|------|
 | PR to main / push to main | test | Node.js syntax check |
 
-### リリース作成（Release）
-
-| トリガー | ジョブ | 内容 |
-|---------|--------|------|
-| `v*` タグ push | build-mcpb | `mcpb pack` で .mcpb 生成 |
-| `v*` タグ push | create-release | GitHub Release 作成 + .mcpb 添付 |
-
 ### デプロイ（CD）
 
 | トリガー | ジョブ | 内容 |
@@ -236,11 +229,13 @@ Node.js >= 18.0.0 が必要。
 | release published | npm-publish | npm レジストリに公開 |
 
 リリースフロー:
-1. `v*` タグを push する
-2. Release ワークフローが自動実行: .mcpb 生成 → GitHub Release 作成 + .mcpb 添付
-3. Release published イベントで CD ワークフローが発火: .mcpb 生成 → npm publish
-4. npm publish 時にリリースタグ名から自動でバージョンを同期する（package.json の手動更新不要）
-5. プレリリースタグ（`-` を含む）は `next` dist-tag で公開、正式リリースは `latest` で公開
+1. AI が `gh release create` でリリースを作成する（PAT 経由で release イベントが発火する）
+2. Release published イベントで CD ワークフローが発火: .mcpb 生成 → npm publish
+3. npm publish 時にリリースタグ名から自動でバージョンを同期する（package.json の手動更新不要）
+4. プレリリースタグ（`-` を含む）は `next` dist-tag で公開、正式リリースは `latest` で公開
+
+注意: GITHUB_TOKEN で作成されたリリースは release イベントを発火しない（GitHub Actions の制限）。
+そのため AI が PAT 認証済み gh CLI でリリースを作成する運用とする。
 
 manifest.json のバージョンも一致させる。
 
