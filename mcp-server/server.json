@@ -1,6 +1,6 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
-  "name": "io.github.liplus-project/github-webhook-mcp",
+  "name": "io.github.Liplus-Project/github-webhook-mcp",
   "description": "MCP server bridging GitHub webhooks via Cloudflare Worker for real-time event streaming",
   "version": "0.8.1",
   "repository": {
