@@ -226,11 +226,12 @@ Node.js >= 18.0.0 が必要。
 | トリガー | ジョブ | 内容 |
 |---------|--------|------|
 | release published | build-mcpb | `mcpb pack` で .mcpb 生成 |
+| release published | attach-mcpb | `gh release upload` で .mcpb をリリースに添付（build-mcpb 後） |
 | release published | npm-publish | npm レジストリに公開 |
 
 リリースフロー:
 1. AI が `gh release create` でリリースを作成する（PAT 経由で release イベントが発火する）
-2. Release published イベントで CD ワークフローが発火: .mcpb 生成 → npm publish
+2. Release published イベントで CD ワークフローが発火: .mcpb 生成 → .mcpb リリース添付 → npm publish
 3. npm publish 時にリリースタグ名から自動でバージョンを同期する（package.json の手動更新不要）
 4. プレリリースタグ（`-` を含む）は `next` dist-tag で公開、正式リリースは `latest` で公開
 
