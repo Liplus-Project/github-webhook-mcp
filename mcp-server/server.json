@@ -1,5 +1,5 @@
 {
-  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-07-09/server.schema.json",
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.liplus-project/github-webhook-mcp",
   "description": "MCP server bridging GitHub webhooks via Cloudflare Worker for real-time event streaming",
   "version": "0.8.1",
@@ -11,23 +11,23 @@
   },
   "packages": [
     {
-      "registry_type": "npm",
+      "registryType": "npm",
       "identifier": "github-webhook-mcp",
       "version": "0.8.1",
-      "runtime_hint": "npx",
+      "runtimeHint": "npx",
       "transport": {
         "type": "stdio"
       },
-      "environment_variables": [
+      "environmentVariables": [
         {
           "name": "WEBHOOK_WORKER_URL",
           "description": "URL of your deployed Cloudflare Worker endpoint (default: https://github-webhook.smgjp.com)",
-          "is_required": false
+          "isRequired": false
         },
         {
           "name": "WEBHOOK_CHANNEL",
           "description": "Set to '0' to disable SSE channel notifications (default: enabled)",
-          "is_required": false
+          "isRequired": false
         }
       ]
     }
