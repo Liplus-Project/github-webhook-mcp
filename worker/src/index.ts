@@ -250,11 +250,163 @@ const innerHandler: ExportedHandler<Env> = {
         return new Response("Unauthorized", { status: 401 });
       }
 
-      // Route to tenant-specific WebhookStore DO
-      const storeName = `store-${props.githubUserId}`;
-      const doId = env.WEBHOOK_STORE.idFromName(storeName);
-      const stub = env.WEBHOOK_STORE.get(doId);
-      return stub.fetch(request);
+      // Resolve all accessible account stores (user + orgs).
+      // Webhooks are ingested into store-{account_id} keyed by the GitHub App
+      // installation's account, so org events live in org stores, not user stores.
+      const accountIds = props.accessibleAccountIds?.length
+        ? props.accessibleAccountIds
+        : [props.githubUserId];
+      const storeStubs = accountIds.map((id) => {
+        const doId = env.WEBHOOK_STORE.idFromName(`store-${id}`);
+        return env.WEBHOOK_STORE.get(doId);
+      });
+
+      // Single store — direct pass-through (no fanout overhead)
+      if (storeStubs.length === 1) {
+        return storeStubs[0].fetch(request);
+      }
+
+      // ── Multi-store fanout: WebSocket ──
+      if (request.headers.get("Upgrade") === "websocket") {
+        const clientPair = new WebSocketPair();
+        const clientWs = clientPair[0];
+        const serverWs = clientPair[1];
+
+        // Accept the server-side WebSocket (we manage the lifecycle)
+        serverWs.accept();
+
+        // Track upstream connections for cleanup
+        const upstreamSockets: WebSocket[] = [];
+
+        // Connect to each store DO via internal WebSocket
+        for (const stub of storeStubs) {
+          const upstreamRes = await stub.fetch(
+            new Request("https://do/events", {
+              headers: { "Upgrade": "websocket" },
+            }),
+          );
+          const upstreamWs = upstreamRes.webSocket;
+          if (!upstreamWs) continue;
+
+          upstreamWs.accept();
+          upstreamSockets.push(upstreamWs);
+
+          // Forward upstream messages to the client (skip initial "connected" from each DO)
+          let firstMessage = true;
+          upstreamWs.addEventListener("message", (event: MessageEvent) => {
+            if (firstMessage) {
+              firstMessage = false;
+              // Skip individual DO "connected" messages; we send our own below
+              return;
+            }
+            try {
+              serverWs.send(typeof event.data === "string" ? event.data : "");
+            } catch {
+              // Client disconnected
+            }
+          });
+
+          upstreamWs.addEventListener("close", () => {
+            // Upstream closed; remove from tracking
+            const idx = upstreamSockets.indexOf(upstreamWs);
+            if (idx >= 0) upstreamSockets.splice(idx, 1);
+          });
+        }
+
+        // Forward client messages (e.g. "ping") to all upstream DOs
+        serverWs.addEventListener("message", (event: MessageEvent) => {
+          for (const ws of upstreamSockets) {
+            try {
+              ws.send(typeof event.data === "string" ? event.data : "");
+            } catch { /* upstream gone */ }
+          }
+        });
+
+        // When client disconnects, close all upstream connections
+        serverWs.addEventListener("close", () => {
+          for (const ws of upstreamSockets) {
+            try { ws.close(1000, "client disconnected"); } catch { /* ok */ }
+          }
+        });
+
+        // Send unified "connected" message to client
+        serverWs.send(JSON.stringify({ status: "connected", stores: accountIds.length }));
+
+        return new Response(null, { status: 101, webSocket: clientWs });
+      }
+
+      // ── Multi-store fanout: SSE ──
+      const sseEncoder = new TextEncoder();
+      const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
+      const writer = writable.getWriter();
+
+      // Send initial connected message
+      writer.write(sseEncoder.encode(
+        `data: ${JSON.stringify({ status: "connected", stores: accountIds.length })}\n\n`,
+      ));
+
+      // Track abort controllers for upstream fetches
+      const upstreamAborts: AbortController[] = [];
+
+      // Connect to each store DO via internal SSE
+      for (const stub of storeStubs) {
+        const abortCtrl = new AbortController();
+        upstreamAborts.push(abortCtrl);
+
+        const upstreamRes = await stub.fetch(
+          new Request("https://do/events", {
+            signal: abortCtrl.signal,
+          }),
+        );
+
+        if (!upstreamRes.body) continue;
+
+        // Pipe upstream SSE data to client (runs in background)
+        const reader = upstreamRes.body.getReader();
+        const pump = async () => {
+          let skipFirst = true;
+          let buffer = "";
+          try {
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              // Parse SSE frames to skip initial "connected" message from each DO
+              const text = new TextDecoder().decode(value);
+              buffer += text;
+              const frames = buffer.split("\n\n");
+              buffer = frames.pop() || ""; // last element is incomplete or empty
+              for (const frame of frames) {
+                if (!frame.trim()) continue;
+                if (skipFirst) {
+                  skipFirst = false;
+                  continue; // Skip DO's own "connected" message
+                }
+                await writer.write(sseEncoder.encode(frame + "\n\n"));
+              }
+            }
+          } catch {
+            // Stream ended or aborted
+          }
+        };
+        // Don't await — let all pumps run concurrently
+        ctx.waitUntil(pump());
+      }
+
+      // Cleanup on client disconnect
+      request.signal.addEventListener("abort", () => {
+        for (const ctrl of upstreamAborts) {
+          ctrl.abort();
+        }
+        writer.close().catch(() => {});
+      });
+
+      return new Response(readable, {
+        headers: {
+          "Content-Type": "text/event-stream",
+          "Cache-Control": "no-cache",
+          "Connection": "keep-alive",
+        },
+      });
     }
 
     // ── MCP endpoint (OAuth-protected, ctx.props set) ────────
