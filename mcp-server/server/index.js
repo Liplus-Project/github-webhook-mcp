@@ -520,7 +520,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }))
 server.setRequestHandler(CallToolRequestSchema, async (req) => {
   const { name, arguments: args } = req.params;
   try {
-    return await callRemoteTool(name, args ?? {});
+    const result = await callRemoteTool(name, args ?? {});
+    // First successful tool call confirms OAuth is working
+    markOAuthEstablished();
+    return result;
   } catch (err) {
     if (err instanceof OAuthPendingError) {
       return {
@@ -542,6 +545,21 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
 
 // ── SSE Listener → Channel Notifications ─────────────────────────────────────
 
+/** Track whether OAuth has been established (first successful tool call). */
+let _oauthEstablished = false;
+
+function markOAuthEstablished() {
+  if (!_oauthEstablished) {
+    _oauthEstablished = true;
+    if (CHANNEL_ENABLED && !_sseConnected) {
+      process.stderr.write("[github-webhook-mcp] OAuth established, starting SSE connection\n");
+      connectSSE();
+    }
+  }
+}
+
+let _sseConnected = false;
+
 async function connectSSE() {
   let EventSourceImpl;
   try {
@@ -551,47 +569,88 @@ async function connectSSE() {
     return;
   }
 
-  const token = await getAccessToken();
-  const sseUrl = token
-    ? `${WORKER_URL}/events?token=${encodeURIComponent(token)}`
-    : `${WORKER_URL}/events`;
-  const es = new EventSourceImpl(sseUrl);
+  _sseConnected = true;
+  let retryCount = 0;
+  const MAX_RETRY_DELAY = 60_000; // 60 seconds
+  const BASE_RETRY_DELAY = 1_000; // 1 second
 
-  es.onmessage = (event) => {
+  async function attemptConnection() {
+    let token;
     try {
-      const data = JSON.parse(event.data);
-      if ("heartbeat" in data || "status" in data) return;
-      if (!data.summary) return;
-
-      const s = data.summary;
-      const lines = [
-        `[${s.type}] ${s.repo ?? ""}`,
-        s.action ? `action: ${s.action}` : null,
-        s.title ? `#${s.number ?? ""} ${s.title}` : null,
-        s.sender ? `by ${s.sender}` : null,
-        s.url ?? null,
-      ].filter(Boolean);
-
-      server.notification({
-        method: "notifications/claude/channel",
-        params: {
-          content: lines.join("\n"),
-          meta: {
-            chat_id: "github",
-            message_id: s.id,
-            user: s.sender ?? "github",
-            ts: s.received_at,
-          },
-        },
-      });
-    } catch {
-      // Ignore parse errors
+      token = await getAccessToken();
+    } catch (err) {
+      process.stderr.write(`[github-webhook-mcp] SSE: failed to get access token: ${err}\n`);
+      scheduleRetry();
+      return;
     }
-  };
 
-  es.onerror = () => {
-    // EventSource auto-reconnects
-  };
+    if (!token) {
+      process.stderr.write("[github-webhook-mcp] SSE: no access token available, will retry\n");
+      scheduleRetry();
+      return;
+    }
+
+    const sseUrl = `${WORKER_URL}/events?token=${encodeURIComponent(token)}`;
+    const es = new EventSourceImpl(sseUrl);
+
+    es.onopen = () => {
+      retryCount = 0; // Reset backoff on successful connection
+      process.stderr.write("[github-webhook-mcp] SSE: connected\n");
+    };
+
+    es.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        if ("heartbeat" in data || "status" in data) return;
+        if (!data.summary) return;
+
+        const s = data.summary;
+        const lines = [
+          `[${s.type}] ${s.repo ?? ""}`,
+          s.action ? `action: ${s.action}` : null,
+          s.title ? `#${s.number ?? ""} ${s.title}` : null,
+          s.sender ? `by ${s.sender}` : null,
+          s.url ?? null,
+        ].filter(Boolean);
+
+        server.notification({
+          method: "notifications/claude/channel",
+          params: {
+            content: lines.join("\n"),
+            meta: {
+              chat_id: "github",
+              message_id: s.id,
+              user: s.sender ?? "github",
+              ts: s.received_at,
+            },
+          },
+        });
+      } catch {
+        // Ignore parse errors
+      }
+    };
+
+    es.onerror = (err) => {
+      const status = err && err.status;
+      if (status === 401) {
+        process.stderr.write("[github-webhook-mcp] SSE: 401 unauthorized, closing and retrying with fresh token\n");
+        _cachedTokens = null; // Force token refresh on next attempt
+      } else {
+        process.stderr.write(`[github-webhook-mcp] SSE: connection error${status ? ` (status ${status})` : ""}\n`);
+      }
+      es.close();
+      scheduleRetry();
+    };
+  }
+
+  function scheduleRetry() {
+    const delay = Math.min(BASE_RETRY_DELAY * Math.pow(2, retryCount), MAX_RETRY_DELAY);
+    retryCount++;
+    process.stderr.write(`[github-webhook-mcp] SSE: retrying in ${Math.round(delay / 1000)}s (attempt ${retryCount})\n`);
+    setTimeout(() => attemptConnection(), delay);
+  }
+
+  attemptConnection();
 }
 
 // ── Start ────────────────────────────────────────────────────────────────────
@@ -600,5 +659,16 @@ const transport = new StdioServerTransport();
 await server.connect(transport);
 
 if (CHANNEL_ENABLED) {
-  connectSSE();
+  // Check if tokens already exist from a previous session.
+  // If so, start SSE immediately. Otherwise, defer until after the first
+  // successful tool call establishes OAuth.
+  loadTokens().then((tokens) => {
+    if (tokens && tokens.access_token) {
+      _cachedTokens = tokens;
+      markOAuthEstablished();
+    }
+    // If no tokens, SSE will start after the first successful tool call
+  }).catch(() => {
+    // Token load failed, SSE will start after first tool call
+  });
 }
