@@ -9,6 +9,8 @@ import { summarizeEvent } from "../../shared/src/summarize.js";
 
 export class WebhookStore extends DurableObject {
   private initialized = false;
+  private sseWriters = new Set<WritableStreamDefaultWriter<Uint8Array>>();
+  private sseEncoder = new TextEncoder();
 
   private ensureTable() {
     if (this.initialized) return;
@@ -26,15 +28,26 @@ export class WebhookStore extends DurableObject {
     this.initialized = true;
   }
 
-  /** Broadcast to all connected WebSocket clients */
+  /** Broadcast to all connected WebSocket and SSE clients */
   private broadcast(data: unknown) {
     const msg = JSON.stringify(data);
+
+    // WebSocket clients
     for (const ws of this.ctx.getWebSockets()) {
       try {
         ws.send(msg);
       } catch {
         // Client disconnected; will be cleaned up by webSocketClose
       }
+    }
+
+    // SSE clients
+    const ssePayload = this.sseEncoder.encode(`data: ${msg}\n\n`);
+    for (const writer of this.sseWriters) {
+      writer.write(ssePayload).catch(() => {
+        // Client disconnected; remove from set
+        this.sseWriters.delete(writer);
+      });
     }
   }
 
@@ -55,22 +68,24 @@ export class WebhookStore extends DurableObject {
     if (url.pathname === "/events" && request.method === "GET") {
       // Upgrade hint: clients should use WebSocket for reliable delivery.
       // SSE fallback kept for compatibility but may miss events during DO hibernation.
-      const encoder = new TextEncoder();
       const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
       const writer = writable.getWriter();
-      writer.write(encoder.encode(`data: ${JSON.stringify({ status: "connected", hint: "use WebSocket for reliable delivery" })}\n\n`));
+      writer.write(this.sseEncoder.encode(`data: ${JSON.stringify({ status: "connected", hint: "use WebSocket for reliable delivery" })}\n\n`));
+
+      // Register this SSE writer for broadcast delivery
+      this.sseWriters.add(writer);
 
       // Heartbeat to keep connection alive
       const heartbeat = setInterval(() => {
-        try {
-          writer.write(encoder.encode(`data: ${JSON.stringify({ heartbeat: Date.now() })}\n\n`));
-        } catch {
+        writer.write(this.sseEncoder.encode(`data: ${JSON.stringify({ heartbeat: Date.now() })}\n\n`)).catch(() => {
           clearInterval(heartbeat);
-        }
+          this.sseWriters.delete(writer);
+        });
       }, 30000);
 
       request.signal.addEventListener("abort", () => {
         clearInterval(heartbeat);
+        this.sseWriters.delete(writer);
         writer.close().catch(() => {});
       });
 
