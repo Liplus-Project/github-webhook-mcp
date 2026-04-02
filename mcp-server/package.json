@@ -9,7 +9,8 @@
   "main": "./server/index.js",
   "files": [
     "server/",
-    "manifest.json"
+    "manifest.json",
+    "server.json"
   ],
   "scripts": {
     "start": "node server/index.js",
@@ -32,6 +33,7 @@
     "webhook",
     "cloudflare"
   ],
+  "mcpName": "io.github.liplus-project/github-webhook-mcp",
   "license": "MIT",
   "repository": {
     "type": "git",
