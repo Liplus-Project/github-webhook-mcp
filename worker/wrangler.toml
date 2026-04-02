@@ -21,9 +21,7 @@ new_sqlite_classes = ["TenantRegistry"]
 # KV namespace for OAuth provider (token, client, grant storage)
 [[kv_namespaces]]
 binding = "OAUTH_KV"
-id = "PLACEHOLDER_KV_ID"
-# After creating the KV namespace with `wrangler kv namespace create OAUTH_KV`,
-# replace PLACEHOLDER_KV_ID with the actual namespace ID.
+id = "67611ab57f734f1c9a0b5d5a96f65e78"
 
 # Required secrets (set via `wrangler secret put <NAME>`):
 # GITHUB_CLIENT_ID      — GitHub App OAuth client ID
