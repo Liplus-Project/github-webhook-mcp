@@ -484,7 +484,10 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
 mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
   try {
-    return await callRemoteTool(name, args ?? {});
+    const result = await callRemoteTool(name, args ?? {});
+    // First successful tool call confirms OAuth is working
+    markOAuthEstablished();
+    return result;
   } catch (err) {
     return {
       content: [{ type: "text", text: `Failed to reach worker: ${err}` }],
@@ -495,18 +498,52 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
 
 // ── WebSocket Listener → Channel Notifications ──────────────────────────────
 
+/** Track whether OAuth has been established (first successful tool call). */
+let _oauthEstablished = false;
+let _wsConnected = false;
+
+function markOAuthEstablished(): void {
+  if (!_oauthEstablished) {
+    _oauthEstablished = true;
+    if (CHANNEL_ENABLED && !_wsConnected) {
+      process.stderr.write("[github-webhook-mcp] OAuth established, starting WebSocket connection\n");
+      connectWebSocket();
+    }
+  }
+}
+
 async function connectWebSocket() {
   const wsUrl = WORKER_URL.replace(/^http/, "ws") + "/events";
   let ws: WebSocket;
-  let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   let pingTimer: ReturnType<typeof setInterval> | null = null;
 
+  _wsConnected = true;
+  let retryCount = 0;
+  const MAX_RETRY_DELAY = 60_000; // 60 seconds
+  const BASE_RETRY_DELAY = 1_000; // 1 second
+
   async function connect() {
-    const token = await getAccessToken();
-    const wsOptions = token ? { headers: { "Authorization": `Bearer ${token}` } } : undefined;
+    let token: string;
+    try {
+      token = await getAccessToken();
+    } catch (err) {
+      process.stderr.write(`[github-webhook-mcp] WebSocket: failed to get access token: ${err}\n`);
+      scheduleRetry();
+      return;
+    }
+
+    if (!token) {
+      process.stderr.write("[github-webhook-mcp] WebSocket: no access token available, will retry\n");
+      scheduleRetry();
+      return;
+    }
+
+    const wsOptions = { headers: { "Authorization": `Bearer ${token}` } };
     ws = new WebSocket(wsUrl, wsOptions);
 
     ws.on("open", () => {
+      retryCount = 0; // Reset backoff on successful connection
+      process.stderr.write("[github-webhook-mcp] WebSocket: connected\n");
       // Send periodic pings to keep connection alive
       pingTimer = setInterval(() => {
         if (ws.readyState === WebSocket.OPEN) {
@@ -547,15 +584,30 @@ async function connectWebSocket() {
       }
     });
 
-    ws.on("close", () => {
+    ws.on("close", (code: number) => {
       if (pingTimer) clearInterval(pingTimer);
-      // Reconnect after 5 seconds
-      reconnectTimer = setTimeout(() => void connect(), 5000);
+      pingTimer = null;
+      if (code === 1008 || code === 4401) {
+        // Policy violation or unauthorized — refresh token
+        process.stderr.write(`[github-webhook-mcp] WebSocket: closed with code ${code}, refreshing token\n`);
+        _cachedTokens = null;
+      } else {
+        process.stderr.write(`[github-webhook-mcp] WebSocket: closed (code ${code})\n`);
+      }
+      scheduleRetry();
     });
 
-    ws.on("error", () => {
+    ws.on("error", (err: Error) => {
+      process.stderr.write(`[github-webhook-mcp] WebSocket: error: ${err.message}\n`);
       // Will trigger close event, which handles reconnect
     });
+  }
+
+  function scheduleRetry(): void {
+    const delay = Math.min(BASE_RETRY_DELAY * Math.pow(2, retryCount), MAX_RETRY_DELAY);
+    retryCount++;
+    process.stderr.write(`[github-webhook-mcp] WebSocket: retrying in ${Math.round(delay / 1000)}s (attempt ${retryCount})\n`);
+    setTimeout(() => void connect(), delay);
   }
 
   await connect();
@@ -566,5 +618,16 @@ async function connectWebSocket() {
 await mcp.connect(new StdioServerTransport());
 
 if (CHANNEL_ENABLED) {
-  void connectWebSocket();
+  // Check if tokens already exist from a previous session.
+  // If so, start WebSocket immediately. Otherwise, defer until after the first
+  // successful tool call establishes OAuth.
+  loadTokens().then((tokens) => {
+    if (tokens && tokens.access_token) {
+      _cachedTokens = tokens;
+      markOAuthEstablished();
+    }
+    // If no tokens, WebSocket will start after first tool call
+  }).catch(() => {
+    // Token load failed, WebSocket will start after first tool call
+  });
 }
