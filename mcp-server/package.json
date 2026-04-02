@@ -33,7 +33,7 @@
     "webhook",
     "cloudflare"
   ],
-  "mcpName": "io.github.liplus-project/github-webhook-mcp",
+  "mcpName": "io.github.Liplus-Project/github-webhook-mcp",
   "license": "MIT",
   "repository": {
     "type": "git",
