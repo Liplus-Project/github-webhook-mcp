@@ -54,6 +54,67 @@ See the [Installation wiki page](https://github.com/Liplus-Project/github-webhoo
 - **MCP Client Setup** for Claude Desktop, Claude Code CLI, and Codex
 - **Self-Hosting Guide** for Cloudflare Workers deployment
 
+## Usage Examples
+
+### Example 1: Check pending webhook status
+
+**User prompt:**
+> "Are there any new GitHub notifications?"
+
+**Expected output:**
+The AI calls `get_pending_status` and returns a summary:
+
+```
+You have 3 pending webhook events:
+- 2 push events
+- 1 pull_request event
+```
+
+### Example 2: Inspect a specific event
+
+**User prompt:**
+> "Show me the details of the latest pull request event."
+
+**Expected output:**
+The AI calls `list_pending_events` to find the PR event, then `get_event` with the event ID to retrieve the full payload:
+
+```
+PR #42 "Fix login timeout" was opened by @alice in repo acme/web-app
+  Branch: fix/login-timeout → main
+  Status: open
+  Changed files: 3
+```
+
+### Example 3: Process events after review
+
+**User prompt:**
+> "I've reviewed all the push notifications, mark them as done."
+
+**Expected output:**
+The AI calls `list_pending_events` to find push events, then `mark_processed` for each one:
+
+```
+Marked 2 push events as processed:
+- Push to main by @bob (3 commits)
+- Push to develop by @alice (1 commit)
+```
+
+### Example 4: Monitor CI status via webhooks
+
+**User prompt:**
+> "Did the CI checks pass on my latest PR?"
+
+**Expected output:**
+The AI calls `list_pending_events` to find `check_run` events related to the PR, then `get_event` for details:
+
+```
+CI results for PR #42 "Fix login timeout":
+- build (ubuntu-latest): ✓ passed
+- lint: ✓ passed
+- test (node-18): ✓ passed
+All checks passed.
+```
+
 ## MCP Tools
 
 | Tool | Description |
