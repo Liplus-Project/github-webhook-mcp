@@ -572,6 +572,10 @@ async function connectWebSocket() {
           params: {
             content: parts.join(" "),
             meta: {
+              chat_id: "github",
+              message_id: s.id,
+              user: s.sender ?? "github",
+              ts: s.received_at,
               event_id: s.id,
               type: s.type,
               ...(s.repo ? { repo: s.repo } : {}),
