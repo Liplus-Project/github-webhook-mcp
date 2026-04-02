@@ -2,7 +2,7 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-07-09/server.schema.json",
   "name": "io.github.liplus-project/github-webhook-mcp",
   "description": "MCP server bridging GitHub webhooks via Cloudflare Worker for real-time event streaming",
-  "version": "0.8.0",
+  "version": "0.8.1",
   "repository": {
     "url": "https://github.com/Liplus-Project/github-webhook-mcp",
     "source": "github",
@@ -13,7 +13,7 @@
     {
       "registry_type": "npm",
       "identifier": "github-webhook-mcp",
-      "version": "0.8.0",
+      "version": "0.8.1",
       "runtime_hint": "npx",
       "transport": {
         "type": "stdio"
