@@ -21,6 +21,10 @@ import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { exec } from "node:child_process";
+import { createRequire } from "node:module";
+
+const require = createRequire(import.meta.url);
+const { version: PACKAGE_VERSION } = require("../package.json");
 
 const WORKER_URL =
   process.env.WEBHOOK_WORKER_URL ||
@@ -423,7 +427,7 @@ if (CHANNEL_ENABLED) {
 }
 
 const server = new Server(
-  { name: "github-webhook-mcp", version: "1.0.0" },
+  { name: "github-webhook-mcp", version: PACKAGE_VERSION },
   {
     capabilities,
     instructions: CHANNEL_ENABLED
