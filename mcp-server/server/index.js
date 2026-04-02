@@ -590,8 +590,10 @@ async function connectSSE() {
       return;
     }
 
-    const sseUrl = `${WORKER_URL}/events?token=${encodeURIComponent(token)}`;
-    const es = new EventSourceImpl(sseUrl);
+    const sseUrl = `${WORKER_URL}/events`;
+    const es = new EventSourceImpl(sseUrl, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
 
     es.onopen = () => {
       retryCount = 0; // Reset backoff on successful connection
