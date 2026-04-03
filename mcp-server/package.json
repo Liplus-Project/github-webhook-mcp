@@ -18,7 +18,8 @@
     "pack:mcpb": "mcpb pack"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.0.0"
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "ws": "^8.18.0"
   },
   "devDependencies": {
     "@anthropic-ai/mcpb": "^2.1.0"

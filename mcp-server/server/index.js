@@ -23,6 +23,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { exec } from "node:child_process";
 import { createRequire } from "node:module";
+import WebSocketClient from "ws";
 
 const require = createRequire(import.meta.url);
 const { version: PACKAGE_VERSION } = require("../package.json");
@@ -593,27 +594,27 @@ async function connectWebSocket() {
     let pingTimer = null;
 
     try {
-      ws = new WebSocket(wsUrl, { headers: { Authorization: `Bearer ${token}` } });
+      ws = new WebSocketClient(wsUrl, { headers: { Authorization: `Bearer ${token}` } });
     } catch (err) {
       process.stderr.write(`[github-webhook-mcp] WebSocket: failed to create connection: ${err}\n`);
       scheduleRetry();
       return;
     }
 
-    ws.addEventListener("open", () => {
+    ws.on("open", () => {
       retryCount = 0; // Reset backoff on successful connection
       process.stderr.write("[github-webhook-mcp] WebSocket: connected\n");
       // Send periodic pings to keep connection alive (25s keepalive)
       pingTimer = setInterval(() => {
-        if (ws.readyState === WebSocket.OPEN) {
+        if (ws.readyState === WebSocketClient.OPEN) {
           ws.send("ping");
         }
       }, 25_000);
     });
 
-    ws.addEventListener("message", (event) => {
+    ws.on("message", (raw) => {
       try {
-        const data = JSON.parse(typeof event.data === "string" ? event.data : event.data.toString());
+        const data = JSON.parse(raw.toString());
 
         // Skip status, pong, heartbeat messages
         if ("status" in data || "pong" in data || "heartbeat" in data) return;
@@ -645,10 +646,9 @@ async function connectWebSocket() {
       }
     });
 
-    ws.addEventListener("close", (event) => {
+    ws.on("close", (code) => {
       if (pingTimer) clearInterval(pingTimer);
       pingTimer = null;
-      const code = event.code;
       if (code === 1008 || code === 4401) {
         // Policy violation or unauthorized — refresh token
         process.stderr.write(`[github-webhook-mcp] WebSocket: closed with code ${code}, refreshing token\n`);
@@ -659,8 +659,8 @@ async function connectWebSocket() {
       scheduleRetry();
     });
 
-    ws.addEventListener("error", () => {
-      process.stderr.write("[github-webhook-mcp] WebSocket: connection error\n");
+    ws.on("error", (err) => {
+      process.stderr.write(`[github-webhook-mcp] WebSocket: error: ${err.message}\n`);
       // Will trigger close event, which handles reconnect
     });
   }
