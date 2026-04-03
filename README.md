@@ -8,16 +8,16 @@ Real-time GitHub webhook notifications for Claude via Cloudflare Worker + Durabl
 GitHub ──POST──▶ Cloudflare Worker ──▶ Durable Object (SQLite)
                                            │
                                            ├── MCP tools (Streamable HTTP)
-                                           ├── SSE real-time stream
+                                           ├── WebSocket real-time stream
                                            │
                           ┌────────────────┘
                           │
      Desktop / Codex: .mcpb local bridge ──▶ polling via MCP tools
-     Claude Code CLI: .mcpb local bridge ──▶ SSE → channel notifications
+     Claude Code CLI: .mcpb local bridge ──▶ WebSocket → channel notifications
 ```
 
 - **Cloudflare Worker** receives GitHub webhooks, verifies signatures, stores events in a Durable Object with SQLite.
-- **Local MCP bridge** (.mcpb) proxies tool calls to the Worker and optionally listens to SSE for real-time channel notifications.
+- **Local MCP bridge** (.mcpb) proxies tool calls to the Worker and optionally connects via WebSocket for real-time channel notifications.
 - No local webhook receiver or tunnel required.
 
 ## Prerequisites
