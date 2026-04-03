@@ -4,7 +4,8 @@
  *
  * Thin stdio MCP server that proxies tool calls to a remote
  * Cloudflare Worker + Durable Object backend via Streamable HTTP.
- * Optionally listens to SSE for real-time channel notifications.
+ * Optionally listens via WebSocket for real-time channel notifications
+ * (enables DO hibernation on the Worker side).
  * Authenticates via OAuth 2.1 with PKCE (localhost callback).
  *
  * Discord MCP pattern: data lives in the cloud, local MCP is a thin bridge.
@@ -547,7 +548,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
   }
 });
 
-// ── SSE Listener → Channel Notifications ─────────────────────────────────────
+// ── WebSocket Listener → Channel Notifications ──────────────────────────────
 
 /** Track whether OAuth has been established (first successful tool call). */
 let _oauthEstablished = false;
@@ -555,59 +556,67 @@ let _oauthEstablished = false;
 function markOAuthEstablished() {
   if (!_oauthEstablished) {
     _oauthEstablished = true;
-    if (CHANNEL_ENABLED && !_sseConnected) {
-      process.stderr.write("[github-webhook-mcp] OAuth established, starting SSE connection\n");
-      connectSSE();
+    if (CHANNEL_ENABLED && !_wsConnected) {
+      process.stderr.write("[github-webhook-mcp] OAuth established, starting WebSocket connection\n");
+      connectWebSocket();
     }
   }
 }
 
-let _sseConnected = false;
+let _wsConnected = false;
 
-async function connectSSE() {
-  let EventSourceImpl;
-  try {
-    EventSourceImpl = (await import("eventsource")).default;
-  } catch {
-    // eventsource not installed — skip SSE
-    return;
-  }
+async function connectWebSocket() {
+  const wsUrl = WORKER_URL.replace(/^http/, "ws") + "/events";
 
-  _sseConnected = true;
+  _wsConnected = true;
   let retryCount = 0;
   const MAX_RETRY_DELAY = 60_000; // 60 seconds
   const BASE_RETRY_DELAY = 1_000; // 1 second
 
-  async function attemptConnection() {
+  async function connect() {
     let token;
     try {
       token = await getAccessToken();
     } catch (err) {
-      process.stderr.write(`[github-webhook-mcp] SSE: failed to get access token: ${err}\n`);
+      process.stderr.write(`[github-webhook-mcp] WebSocket: failed to get access token: ${err}\n`);
       scheduleRetry();
       return;
     }
 
     if (!token) {
-      process.stderr.write("[github-webhook-mcp] SSE: no access token available, will retry\n");
+      process.stderr.write("[github-webhook-mcp] WebSocket: no access token available, will retry\n");
       scheduleRetry();
       return;
     }
 
-    const sseUrl = `${WORKER_URL}/events`;
-    const es = new EventSourceImpl(sseUrl, {
-      headers: { Authorization: `Bearer ${token}` },
+    let ws;
+    let pingTimer = null;
+
+    try {
+      ws = new WebSocket(wsUrl, { headers: { Authorization: `Bearer ${token}` } });
+    } catch (err) {
+      process.stderr.write(`[github-webhook-mcp] WebSocket: failed to create connection: ${err}\n`);
+      scheduleRetry();
+      return;
+    }
+
+    ws.addEventListener("open", () => {
+      retryCount = 0; // Reset backoff on successful connection
+      process.stderr.write("[github-webhook-mcp] WebSocket: connected\n");
+      // Send periodic pings to keep connection alive (25s keepalive)
+      pingTimer = setInterval(() => {
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send("ping");
+        }
+      }, 25_000);
     });
 
-    es.onopen = () => {
-      retryCount = 0; // Reset backoff on successful connection
-      process.stderr.write("[github-webhook-mcp] SSE: connected\n");
-    };
-
-    es.onmessage = (event) => {
+    ws.addEventListener("message", (event) => {
       try {
-        const data = JSON.parse(event.data);
-        if ("heartbeat" in data || "status" in data) return;
+        const data = JSON.parse(typeof event.data === "string" ? event.data : event.data.toString());
+
+        // Skip status, pong, heartbeat messages
+        if ("status" in data || "pong" in data || "heartbeat" in data) return;
         if (!data.summary) return;
 
         const s = data.summary;
@@ -634,29 +643,36 @@ async function connectSSE() {
       } catch {
         // Ignore parse errors
       }
-    };
+    });
 
-    es.onerror = (err) => {
-      const status = err && err.status;
-      if (status === 401) {
-        process.stderr.write("[github-webhook-mcp] SSE: 401 unauthorized, closing and retrying with fresh token\n");
-        _cachedTokens = null; // Force token refresh on next attempt
+    ws.addEventListener("close", (event) => {
+      if (pingTimer) clearInterval(pingTimer);
+      pingTimer = null;
+      const code = event.code;
+      if (code === 1008 || code === 4401) {
+        // Policy violation or unauthorized — refresh token
+        process.stderr.write(`[github-webhook-mcp] WebSocket: closed with code ${code}, refreshing token\n`);
+        _cachedTokens = null;
       } else {
-        process.stderr.write(`[github-webhook-mcp] SSE: connection error${status ? ` (status ${status})` : ""}\n`);
+        process.stderr.write(`[github-webhook-mcp] WebSocket: closed (code ${code})\n`);
       }
-      es.close();
       scheduleRetry();
-    };
+    });
+
+    ws.addEventListener("error", () => {
+      process.stderr.write("[github-webhook-mcp] WebSocket: connection error\n");
+      // Will trigger close event, which handles reconnect
+    });
   }
 
   function scheduleRetry() {
     const delay = Math.min(BASE_RETRY_DELAY * Math.pow(2, retryCount), MAX_RETRY_DELAY);
     retryCount++;
-    process.stderr.write(`[github-webhook-mcp] SSE: retrying in ${Math.round(delay / 1000)}s (attempt ${retryCount})\n`);
-    setTimeout(() => attemptConnection(), delay);
+    process.stderr.write(`[github-webhook-mcp] WebSocket: retrying in ${Math.round(delay / 1000)}s (attempt ${retryCount})\n`);
+    setTimeout(() => void connect(), delay);
   }
 
-  attemptConnection();
+  await connect();
 }
 
 // ── Start ────────────────────────────────────────────────────────────────────
@@ -666,15 +682,15 @@ await server.connect(transport);
 
 if (CHANNEL_ENABLED) {
   // Check if tokens already exist from a previous session.
-  // If so, start SSE immediately. Otherwise, defer until after the first
+  // If so, start WebSocket immediately. Otherwise, defer until after the first
   // successful tool call establishes OAuth.
   loadTokens().then((tokens) => {
     if (tokens && tokens.access_token) {
       _cachedTokens = tokens;
       markOAuthEstablished();
     }
-    // If no tokens, SSE will start after the first successful tool call
+    // If no tokens, WebSocket will start after the first successful tool call
   }).catch(() => {
-    // Token load failed, SSE will start after first tool call
+    // Token load failed, WebSocket will start after first tool call
   });
 }
