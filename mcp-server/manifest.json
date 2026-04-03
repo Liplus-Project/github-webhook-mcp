@@ -17,6 +17,7 @@
   "documentation": "https://github.com/Liplus-Project/github-webhook-mcp#readme",
   "support": "https://github.com/Liplus-Project/github-webhook-mcp/discussions",
   "license": "MIT",
+  "icon": "icon.png",
   "server": {
     "type": "node",
     "entry_point": "server/index.js",
