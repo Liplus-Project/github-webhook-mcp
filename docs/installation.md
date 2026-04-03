@@ -223,7 +223,7 @@ Webhook エンドポイントへのアクセスを GitHub の IP 範囲に制限
 
 ### 8. チャンネル通知（オプション）
 
-ローカル MCP ブリッジは Claude Code の `claude/channel` 機能をサポートしています。有効にすると、新しい Webhook イベントが SSE 経由でリアルタイムにセッションにプッシュされます。Claude Code CLI でのみ利用可能です。
+ローカル MCP ブリッジは Claude Code の `claude/channel` 機能をサポートしています。有効にすると、新しい Webhook イベントが WebSocket 経由でリアルタイムにセッションにプッシュされます。Claude Code CLI でのみ利用可能です。
 
 MCP クライアント設定で `WEBHOOK_CHANNEL=1` を設定し（上記 [Claude Code CLI](#claude-code-cli--npx) 参照）、チャンネルをロード:
 
@@ -237,7 +237,7 @@ claude --dangerously-load-development-channels server:github-webhook-mcp
 
 1. **Webhook 受信テスト:** GitHub App の設定ページ → **Advanced** → **Recent Deliveries** で配信状況を確認
 2. **MCP 接続テスト:** MCP クライアントから `get_pending_status` ツールを呼び出して応答を確認
-3. **SSE テスト:** `curl -N https://<your-worker>/events` でストリーム接続を確認
+3. **WebSocket テスト:** `wscat -c wss://<your-worker>/events` でストリーム接続を確認（SSE: `curl -N https://<your-worker>/events`）
 
 ### トラブルシューティング
 
