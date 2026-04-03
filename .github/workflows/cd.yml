@@ -16,6 +16,11 @@ jobs:
           node-version: "24"
       - run: npm ci
         working-directory: mcp-server
+      - name: Sync manifest.json version from release tag
+        working-directory: mcp-server
+        env:
+          TAG_NAME: ${{ github.event.release.tag_name }}
+        run: jq --arg v "${TAG_NAME#v}" '.version = $v' manifest.json > manifest.tmp && mv manifest.tmp manifest.json
       - run: npx mcpb pack
         working-directory: mcp-server
       - uses: actions/upload-artifact@v7
