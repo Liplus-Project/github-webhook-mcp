@@ -22,7 +22,7 @@
     "ws": "^8.18.0"
   },
   "devDependencies": {
-    "@anthropic-ai/mcpb": "^2.1.0"
+    "@anthropic-ai/mcpb": "^2.1.2"
   },
   "engines": {
     "node": ">=18.0.0"
@@ -34,7 +34,7 @@
     "cloudflare"
   ],
   "mcpName": "io.github.Liplus-Project/github-webhook-mcp",
-  "license": "MIT",
+  "license": "Apache-2.0",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/Liplus-Project/github-webhook-mcp.git"
