@@ -239,6 +239,21 @@ Node.js >= 18.0.0 が必要。
 
 manifest.json のバージョンも一致させる。
 
+## Distribution Channels
+
+| チャネル | 用途 | ステータス | 要件 |
+|---------|------|-----------|------|
+| Anthropic Desktop Extensions Directory | Claude Desktop ローカル mcpb 配布 | 申請済み（2026-04-02） | 公開 GitHub リポジトリ、Node.js、manifest.json、推奨 MIT ライセンス |
+| Anthropic Remote MCP Server Directory | リモート MCP サーバー配布 | 未申請 | OAuth 2.0、HTTPS、ツール安全性アノテーション |
+| npm レジストリ | CLI / Codex 向け npx 配布 | 稼働中 | npm publish（CD で自動公開） |
+| MCP Community Registry (registry.modelcontextprotocol.io) | コミュニティ発見チャネル | 将来 | 未定 |
+
+申請フォーム:
+- Desktop Extensions: [MCPB Desktop Extensions Submission Form](https://forms.gle/mcpb-desktop-extensions)
+- Remote MCP Server: [Remote MCP Server Submission Form](https://forms.gle/remote-mcp-server)
+
+各チャネルの申請経緯と詳細ステータスは tips issue #175 を参照。
+
 ## Infrastructure
 
 | コンポーネント | 用途 |
