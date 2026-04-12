@@ -378,7 +378,7 @@ async function getSessionId() {
   return _sessionId;
 }
 
-async function callRemoteTool(name, args) {
+async function callRemoteTool(name, args, _retried = false) {
   const sessionId = await getSessionId();
 
   const res = await fetch(`${WORKER_URL}/mcp`, {
@@ -396,11 +396,14 @@ async function callRemoteTool(name, args) {
     }),
   });
 
-  // 401 = token expired or revoked, re-authenticate and retry
+  // 401 = token expired or revoked, re-authenticate and retry once
   if (res.status === 401) {
+    if (_retried) {
+      return { content: [{ type: "text", text: "Authentication failed after retry. Please re-authenticate." }] };
+    }
     _cachedTokens = null;
     _sessionId = null;
-    return callRemoteTool(name, args);
+    return callRemoteTool(name, args, true);
   }
 
   const text = await res.text();
@@ -411,9 +414,9 @@ async function callRemoteTool(name, args) {
 
   if (json.error) {
     // Session expired — retry once with a fresh session
-    if (json.error.code === -32600 || json.error.code === -32001) {
+    if ((json.error.code === -32600 || json.error.code === -32001) && !_retried) {
       _sessionId = null;
-      return callRemoteTool(name, args);
+      return callRemoteTool(name, args, true);
     }
     return { content: [{ type: "text", text: JSON.stringify(json.error) }] };
   }
