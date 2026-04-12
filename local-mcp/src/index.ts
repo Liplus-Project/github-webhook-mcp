@@ -363,7 +363,7 @@ async function getSessionId(): Promise<string> {
   return _sessionId;
 }
 
-async function callRemoteTool(name: string, args: Record<string, unknown>): Promise<{ content: Array<{ type: string; text: string }> }> {
+async function callRemoteTool(name: string, args: Record<string, unknown>, _retried = false): Promise<{ content: Array<{ type: string; text: string }> }> {
   const sessionId = await getSessionId();
 
   const res = await fetch(`${WORKER_URL}/mcp`, {
@@ -381,11 +381,14 @@ async function callRemoteTool(name: string, args: Record<string, unknown>): Prom
     }),
   });
 
-  // 401 = token expired or revoked, re-authenticate and retry
+  // 401 = token expired or revoked, re-authenticate and retry once
   if (res.status === 401) {
+    if (_retried) {
+      return { content: [{ type: "text", text: "Authentication failed after retry. Please re-authenticate." }] };
+    }
     _cachedTokens = null;
     _sessionId = null;
-    return callRemoteTool(name, args);
+    return callRemoteTool(name, args, true);
   }
 
   const text = await res.text();
@@ -396,9 +399,9 @@ async function callRemoteTool(name: string, args: Record<string, unknown>): Prom
 
   if (json.error) {
     // Session expired — retry once with a fresh session
-    if (json.error.code === -32600 || json.error.code === -32001) {
+    if ((json.error.code === -32600 || json.error.code === -32001) && !_retried) {
       _sessionId = null;
-      return callRemoteTool(name, args);
+      return callRemoteTool(name, args, true);
     }
     return { content: [{ type: "text", text: JSON.stringify(json.error) }] };
   }

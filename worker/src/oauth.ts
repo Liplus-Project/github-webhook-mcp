@@ -29,8 +29,8 @@ export interface GitHubUserProps {
   githubLogin: string;
   /** GitHub access token (ghu_ prefix, 8h TTL) */
   githubAccessToken: string;
-  /** GitHub refresh token (ghr_ prefix, 6mo TTL) */
-  githubRefreshToken: string;
+  /** GitHub refresh token (ghr_ prefix, 6mo TTL). null when not provided. */
+  githubRefreshToken: string | null;
   /**
    * All account IDs (user + orgs) whose App installations the user can access.
    * Populated via GET /user/installations at OAuth time.
@@ -187,7 +187,7 @@ export async function handleGitHubCallback(
     githubUserId: user.id,
     githubLogin: user.login,
     githubAccessToken: tokenData.access_token,
-    githubRefreshToken: tokenData.refresh_token || "",
+    githubRefreshToken: tokenData.refresh_token || null,
     accessibleAccountIds,
   };
 
