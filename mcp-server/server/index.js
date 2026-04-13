@@ -302,10 +302,23 @@ async function refreshAccessToken(refreshToken) {
   });
 
   if (!res.ok) {
-    throw new Error(`Token refresh failed: ${res.status}`);
+    const body = await res.text().catch(() => "");
+    const err = new Error(
+      `Token refresh failed: ${res.status} ${res.statusText}${body ? ` — ${body.slice(0, 200)}` : ""}`,
+    );
+    console.error("[oauth] refresh failed:", err.message);
+    throw err;
   }
 
   const data = await res.json();
+
+  if (!data.access_token) {
+    const err = new Error(
+      `Token refresh returned no access_token: ${JSON.stringify(data).slice(0, 200)}`,
+    );
+    console.error("[oauth] refresh malformed:", err.message);
+    throw err;
+  }
 
   const tokens = {
     access_token: data.access_token,
@@ -314,6 +327,7 @@ async function refreshAccessToken(refreshToken) {
   };
 
   await saveTokens(tokens);
+  console.error("[oauth] token refreshed successfully, expires in %ds", data.expires_in || "unknown");
   return tokens;
 }
 
@@ -323,7 +337,9 @@ async function getAccessToken() {
   }
 
   if (_cachedTokens) {
-    if (!_cachedTokens.expires_at || _cachedTokens.expires_at > Date.now() + 60_000) {
+    // Proactive refresh: refresh 5 minutes before expiry instead of after
+    const REFRESH_BUFFER_MS = 5 * 60_000;
+    if (!_cachedTokens.expires_at || _cachedTokens.expires_at > Date.now() + REFRESH_BUFFER_MS) {
       return _cachedTokens.access_token;
     }
 
@@ -331,9 +347,11 @@ async function getAccessToken() {
       try {
         _cachedTokens = await refreshAccessToken(_cachedTokens.refresh_token);
         return _cachedTokens.access_token;
-      } catch {
-        // Refresh failed, fall through to full OAuth flow
+      } catch (err) {
+        console.error("[oauth] refresh failed, falling back to full OAuth flow:", err.message || err);
       }
+    } else {
+      console.error("[oauth] no refresh_token available, requiring full OAuth flow");
     }
   }
 
