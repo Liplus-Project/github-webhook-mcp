@@ -191,6 +191,8 @@ export async function handleGitHubCallback(
     accessibleAccountIds,
   };
 
+  console.log(`[oauth] completeAuthorization: user=${user.login} (${user.id}), accounts=${accessibleAccountIds.join(",")}`);
+
   const { redirectTo } = await oauthHelpers.completeAuthorization({
     request: stateData.oauthRequest,
     userId: String(user.id),
@@ -199,6 +201,9 @@ export async function handleGitHubCallback(
     },
     scope: stateData.oauthRequest.scope,
     props,
+    // Preserve existing grants to prevent concurrent clients (MCP + WebSocket channel)
+    // from revoking each other's grants, which causes "Grant not found" on refresh.
+    revokeExistingGrants: false,
   });
 
   return Response.redirect(redirectTo, 302);
@@ -241,9 +246,9 @@ export function createOAuthProvider(
 
     // Token exchange callback to propagate GitHub token refresh
     tokenExchangeCallback: async ({ grantType, props }) => {
+      const ghProps = props as unknown as GitHubUserProps | undefined;
+      console.log(`[oauth] tokenExchange: grantType=${grantType}, user=${ghProps?.githubLogin ?? "unknown"}`);
       if (grantType === "refresh_token" as never) {
-        // On refresh, we could re-validate GitHub tokens here in the future
-        // For now, pass through existing props
         return { newProps: props };
       }
     },
