@@ -54,6 +54,7 @@ async function saveTokens(tokens) {
 }
 
 let _cachedTokens = null;
+let _refreshLock = null;
 
 // ── PKCE Utilities ───────────────────────────────────────────────────────────
 
@@ -344,11 +345,21 @@ async function getAccessToken() {
     }
 
     if (_cachedTokens.refresh_token) {
+      // Serialize concurrent refresh attempts to prevent race conditions.
+      // Without this lock, the WebSocket startup and the first tool call can
+      // both trigger refreshAccessToken() with the same refresh token
+      // simultaneously, causing the token file to end up with an orphaned
+      // refresh token that the Worker no longer recognizes.
+      if (!_refreshLock) {
+        _refreshLock = refreshAccessToken(_cachedTokens.refresh_token);
+      }
       try {
-        _cachedTokens = await refreshAccessToken(_cachedTokens.refresh_token);
+        _cachedTokens = await _refreshLock;
         return _cachedTokens.access_token;
       } catch (err) {
         console.error("[oauth] refresh failed, falling back to full OAuth flow:", err.message || err);
+      } finally {
+        _refreshLock = null;
       }
     } else {
       console.error("[oauth] no refresh_token available, requiring full OAuth flow");
