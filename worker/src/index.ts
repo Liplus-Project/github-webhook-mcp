@@ -1,19 +1,18 @@
 /**
  * Cloudflare Worker entrypoint for github-webhook-mcp.
  *
- * OAuth model: bespoke Device Authorization Grant (RFC 8628) implementation.
- * See worker/src/oauth.ts. The legacy @cloudflare/workers-oauth-provider
- * wrapper and its /oauth/authorize + /oauth/callback localhost flow were
- * removed in v0.11.0 (see #198) because they caused a chronic auth loop
- * (#195) across process restarts.
+ * OAuth model: bespoke Worker-hosted web OAuth flow. See worker/src/oauth.ts.
+ * v0.11.1 reverts the device-authorization-grant iteration (#203, v0.11.0)
+ * back to a standard web OAuth UX. The redirect_uri is pinned to
+ * `https://<worker>/oauth/callback` so the approval step never returns to
+ * the client's localhost (fix for #195's chronic auth loop).
  *
  * Routes:
  *   GET  /.well-known/oauth-authorization-server   RFC 8414 metadata (oauth.ts)
- *   POST /oauth/register                           RFC 7591 (oauth.ts)
- *   POST /oauth/device_authorization               RFC 8628 §3.1 (oauth.ts)
- *   POST /oauth/token                              RFC 8628 §3.4 + refresh (oauth.ts)
- *   GET  /oauth/device                             Device approval redirect (oauth.ts)
- *   GET  /oauth/authorize, /oauth/callback         410 Gone (oauth.ts)
+ *   POST /oauth/register                           RFC 7591 dynamic registration (oauth.ts)
+ *   GET  /oauth/authorize                          State issuance + GitHub redirect (oauth.ts)
+ *   GET  /oauth/callback                           GitHub code → bearer token exchange (oauth.ts)
+ *   POST /oauth/token                              Web-auth polling + refresh_token (oauth.ts)
  *
  *   POST /webhooks/github                          Webhook ingest (no auth)
  *   POST /mcp                                      MCP protocol (Bearer token)

@@ -1,14 +1,15 @@
 /**
- * OAuth KV store — bespoke schema for device authorization grant flow (RFC 8628).
+ * OAuth KV store — bespoke schema for Worker-hosted web OAuth flow.
  *
- * Replaces the opaque key format used by @cloudflare/workers-oauth-provider v0.3.1.
- * All records are JSON-encoded with explicit expiresAt timestamps so we can
- * detect expiry without relying solely on KV TTL.
+ * v0.11.1 reverts the device-authorization-grant layout (#203) in favour of a
+ * Worker-hosted web OAuth flow. The Worker acts as the redirect_uri target
+ * (`https://<worker>/oauth/callback`) so the client never needs a localhost
+ * listener. Issued bearer tokens and refresh rotation semantics stay identical
+ * to v0.11.0 — only the approval path is new.
  *
  * Key layout:
  *   client:{client_id}                  → ClientRecord (dynamic client registration)
- *   device:{device_code}                → DeviceRecord (device flow polling state)
- *   user_code:{user_code}               → {device_code} (user-code → device-code index)
+ *   web_auth_state:{state}              → WebAuthStateRecord (web OAuth polling state)
  *   token:{access_token}                → TokenRecord (access token → grant ref)
  *   refresh:{refresh_token}             → RefreshRecord (refresh token → grant ref)
  *   grant:{grant_id}                    → GrantRecord (GitHub props + issued tokens)
@@ -21,37 +22,44 @@ import type { GitHubUserProps } from "./oauth.js";
 
 export interface ClientRecord {
   client_id: string;
-  /** Optional for public clients using device flow. */
+  /** Optional for public clients. */
   client_secret?: string;
   client_name?: string;
   redirect_uris: string[];
-  /** Always includes "urn:ietf:params:oauth:grant-type:device_code" + "refresh_token". */
+  /** Always includes "authorization_code" + "refresh_token". */
   grant_types: string[];
   token_endpoint_auth_method: "none" | "client_secret_post" | "client_secret_basic";
   created_at: string;
 }
 
-export interface DeviceRecord {
-  device_code: string;
-  user_code: string;
+/**
+ * Web OAuth polling state.
+ *
+ * The MCP bridge obtains a `state` by calling GET /oauth/authorize, opens the
+ * browser to let the user complete GitHub's web OAuth, and polls
+ * POST /oauth/token with grant_type=urn:ietf:params:oauth:grant-type:web_authorization_poll
+ * against that `state`. The callback handler flips the record to `approved` and
+ * attaches the freshly-issued access/refresh tokens; the next poll consumes
+ * them and the record is deleted.
+ */
+export interface WebAuthStateRecord {
+  state: string;
   client_id: string;
   /** Scope requested by the client, space-separated. May be empty. */
   scope: string;
   /** Absolute expiry time (epoch seconds). */
   expires_at: number;
-  /** Minimum polling interval in seconds. Bumped on slow_down. */
-  interval: number;
-  /** Next allowed poll time (epoch seconds). Enforces interval + slow_down. */
-  next_poll_at: number;
   /**
    * Approval state:
    *   pending   — user has not completed authorization yet
-   *   approved  — user authorized; props populated; ready for token exchange
+   *   approved  — user authorized; access_token / refresh_token populated
    *   denied    — user denied authorization
    */
   status: "pending" | "approved" | "denied";
-  /** Populated once the user completes GitHub authorization. */
-  props?: GitHubUserProps;
+  /** Populated once the callback handler completes the GitHub exchange. */
+  access_token?: string;
+  /** Populated alongside access_token. */
+  refresh_token?: string;
 }
 
 export interface TokenRecord {
@@ -85,10 +93,10 @@ export interface GrantRecord {
 /** Token lifetimes (seconds). */
 export const ACCESS_TOKEN_TTL = 3600;            // 1 hour
 export const REFRESH_TOKEN_TTL = 30 * 24 * 3600; // 30 days
-/** Device code lifetime (seconds). RFC 8628 §3.2 recommends ~600s. */
-export const DEVICE_CODE_TTL = 600;
-/** Default polling interval (seconds). RFC 8628 §3.5. */
-export const DEVICE_POLL_INTERVAL = 5;
+/** Web auth state lifetime (seconds). */
+export const WEB_AUTH_STATE_TTL = 600;
+/** Default client poll interval (seconds). */
+export const WEB_AUTH_POLL_INTERVAL = 2;
 
 const nowSec = () => Math.floor(Date.now() / 1000);
 
@@ -124,24 +132,28 @@ export async function getClient(kv: KVNamespace, clientId: string): Promise<Clie
   return getJson<ClientRecord>(kv, `client:${clientId}`);
 }
 
-// ── Device records (RFC 8628 polling state) ───────────────────────
+// ── Web auth state records (Worker-hosted web OAuth polling) ──────
 
-export async function putDevice(kv: KVNamespace, record: DeviceRecord): Promise<void> {
+export async function putWebAuthState(
+  kv: KVNamespace,
+  record: WebAuthStateRecord,
+): Promise<void> {
   const remaining = record.expires_at - nowSec();
-  await putJson(kv, `device:${record.device_code}`, record, remaining);
-  // user_code index for approval landing pages / lookups.
-  await kv.put(`user_code:${record.user_code}`, record.device_code, {
-    expirationTtl: Math.max(60, remaining),
-  });
+  await putJson(kv, `web_auth_state:${record.state}`, record, remaining);
 }
 
-export async function getDevice(kv: KVNamespace, deviceCode: string): Promise<DeviceRecord | null> {
-  return getJson<DeviceRecord>(kv, `device:${deviceCode}`);
+export async function getWebAuthState(
+  kv: KVNamespace,
+  state: string,
+): Promise<WebAuthStateRecord | null> {
+  return getJson<WebAuthStateRecord>(kv, `web_auth_state:${state}`);
 }
 
-export async function deleteDevice(kv: KVNamespace, record: DeviceRecord): Promise<void> {
-  await kv.delete(`device:${record.device_code}`);
-  await kv.delete(`user_code:${record.user_code}`);
+export async function deleteWebAuthState(
+  kv: KVNamespace,
+  state: string,
+): Promise<void> {
+  await kv.delete(`web_auth_state:${state}`);
 }
 
 // ── Grant + token records ─────────────────────────────────────────
@@ -191,20 +203,6 @@ export function randomToken(bytes = 32): string {
   const buf = new Uint8Array(bytes);
   crypto.getRandomValues(buf);
   return base64UrlEncode(buf);
-}
-
-/** Generate an RFC 8628 user_code: 8 uppercase alphanumeric chars grouped XXXX-XXXX. */
-export function randomUserCode(): string {
-  // Exclude ambiguous chars (0/O, 1/I) per RFC 8628 §6.1 guidance.
-  const alphabet = "BCDFGHJKLMNPQRSTVWXZ23456789";
-  const buf = new Uint8Array(8);
-  crypto.getRandomValues(buf);
-  let out = "";
-  for (let i = 0; i < 8; i++) {
-    out += alphabet[buf[i] % alphabet.length];
-    if (i === 3) out += "-";
-  }
-  return out;
 }
 
 export function grantIdFor(userId: string): string {
