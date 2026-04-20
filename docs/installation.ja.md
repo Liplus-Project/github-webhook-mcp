@@ -46,6 +46,8 @@ A browser window should have opened automatically. Sign in on GitHub, then retry
 
 > **ブラウザ自動オープンが失敗した場合:** 応答と stderr ログに URL がそのまま残るので、手動でコピーしてブラウザに貼り付けてください。Windows では `start`、macOS では `open`、Linux では `xdg-open` を使用します。
 
+> **v0.11.2 Windows hotfix:** v0.11.1 の Windows 版はブラウザ自動オープン時に authorize URL を cmd.exe にクォート無しで渡していたため、URL に含まれる `&` が command separator として解釈され、`state` パラメータが欠落して `/oauth/authorize` が 400 を返していました。v0.11.2 では URL を `"..."` で囲んで shell 経由で起動するようにしたので、`&` がリテラル扱いされ state が正しくブラウザに届きます。v0.11.1 で自動オープンが機能しなかった Windows ユーザーは v0.11.2 に更新してください（手動 URL コピーは引き続きフォールバックとして動作します）。
+
 > **旧バージョンからの移行:** v0.11.0 以前（localhost callback flow / device flow どちらも）の `~/.github-webhook-mcp/oauth-tokens.json` は flow marker が一致しないため自動で無視され、初回ツール呼び出し時に新しい web OAuth flow で再認証が走ります。特別な手作業は不要です。
 
 ### Claude Desktop — デスクトップ拡張 (.mcpb)
