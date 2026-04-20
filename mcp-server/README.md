@@ -9,14 +9,14 @@ This package is the **client-side proxy only**. Webhook ingestion, tenant routin
 - Speaks stdio MCP locally to your client.
 - Forwards `tools/call` to the Worker's Streamable HTTP MCP endpoint (`/mcp`).
 - Optionally maintains a WebSocket connection to the Worker's `/events` endpoint and re-emits incoming webhook events as Claude Code `claude/channel` notifications (real-time push, no polling).
-- Handles OAuth 2.1 **Device Authorization Grant (RFC 8628)** against the Worker and Dynamic Client Registration (RFC 7591). No localhost callback port is used, so the flow works reliably across process restarts and concurrent client instances.
-- Caches access and refresh tokens under `~/.github-webhook-mcp/` (mode `0600`) and refreshes them silently before expiry.
+- Handles **Worker-hosted web OAuth** against the Worker and Dynamic Client Registration (RFC 7591). No localhost callback port is used: GitHub's `redirect_uri` is pinned to the Worker itself, so the flow works reliably across process restarts and concurrent client instances.
+- Caches access and refresh tokens under `~/.github-webhook-mcp/` (mode `0600`) and refreshes them silently before expiry. On `invalid_grant` during refresh, the proxy re-reads the tokens file to adopt any rotation performed by a sibling process before falling back to a full re-authorization.
 
 ## Requirements
 
 - Node.js >= 18
 - A reachable github-webhook-mcp Worker (the public preview default is `https://github-webhook.smgjp.com`; you can also point at your own deployment)
-- A web browser (used once to approve the device code at `https://github.com/login/device` — can be on a different machine from where the MCP client runs)
+- A web browser (used once to sign in on GitHub via the authorize URL the proxy prints — can be on a different machine from where the MCP client runs)
 - A GitHub App installed on the accounts/organizations whose events you want to receive (the Worker resolves your accessible installations automatically after OAuth)
 
 ## Install / Run
@@ -36,21 +36,20 @@ npm install -g github-webhook-mcp
 github-webhook-mcp
 ```
 
-On first run the proxy prints a GitHub device code and verification URL to stderr:
+On first run the proxy prints an authorize URL to stderr and tries to open it in your default browser:
 
 ```
-[github-webhook-mcp] OAuth device authorization required.
-[github-webhook-mcp] Visit: https://github.com/login/device
-[github-webhook-mcp] Enter code: WDJB-MJHT
-[github-webhook-mcp] Or open directly: https://github.com/login/device?user_code=WDJB-MJHT
-[github-webhook-mcp] Waiting for approval (expires in 600s)...
+[github-webhook-mcp] OAuth authorization required.
+[github-webhook-mcp] Opening: https://github-webhook.smgjp.com/oauth/authorize?client_id=abc&state=xyz
+[github-webhook-mcp] Approve in the browser window; the tab can be closed when done.
+[github-webhook-mcp] Waiting for approval (state expires in 600s)...
 ```
 
-Open the verification URL in any browser, enter the 8-character code, and authorize the GitHub App. Tokens are stored under `~/.github-webhook-mcp/` and refreshed automatically before expiry.
+Sign in on GitHub (2FA works as usual), approve access, and close the tab when the "Authorization complete" page appears. Tokens are stored under `~/.github-webhook-mcp/` and refreshed automatically before expiry.
 
-> **Migrating from v0.10.x or earlier.** The previous versions used a browser-based localhost callback flow. On first run with v0.11.0+, the proxy detects the legacy tokens file, removes it, prints a migration notice to stderr, and starts the device flow. One-time re-authentication is required.
+> **Migrating from v0.10.x / v0.11.0.** v0.10.x used a browser-based localhost callback flow; v0.11.0 used a GitHub device code flow. On first run with v0.11.1+, the proxy treats any tokens file whose flow marker does not match the new web flow as inactive and transparently starts the new authorization. One-time re-authentication is required; the legacy file is left in place but ignored.
 
-> **Enable Device Flow on self-hosted GitHub Apps.** If you self-host the Worker with your own GitHub App, toggle **"Enable Device Flow"** in the App settings (under *Identifying and authorizing users*). Without it the Worker returns `503 device_flow_disabled`. See the [self-hosting guide](https://github.com/Liplus-Project/github-webhook-mcp/blob/main/docs/installation.md#4-github-app-の作成と設定) for step-by-step instructions.
+> **Configure the Callback URL on self-hosted GitHub Apps.** If you self-host the Worker with your own GitHub App, register `https://<your-worker>/oauth/callback` as the **Callback URL**. Without it, the Worker's `/oauth/callback` step fails with "Authorization failed" because GitHub will reject the redirect. **Device Flow** is not used and can stay off. See the [self-hosting guide](https://github.com/Liplus-Project/github-webhook-mcp/blob/main/docs/installation.md) for step-by-step instructions.
 
 ## Client configuration
 
@@ -149,24 +148,23 @@ If real-time channel notifications are enabled (Claude Code), step 1 can be skip
 ## Authentication flow
 
 1. On first tool call (or on startup if cached tokens exist), the proxy discovers OAuth metadata at `${WEBHOOK_WORKER_URL}/.well-known/oauth-authorization-server`.
-2. It performs Dynamic Client Registration (RFC 7591) if no client is cached, declaring support for the `urn:ietf:params:oauth:grant-type:device_code` and `refresh_token` grant types (public client, no secret).
-3. It requests a device code from the Worker's `/oauth/device_authorization` endpoint. The Worker proxies that request to GitHub's `POST https://github.com/login/device/code` and returns an RFC 8628 §3.2 response.
-4. The proxy prints the `user_code` and `verification_uri` to stderr. You open the URL in any browser and enter the code.
-5. The proxy polls `/oauth/token` with `grant_type=urn:ietf:params:oauth:grant-type:device_code` at the interval the server specifies. `authorization_pending` and `slow_down` responses are handled per RFC 8628 §3.5.
-6. When you approve, the Worker exchanges the GitHub device code for a GitHub access token, fetches your GitHub profile + installations, and issues its own opaque access/refresh token pair bound to that grant.
-7. The Worker resolves your accessible GitHub installations (your user account plus any organizations where the GitHub App is installed) and binds them to the OAuth session, so events from any of those tenants surface through the same MCP session.
-8. Subsequent calls reuse the access token and silently refresh it five minutes before expiry. On `401` from the Worker, the proxy invalidates its cached tokens and re-authenticates automatically (falling back to the device flow if the refresh token is also rejected).
+2. It performs Dynamic Client Registration (RFC 7591) if no client is cached, declaring support for the `urn:ietf:params:oauth:grant-type:web_authorization_poll` and `refresh_token` grant types (public client, no secret — the Worker itself uses its own `GITHUB_CLIENT_SECRET` to talk to GitHub).
+3. It generates a random `state` and opens `${WEBHOOK_WORKER_URL}/oauth/authorize?client_id=<cid>&state=<state>` in your default browser. The Worker stores a pending state record and 302-redirects to GitHub's standard `https://github.com/login/oauth/authorize`, with `redirect_uri` pinned to the Worker's own `/oauth/callback` (no localhost).
+4. You sign in on GitHub and approve. GitHub redirects back to `${WEBHOOK_WORKER_URL}/oauth/callback?code=<code>&state=<state>`. The Worker exchanges the code for a GitHub access token (confidential client), fetches your GitHub profile + installations, and issues its own opaque access/refresh token pair bound to that grant. The browser tab shows "Authorization complete".
+5. Meanwhile the proxy polls `${WEBHOOK_WORKER_URL}/oauth/token` with `grant_type=urn:ietf:params:oauth:grant-type:web_authorization_poll` against the same state. It receives `authorization_pending` until the callback completes, then receives the Worker-issued token pair on the next poll.
+6. The Worker resolves your accessible GitHub installations (your user account plus any organizations where the GitHub App is installed) and binds them to the OAuth session, so events from any of those tenants surface through the same MCP session.
+7. Subsequent calls reuse the access token and silently refresh it five minutes before expiry. On `401` from the Worker or `invalid_grant` during refresh, the proxy first re-reads its tokens file (in case a sibling process has already rotated) and only falls back to a fresh web flow when no newer refresh token is on disk.
 
 No localhost port is listened on at any point. The flow works the same way on headless hosts and across concurrent MCP client instances.
 
 ## Troubleshooting
 
-- **Device code never appears in the log.** Check the stderr stream of the MCP process (Claude Code surfaces it as the server's log). Look for the `[github-webhook-mcp] OAuth device authorization required.` block.
-- **`OAuth device code expired before approval. Re-run the client to retry.`** The code expires after ~10 minutes. Trigger any tool call again to restart the flow.
-- **`/oauth/device_authorization` returns 503.** The upstream GitHub App does not have **Enable Device Flow** turned on. Self-hosters must enable it in the GitHub App settings.
+- **Authorize URL never appears in the log.** Check the stderr stream of the MCP process (Claude Code surfaces it as the server's log). Look for the `[github-webhook-mcp] OAuth authorization required.` block.
+- **`OAuth state expired before approval. Re-run the client to retry.`** The state token expires after ~10 minutes. Trigger any tool call again to restart the flow.
+- **Browser lands on "Authorization failed" (Worker 502).** The Worker rejected the GitHub code exchange. On self-hosts this usually means the GitHub App's **Callback URL** does not include `https://<your-worker>/oauth/callback`, or `GITHUB_CLIENT_SECRET` is missing / wrong.
 - **`Failed to reach worker`.** Check that `WEBHOOK_WORKER_URL` is correct and reachable from your machine.
 - **`Authentication failed after retry`.** Cached tokens were rejected and re-authentication did not succeed. Remove `~/.github-webhook-mcp/oauth-tokens.json` and retry.
-- **Legacy tokens migration.** If you see `Detected legacy OAuth tokens from pre-v0.11.0`, this is normal on the first run after upgrading. The old file has been removed and a device-code prompt follows. Complete it once.
+- **Upgrading from v0.10.x / v0.11.0.** Existing tokens files are ignored (flow marker mismatch) and a fresh web-flow authorize URL is emitted on the next tool call. No manual cleanup is required.
 - **No events arriving.** Confirm that the GitHub App is installed on the target account/organization and that webhook deliveries are succeeding on the GitHub App's *Advanced* → *Recent Deliveries* page. The Worker only sees events for installations linked to your authenticated account.
 - **`429` from the Worker.** The per-tenant event quota (default 10,000) has been exceeded. Process the backlog with `mark_processed` to free space.
 - **Real-time notifications not showing in Claude Code.** Make sure `WEBHOOK_CHANNEL` is not set to `0` and that Claude Code was launched with `--dangerously-load-development-channels server:github-webhook-mcp`.

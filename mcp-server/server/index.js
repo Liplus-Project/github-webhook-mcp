@@ -6,9 +6,18 @@
  * Cloudflare Worker + Durable Object backend via Streamable HTTP.
  * Optionally listens via WebSocket for real-time channel notifications
  * (enables DO hibernation on the Worker side).
- * Authenticates via OAuth 2.1 Device Authorization Grant (RFC 8628);
- * user_code + verification URI are surfaced on stderr because stdio MCP
- * clients have no UI to drive an interactive browser flow.
+ *
+ * v0.11.1: authenticates via a Worker-hosted web OAuth flow.
+ *   1. Bridge generates a random `state` and opens
+ *      `https://<worker>/oauth/authorize?client_id=<cid>&state=<state>` in
+ *      the local browser. The Worker redirects to GitHub's standard web OAuth
+ *      (familiar login + 2FA UX).
+ *   2. Bridge polls `https://<worker>/oauth/token` with
+ *      `grant_type=urn:ietf:params:oauth:grant-type:web_authorization_poll`
+ *      against the same state.
+ *   3. Refresh `invalid_grant` triggers a tokens-file re-read before fallback:
+ *      a sibling Claude Code process may have refreshed already, so we adopt
+ *      its rotation rather than starting a fresh web flow.
  *
  * Discord MCP pattern: data lives in the cloud, local MCP is a thin bridge.
  */
@@ -18,11 +27,12 @@ import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import { readFile, writeFile, mkdir, unlink } from "node:fs/promises";
+import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { homedir, platform as osPlatform } from "node:os";
 import { join } from "node:path";
 import { createRequire } from "node:module";
 import { spawn } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import WebSocketClient from "ws";
 
 const require = createRequire(import.meta.url);
@@ -40,20 +50,16 @@ const TOKEN_FILE = join(TOKEN_DIR, "oauth-tokens.json");
 const CLIENT_REG_FILE = join(TOKEN_DIR, "oauth-client.json");
 
 /**
- * Marker written on every tokens file produced by this client (v0.11.0+).
- * Legacy files from the localhost-callback flow don't have it, which is how
- * we detect a first-run migration scenario and surface the one-time notice.
+ * Marker written on every tokens file produced by this client (v0.11.1+).
+ * Legacy files from earlier flows lack it; loadTokens() ignores them so
+ * startup doesn't adopt stale state and the next tool call re-authenticates.
  */
-const TOKENS_FLOW_MARKER = "device";
+const TOKENS_FLOW_MARKER = "web";
 
 async function loadTokens() {
   try {
     const data = await readFile(TOKEN_FILE, "utf-8");
     const parsed = JSON.parse(data);
-    // Legacy files (pre-v0.11.0) lack the flow marker and carry tokens the
-    // new Worker cannot honor. Ignore them here so startup doesn't adopt
-    // stale state; performOAuthFlow() will surface the migration notice and
-    // remove the file the first time it runs.
     if (!parsed || parsed.flow !== TOKENS_FLOW_MARKER) {
       return null;
     }
@@ -70,19 +76,20 @@ async function saveTokens(tokens) {
 
 let _cachedTokens = null;
 let _refreshLock = null;
-let _deviceFlowLock = null;
-let _legacyMigrationNotified = false;
+let _webAuthLock = null;
 
 /**
- * Tracks the in-flight device authorization so tool calls can return an
+ * Tracks the in-flight web authorization so tool calls can return an
  * auth-required response immediately (instead of blocking for ~600s) while
  * polling continues in the background. Cleared on success or failure so the
- * next tool call after expiry starts a fresh device code.
+ * next tool call after expiry starts a fresh authorize URL.
  */
-let _pendingDeviceAuth = null;
-let _pendingDeviceAuthError = null;
+let _pendingWebAuth = null;
+let _pendingWebAuthError = null;
 
 // ── OAuth Discovery & Registration ───────────────────────────────────────────
+
+const WEB_AUTH_POLL_GRANT = "urn:ietf:params:oauth:grant-type:web_authorization_poll";
 
 async function discoverOAuthMetadata() {
   const res = await fetch(`${WORKER_URL}/.well-known/oauth-authorization-server`);
@@ -106,15 +113,13 @@ async function saveClientRegistration(reg) {
   await writeFile(CLIENT_REG_FILE, JSON.stringify(reg, null, 2), { mode: 0o600 });
 }
 
-const DEVICE_CODE_GRANT = "urn:ietf:params:oauth:grant-type:device_code";
-
 async function ensureClientRegistration(metadata) {
   const existing = await loadClientRegistration();
-  // Legacy registrations were created for authorization_code + refresh_token.
-  // Re-register if the existing one is missing the device_code grant type so
-  // the Worker recognizes us as a device-flow client.
+  // Accept any client registration that already lists our web-auth poll grant.
+  // Legacy device-flow or authorization-code clients get re-registered so the
+  // Worker recognizes us as a v0.11.1 web-flow client.
   if (existing && Array.isArray(existing.grant_types) &&
-      existing.grant_types.includes(DEVICE_CODE_GRANT)) {
+      existing.grant_types.includes(WEB_AUTH_POLL_GRANT)) {
     return existing;
   }
 
@@ -127,9 +132,8 @@ async function ensureClientRegistration(metadata) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       client_name: "github-webhook-mcp-cli",
-      // Device flow does not use redirect_uris; leave empty for RFC 8628.
       redirect_uris: [],
-      grant_types: [DEVICE_CODE_GRANT, "refresh_token"],
+      grant_types: [WEB_AUTH_POLL_GRANT, "refresh_token"],
       token_endpoint_auth_method: "none",
     }),
   });
@@ -143,59 +147,20 @@ async function ensureClientRegistration(metadata) {
   return reg;
 }
 
-// ── OAuth Device Authorization Grant (RFC 8628) ─────────────────────────────
-
-/**
- * Detect a pre-v0.11.0 tokens file and surface a one-time migration notice
- * on stderr. Legacy files were written by the localhost-callback flow and
- * carry tokens the new Worker will reject, so we discard them and let the
- * device flow re-establish authentication from scratch.
- */
-async function checkLegacyTokensMigration() {
-  let raw;
-  try {
-    raw = await readFile(TOKEN_FILE, "utf-8");
-  } catch {
-    return; // No tokens file at all — not a migration case.
-  }
-
-  let parsed;
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
-    // Corrupt file — treat as legacy/unusable and remove.
-    parsed = null;
-  }
-
-  if (parsed && parsed.flow === TOKENS_FLOW_MARKER) {
-    return; // Already a device-flow tokens file — no migration needed.
-  }
-
-  if (_legacyMigrationNotified) return;
-  _legacyMigrationNotified = true;
-
-  process.stderr.write(
-    "[github-webhook-mcp] Detected legacy OAuth tokens from pre-v0.11.0 " +
-    "(localhost callback flow). This client now uses the Device " +
-    "Authorization Grant (RFC 8628). One-time re-authentication is " +
-    "required; follow the device-code prompt below.\n",
-  );
-
-  try {
-    await unlink(TOKEN_FILE);
-  } catch {
-    // Non-fatal: saveTokens() will overwrite it on success anyway.
-  }
-}
+// ── OAuth Web Flow ──────────────────────────────────────────────────────────
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function generateState() {
+  return randomBytes(32).toString("base64url");
+}
+
 /**
- * Best-effort platform-native browser launcher for the device-flow
- * verification URL. Failures are non-fatal: we still surface the URL on
- * stderr / in the tool response so the user can open it manually.
+ * Best-effort platform-native browser launcher for the web-flow authorize URL.
+ * Failures are non-fatal: we still surface the URL on stderr / in the tool
+ * response so the user can open it manually.
  */
 function openBrowser(url) {
   if (!url || typeof url !== "string") return;
@@ -235,42 +200,15 @@ function openBrowser(url) {
   }
 }
 
-async function requestDeviceAuthorization(metadata, client) {
-  const endpoint =
-    metadata.device_authorization_endpoint ||
-    `${WORKER_URL}/oauth/device_authorization`;
-
-  const res = await fetch(endpoint, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({ client_id: client.client_id }),
-  });
-
-  if (!res.ok) {
-    const body = await res.text().catch(() => "");
-    throw new Error(
-      `Device authorization request failed: ${res.status} ${res.statusText}${body ? ` — ${body.slice(0, 200)}` : ""}`,
-    );
-  }
-
-  const data = await res.json();
-  if (!data.device_code || !data.user_code || !data.verification_uri) {
-    throw new Error(
-      `Device authorization response missing required fields: ${JSON.stringify(data).slice(0, 200)}`,
-    );
-  }
-  return data;
-}
-
 /**
- * Poll the Worker's /oauth/token endpoint until the user approves, denies,
- * or the device_code expires. Interval comes from the server; `slow_down`
- * replies bump it by 5s per RFC 8628 §3.5.
+ * Poll the Worker's /oauth/token endpoint until the user approves, denies, or
+ * the state expires. The Worker mirrors RFC 8628's polling error shape so we
+ * can surface `authorization_pending` without exposing the poll to the user.
  */
-async function pollForDeviceToken(metadata, client, deviceAuth) {
+async function pollForWebAuthToken(metadata, client, state, expiresInSec) {
   const endpoint = metadata.token_endpoint || `${WORKER_URL}/oauth/token`;
-  let interval = Math.max(1, Number(deviceAuth.interval) || 5);
-  const deadline = Date.now() + (Number(deviceAuth.expires_in) || 600) * 1000;
+  const interval = 2; // Worker issues Bearer tokens quickly; 2s poll is plenty.
+  const deadline = Date.now() + (expiresInSec || 600) * 1000;
 
   while (Date.now() < deadline) {
     await sleep(interval * 1000);
@@ -281,8 +219,8 @@ async function pollForDeviceToken(metadata, client, deviceAuth) {
         method: "POST",
         headers: { "Content-Type": "application/x-www-form-urlencoded" },
         body: new URLSearchParams({
-          grant_type: DEVICE_CODE_GRANT,
-          device_code: deviceAuth.device_code,
+          grant_type: WEB_AUTH_POLL_GRANT,
+          state,
           client_id: client.client_id,
         }),
       });
@@ -307,16 +245,12 @@ async function pollForDeviceToken(metadata, client, deviceAuth) {
     if (err === "authorization_pending") {
       continue;
     }
-    if (err === "slow_down") {
-      interval += 5;
-      continue;
-    }
     if (err === "access_denied") {
       throw new Error("OAuth authorization denied by user");
     }
     if (err === "expired_token") {
       throw new Error(
-        "OAuth device code expired before approval. Re-run the client to retry.",
+        "OAuth state expired before approval. Re-run the client to retry.",
       );
     }
 
@@ -328,86 +262,73 @@ async function pollForDeviceToken(metadata, client, deviceAuth) {
   }
 
   throw new Error(
-    "OAuth device code expired before approval. Re-run the client to retry.",
+    "OAuth state expired before approval. Re-run the client to retry.",
   );
 }
 
 /**
- * Start a device authorization flow: obtain device_code/user_code, surface the
- * verification URL (stderr + auto-open browser), and kick off a background
- * poll. Callers that await the returned promise will block until the user
- * approves — this is what the WebSocket bootstrap does. Callers that only
- * need the deviceAuth metadata (for a non-blocking tool response) can read
- * `_pendingDeviceAuth` as soon as this function resolves past the await
- * below; see `getAccessTokenOrPendingAuth()`.
+ * Start a Worker-hosted web OAuth flow: mint a state, open the authorize URL
+ * in the local browser, and kick off a background poll. Callers that await
+ * the returned promise will block until the user approves. Callers that only
+ * need the pending metadata (for a non-blocking tool response) can read
+ * `_pendingWebAuth` as soon as phase 1 resolves; see
+ * `getAccessTokenForToolCall()`.
  *
- * Serialization: _deviceFlowLock ensures that concurrent callers (WebSocket
- * bootstrap racing the first tool call) share a single device code rather
- * than each launching their own approval prompt.
+ * Serialization: _webAuthLock ensures that concurrent callers (WebSocket
+ * bootstrap racing the first tool call) share a single authorize URL rather
+ * than each launching their own browser window.
  */
 async function performOAuthFlow() {
-  if (_deviceFlowLock) {
-    return await _deviceFlowLock;
+  if (_webAuthLock) {
+    return await _webAuthLock;
   }
 
-  // Phase 1: obtain the device code. This is fast (one HTTP round-trip) and
-  // we surface the verification URL as soon as it returns.
+  // Phase 1: mint state + open the authorize URL. This is local-only (no HTTP
+  // round-trip) so it returns almost immediately.
   const startPromise = (async () => {
-    await checkLegacyTokensMigration();
-
     const metadata = await discoverOAuthMetadata();
     const client = await ensureClientRegistration(metadata);
-    const deviceAuth = await requestDeviceAuthorization(metadata, client);
 
-    const complete = deviceAuth.verification_uri_complete;
-    const browserUrl = complete || deviceAuth.verification_uri;
+    const state = generateState();
+    const authorizeEndpoint = metadata.authorization_endpoint || `${WORKER_URL}/oauth/authorize`;
+    const authorizeUrl =
+      `${authorizeEndpoint}?client_id=${encodeURIComponent(client.client_id)}` +
+      `&state=${encodeURIComponent(state)}`;
 
-    // stdio MCP clients have no UI surface of their own, so we publish the
-    // user_code and verification URI on stderr where the host logs land. The
-    // auth-required tool response (below) is the primary channel for Claude
-    // Code / Desktop; stderr is the fallback surface.
+    // Client-side state validity window — keep aligned with Worker's WEB_AUTH_STATE_TTL.
+    const expiresInSec = 600;
+    const expiresAt = Date.now() + expiresInSec * 1000;
+
     const lines = [
       "",
-      "[github-webhook-mcp] OAuth device authorization required.",
-      `[github-webhook-mcp] Visit: ${deviceAuth.verification_uri}`,
-      `[github-webhook-mcp] Enter code: ${deviceAuth.user_code}`,
-    ];
-    if (complete && complete !== deviceAuth.verification_uri) {
-      lines.push(`[github-webhook-mcp] Or open directly: ${complete}`);
-    }
-    lines.push(
-      `[github-webhook-mcp] Opening browser for authentication...`,
-      `[github-webhook-mcp] Waiting for approval (expires in ${deviceAuth.expires_in || "?"}s)...`,
+      "[github-webhook-mcp] OAuth authorization required.",
+      `[github-webhook-mcp] Opening: ${authorizeUrl}`,
+      `[github-webhook-mcp] Approve in the browser window; the tab can be closed when done.`,
+      `[github-webhook-mcp] Waiting for approval (state expires in ${expiresInSec}s)...`,
       "",
-    );
+    ];
     process.stderr.write(lines.join("\n"));
 
     // Best-effort browser auto-open. Failures are logged to stderr but do
     // not abort the flow — the URL is still available in the tool response.
-    openBrowser(browserUrl);
+    openBrowser(authorizeUrl);
 
-    const expiresAt = deviceAuth.expires_in
-      ? Date.now() + Number(deviceAuth.expires_in) * 1000
-      : undefined;
-
-    _pendingDeviceAuth = {
-      user_code: deviceAuth.user_code,
-      verification_uri: deviceAuth.verification_uri,
-      verification_uri_complete: complete || null,
+    _pendingWebAuth = {
+      authorize_url: authorizeUrl,
       expires_at: expiresAt,
     };
-    _pendingDeviceAuthError = null;
+    _pendingWebAuthError = null;
 
-    return { metadata, client, deviceAuth };
+    return { metadata, client, state, expiresInSec };
   })();
 
   // Phase 2: poll in the background (still inside the same lock promise so
   // that simultaneous callers await one shared flow). Errors are recorded
   // and re-thrown so awaiting callers see them.
-  _deviceFlowLock = (async () => {
+  _webAuthLock = (async () => {
     try {
-      const { metadata, client, deviceAuth } = await startPromise;
-      const tokenData = await pollForDeviceToken(metadata, client, deviceAuth);
+      const { metadata, client, state, expiresInSec } = await startPromise;
+      const tokenData = await pollForWebAuthToken(metadata, client, state, expiresInSec);
 
       if (!tokenData.access_token) {
         throw new Error(
@@ -426,28 +347,25 @@ async function performOAuthFlow() {
 
       await saveTokens(tokens);
       _cachedTokens = tokens;
-      _pendingDeviceAuth = null;
-      _pendingDeviceAuthError = null;
-      process.stderr.write("[github-webhook-mcp] OAuth device authorization complete.\n");
+      _pendingWebAuth = null;
+      _pendingWebAuthError = null;
+      process.stderr.write("[github-webhook-mcp] OAuth authorization complete.\n");
       return tokens;
     } catch (err) {
-      _pendingDeviceAuth = null;
-      _pendingDeviceAuthError = err && err.message ? err.message : String(err);
+      _pendingWebAuth = null;
+      _pendingWebAuthError = err && err.message ? err.message : String(err);
       throw err;
     }
   })();
 
-  // Make sure the caller-visible promise settles deterministically when the
-  // background poll finishes (or errors). Don't await inside the lock itself;
-  // other callers may want to see _pendingDeviceAuth without blocking.
-  const lockPromise = _deviceFlowLock;
+  const lockPromise = _webAuthLock;
   lockPromise.finally(() => {
-    if (_deviceFlowLock === lockPromise) {
-      _deviceFlowLock = null;
+    if (_webAuthLock === lockPromise) {
+      _webAuthLock = null;
     }
   });
 
-  // Wait for phase 1 so the caller sees _pendingDeviceAuth populated (or the
+  // Wait for phase 1 so the caller sees _pendingWebAuth populated (or the
   // startPromise's error) before we return the outer promise.
   await startPromise;
   return lockPromise;
@@ -473,6 +391,8 @@ async function refreshAccessToken(refreshToken) {
     const err = new Error(
       `Token refresh failed: ${res.status} ${res.statusText}${body ? ` — ${body.slice(0, 200)}` : ""}`,
     );
+    err.status = res.status;
+    err.bodyText = body;
     console.error("[oauth] refresh failed:", err.message);
     throw err;
   }
@@ -499,6 +419,39 @@ async function refreshAccessToken(refreshToken) {
   return tokens;
 }
 
+/**
+ * Detect the `invalid_grant` error shape on a refresh failure. When that hits,
+ * a sibling Claude Code process may have refreshed first — re-read the tokens
+ * file and see whether a newer rotation landed on disk.
+ */
+function isInvalidGrantError(err) {
+  if (!err) return false;
+  if (err.status !== 400) return false;
+  const body = typeof err.bodyText === "string" ? err.bodyText : "";
+  return body.includes("invalid_grant");
+}
+
+/**
+ * RC1 fix: before giving up on a stale refresh_token, re-read the tokens file
+ * to see whether a concurrent process already rotated it. If the on-disk
+ * refresh_token differs from the one that just failed, adopt it and retry.
+ */
+async function tryRefreshViaDiskReread(previousRefreshToken) {
+  const fresh = await loadTokens();
+  if (!fresh || !fresh.refresh_token) return null;
+  if (fresh.refresh_token === previousRefreshToken) return null;
+  try {
+    const tokens = await refreshAccessToken(fresh.refresh_token);
+    return tokens;
+  } catch (err) {
+    console.error(
+      "[oauth] disk-reread refresh also failed:",
+      err && err.message ? err.message : err,
+    );
+    return null;
+  }
+}
+
 async function getAccessToken() {
   if (!_cachedTokens) {
     _cachedTokens = await loadTokens();
@@ -512,11 +465,6 @@ async function getAccessToken() {
     }
 
     if (_cachedTokens.refresh_token) {
-      // Serialize concurrent refresh attempts to prevent race conditions.
-      // Without this lock, the WebSocket startup and the first tool call can
-      // both trigger refreshAccessToken() with the same refresh token
-      // simultaneously, causing the token file to end up with an orphaned
-      // refresh token that the Worker no longer recognizes.
       if (!_refreshLock) {
         _refreshLock = refreshAccessToken(_cachedTokens.refresh_token);
       }
@@ -524,6 +472,15 @@ async function getAccessToken() {
         _cachedTokens = await _refreshLock;
         return _cachedTokens.access_token;
       } catch (err) {
+        // RC1: maybe a sibling process already rotated. Re-read and retry once
+        // before falling through to a full web-flow restart.
+        if (isInvalidGrantError(err)) {
+          const reread = await tryRefreshViaDiskReread(_cachedTokens.refresh_token);
+          if (reread) {
+            _cachedTokens = reread;
+            return _cachedTokens.access_token;
+          }
+        }
         console.error("[oauth] refresh failed, falling back to full OAuth flow:", err.message || err);
       } finally {
         _refreshLock = null;
@@ -538,24 +495,23 @@ async function getAccessToken() {
 }
 
 /**
- * Sentinel thrown by `getAccessTokenForToolCall()` when the device flow is
- * still pending approval. The tool handler catches this and returns a
- * structured auth-required response to the MCP client without blocking on
- * the poll loop.
+ * Sentinel thrown by `getAccessTokenForToolCall()` when the web flow is still
+ * pending approval. The tool handler catches this and returns a structured
+ * auth-required response to the MCP client without blocking on the poll loop.
  */
 class AuthRequiredError extends Error {
   constructor(pending, note) {
-    super(note || "OAuth device authorization required");
+    super(note || "OAuth authorization required");
     this.name = "AuthRequiredError";
     this.pending = pending;
   }
 }
 
 /**
- * Like getAccessToken(), but never blocks on the device-flow poll. If no
- * tokens are available, it starts the flow (if not already running) and
- * throws an AuthRequiredError carrying the current device-code details so
- * the caller can surface them in the tool response immediately.
+ * Like getAccessToken(), but never blocks on the web-flow poll. If no tokens
+ * are available, it starts the flow (if not already running) and throws an
+ * AuthRequiredError carrying the current authorize URL so the caller can
+ * surface it in the tool response immediately.
  */
 async function getAccessTokenForToolCall() {
   if (!_cachedTokens) {
@@ -569,8 +525,6 @@ async function getAccessTokenForToolCall() {
     }
 
     if (_cachedTokens.refresh_token) {
-      // Refresh synchronously — refresh calls are one round-trip, unlike
-      // the full device flow, so blocking a tool call here is fine.
       if (!_refreshLock) {
         _refreshLock = refreshAccessToken(_cachedTokens.refresh_token);
       }
@@ -578,8 +532,15 @@ async function getAccessTokenForToolCall() {
         _cachedTokens = await _refreshLock;
         return _cachedTokens.access_token;
       } catch (err) {
+        if (isInvalidGrantError(err)) {
+          const reread = await tryRefreshViaDiskReread(_cachedTokens.refresh_token);
+          if (reread) {
+            _cachedTokens = reread;
+            return _cachedTokens.access_token;
+          }
+        }
         console.error(
-          "[oauth] refresh failed, starting device flow in background:",
+          "[oauth] refresh failed, starting web flow in background:",
           err.message || err,
         );
       } finally {
@@ -588,31 +549,18 @@ async function getAccessTokenForToolCall() {
     }
   }
 
-  // No usable tokens. Start the device flow if it isn't already running;
-  // either way, hand the caller the current pending device_code details.
-  if (!_pendingDeviceAuth && !_deviceFlowLock) {
-    // Swallow the outer promise; the background poll settles via
-    // _deviceFlowLock. Errors during phase 1 (e.g. network failure to
-    // /oauth/device_authorization) propagate synchronously below.
+  // No usable tokens. Start the web flow if it isn't already running;
+  // either way, hand the caller the current pending authorize URL.
+  if (!_pendingWebAuth && !_webAuthLock) {
     performOAuthFlow().catch((err) => {
-      // Already captured into _pendingDeviceAuthError; log for operators.
-      console.error("[oauth] device flow background poll ended with error:", err.message || err);
+      console.error("[oauth] web flow background poll ended with error:", err.message || err);
     });
 
-    // Wait briefly (phase 1 is a single HTTP round-trip) so _pendingDeviceAuth
-    // is populated before we throw — but never block for the full poll.
-    // performOAuthFlow() only returns once phase 1 has resolved, so we can
-    // await the lock promise safely. The lock is created synchronously inside
-    // performOAuthFlow(), so it's guaranteed to be non-null here.
-    if (_deviceFlowLock) {
+    if (_webAuthLock) {
       try {
-        // Awaiting the lock resolves when polling finishes. We instead await
-        // via a tick to give startPromise time to populate _pendingDeviceAuth.
         await Promise.race([
-          // Let phase 1 populate _pendingDeviceAuth.
           new Promise((resolve) => setImmediate(resolve)),
-          // If phase 1 fails fast, the lock rejects and we re-throw.
-          _deviceFlowLock.then(() => undefined, (err) => { throw err; }),
+          _webAuthLock.then(() => undefined, (err) => { throw err; }),
         ]);
       } catch (err) {
         throw err;
@@ -620,24 +568,22 @@ async function getAccessTokenForToolCall() {
     }
   }
 
-  // Give phase 1 a little more time to finish (device_authorization request
-  // is a single round-trip — normally sub-second). Poll the state briefly
-  // so we return a populated auth-required response instead of an empty one.
+  // Give phase 1 a little more time to finish. Phase 1 now includes a discovery
+  // fetch + (possibly) a register fetch, so allow up to 15s before giving up.
   const phase1Deadline = Date.now() + 15_000;
-  while (!_pendingDeviceAuth && !_pendingDeviceAuthError && Date.now() < phase1Deadline) {
+  while (!_pendingWebAuth && !_pendingWebAuthError && Date.now() < phase1Deadline) {
     await sleep(100);
   }
 
-  if (_pendingDeviceAuthError && !_pendingDeviceAuth) {
-    throw new Error(`OAuth device flow failed: ${_pendingDeviceAuthError}`);
+  if (_pendingWebAuthError && !_pendingWebAuth) {
+    throw new Error(`OAuth web flow failed: ${_pendingWebAuthError}`);
   }
 
-  if (_pendingDeviceAuth) {
-    throw new AuthRequiredError(_pendingDeviceAuth);
+  if (_pendingWebAuth) {
+    throw new AuthRequiredError(_pendingWebAuth);
   }
 
-  // Phase 1 timed out — surface as a regular error.
-  throw new Error("OAuth device flow did not produce a verification URL in time.");
+  throw new Error("OAuth web flow did not produce an authorize URL in time.");
 }
 
 async function buildAuthHeaders(token, extra) {
@@ -827,28 +773,20 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }))
 
 function formatAuthRequiredResponse(pending) {
   const parts = [];
-  parts.push("OAuth device authorization required.");
+  parts.push("OAuth authorization required.");
   parts.push("");
-  if (pending.verification_uri_complete) {
-    parts.push(`Open (code pre-filled): ${pending.verification_uri_complete}`);
-    parts.push("");
-    parts.push(`Or visit ${pending.verification_uri} and enter the code:`);
-  } else {
-    parts.push(`Visit: ${pending.verification_uri}`);
-    parts.push("Enter the code:");
-  }
-  parts.push(`  ${pending.user_code}`);
+  parts.push(`Open this URL in your browser: ${pending.authorize_url}`);
   parts.push("");
   if (pending.expires_at) {
     const remainingMs = pending.expires_at - Date.now();
     if (remainingMs > 0) {
       const mins = Math.max(1, Math.round(remainingMs / 60_000));
-      parts.push(`Code expires in about ${mins} minute${mins === 1 ? "" : "s"}.`);
+      parts.push(`This link is valid for about ${mins} minute${mins === 1 ? "" : "s"}.`);
     }
   }
   parts.push(
     "A browser window should have opened automatically. " +
-      "Retry the same tool call after approving — subsequent calls will succeed once authorization completes.",
+      "Sign in on GitHub, then retry the same tool call — subsequent calls will succeed once authorization completes.",
   );
   return parts.join("\n");
 }

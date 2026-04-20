@@ -1,25 +1,34 @@
 /**
- * Integration tests for the Worker's bespoke OAuth device-flow implementation.
+ * Integration tests for the Worker-hosted web OAuth implementation (v0.11.1).
  *
- * Covers the Step 4 (#202) scenarios that can run deterministically in CI:
- *   - existing-user migration: legacy /oauth/authorize and /oauth/callback return 410
- *   - new-user onboarding:     /.well-known + /oauth/register + /oauth/device_authorization
- *                              + /oauth/token (device_code) → access_token + refresh_token
- *   - concurrent-instance:     refresh_token rotation invalidates the previous token
- *   - process-restart:         access_token validates against the same KV after simulated
- *                              restart (new AuthContext via authenticateApiRequest)
+ * v0.11.1 replaces the device-authorization-grant iteration with a Worker-
+ * hosted web OAuth flow: the bridge opens `/oauth/authorize?state=<state>` in
+ * a browser, the Worker is the redirect_uri target (`/oauth/callback`), and
+ * the bridge polls `/oauth/token` with `grant_type=…web_authorization_poll`
+ * against the same state.
  *
- * The GitHub upstream is stubbed by swapping globalThis.fetch. The KV namespace is a
- * Map-backed mock that matches the subset of the KVNamespace API oauth-store.ts uses.
+ * Scenarios covered deterministically in CI:
+ *   - metadata advertises authorization_code + refresh_token
+ *   - dynamic client registration issues a public client
+ *   - authorize redirects to GitHub with redirect_uri pinned to the Worker
+ *   - polling returns authorization_pending while state is pending
+ *   - callback → pending poll turns into an approved token pair on next poll
+ *   - refresh_token rotation invalidates the previous token pair
+ *   - access_token validates via the middleware across simulated restarts
+ *   - user-denied callback surfaces as access_denied on the next poll
  *
- * End-to-end scenarios that depend on a real user visiting https://github.com/login/device
- * are NOT covered here — those remain on the manual verification checklist documented
- * in docs/installation.md and in the PR body.
+ * GitHub upstream is stubbed by swapping globalThis.fetch. The KV namespace
+ * is a Map-backed mock that matches the subset of the KVNamespace API that
+ * oauth-store.ts uses.
  */
 import { test, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 
-import { handleOAuthRequest, authenticateApiRequest } from "../src/oauth.js";
+import {
+  authenticateApiRequest,
+  handleOAuthRequest,
+  WEB_AUTH_POLL_GRANT,
+} from "../src/oauth.js";
 import type { OAuthEnv } from "../src/oauth.js";
 
 // ── In-memory KV mock ────────────────────────────────────────────────
@@ -98,7 +107,7 @@ async function registerClient(env: OAuthEnv): Promise<string> {
     jsonRequest("https://worker.example.com/oauth/register", {
       client_name: "test-client",
       redirect_uris: [],
-      grant_types: ["urn:ietf:params:oauth:grant-type:device_code", "refresh_token"],
+      grant_types: [WEB_AUTH_POLL_GRANT, "refresh_token"],
       token_endpoint_auth_method: "none",
     }),
     env,
@@ -109,31 +118,95 @@ async function registerClient(env: OAuthEnv): Promise<string> {
   return body.client_id;
 }
 
-// ── Legacy endpoints (existing-user migration) ───────────────────────
+/**
+ * Drive an authorize → callback → poll sequence end-to-end, stubbing GitHub's
+ * web OAuth endpoints. Returns the issued access / refresh token pair.
+ */
+async function onboardUser(
+  env: OAuthEnv,
+  clientId: string,
+  state: string,
+  user: { id: number; login: string },
+  installations: number[],
+): Promise<{ access_token: string; refresh_token: string }> {
+  // Stub GitHub's token exchange + user profile fetch.
+  fetchHandler = async (req) => {
+    if (req.url === "https://github.com/login/oauth/access_token") {
+      return new Response(
+        JSON.stringify({
+          access_token: `ghu_${user.login}`,
+          refresh_token: `ghr_${user.login}`,
+          token_type: "bearer",
+          expires_in: 28800,
+          refresh_token_expires_in: 15897600,
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    if (req.url === "https://api.github.com/user") {
+      return new Response(
+        JSON.stringify({ id: user.id, login: user.login }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    if (req.url.startsWith("https://api.github.com/user/installations")) {
+      return new Response(
+        JSON.stringify({
+          installations: installations.map((id) => ({ account: { id } })),
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    throw new Error(`Unexpected upstream fetch: ${req.url}`);
+  };
 
-test("legacy /oauth/authorize returns 410 Gone so old clients fail loudly", async () => {
-  const env = makeEnv();
-  const res = await handleOAuthRequest(
-    new Request("https://worker.example.com/oauth/authorize?client_id=x&response_type=code"),
+  // /oauth/authorize issues the pending state record and 302s to GitHub.
+  const authRes = await handleOAuthRequest(
+    new Request(
+      `https://worker.example.com/oauth/authorize?client_id=${encodeURIComponent(clientId)}&state=${encodeURIComponent(state)}`,
+    ),
     env,
   );
-  assert.ok(res);
-  assert.equal(res.status, 410);
-});
+  assert.ok(authRes, "authorize must return a response");
+  assert.equal(authRes.status, 302);
 
-test("legacy /oauth/callback returns 410 Gone", async () => {
-  const env = makeEnv();
-  const res = await handleOAuthRequest(
-    new Request("https://worker.example.com/oauth/callback?code=dummy"),
+  // Simulate GitHub redirecting back to the Worker's callback with a code.
+  const cbRes = await handleOAuthRequest(
+    new Request(
+      `https://worker.example.com/oauth/callback?code=dummy-code&state=${encodeURIComponent(state)}`,
+    ),
     env,
   );
-  assert.ok(res);
-  assert.equal(res.status, 410);
-});
+  assert.ok(cbRes);
+  assert.equal(cbRes.status, 200);
+  assert.match(cbRes.headers.get("Content-Type") ?? "", /text\/html/);
+
+  // Poll consumes the approved state and returns the token pair.
+  const pollRes = await handleOAuthRequest(
+    formRequest("https://worker.example.com/oauth/token", {
+      grant_type: WEB_AUTH_POLL_GRANT,
+      state,
+      client_id: clientId,
+    }),
+    env,
+  );
+  assert.ok(pollRes);
+  assert.equal(pollRes.status, 200);
+  const tokens = await pollRes.json() as {
+    access_token: string;
+    refresh_token: string;
+    token_type: string;
+    expires_in: number;
+  };
+  assert.equal(tokens.token_type, "Bearer");
+  assert.ok(tokens.access_token);
+  assert.ok(tokens.refresh_token);
+  return { access_token: tokens.access_token, refresh_token: tokens.refresh_token };
+}
 
 // ── Metadata (RFC 8414) ──────────────────────────────────────────────
 
-test("metadata advertises device_code + refresh_token, no authorization_code", async () => {
+test("metadata advertises authorization_endpoint + web-auth poll + refresh_token", async () => {
   const env = makeEnv();
   const res = await handleOAuthRequest(
     new Request("https://worker.example.com/.well-known/oauth-authorization-server"),
@@ -141,16 +214,16 @@ test("metadata advertises device_code + refresh_token, no authorization_code", a
   );
   assert.ok(res);
   const meta = await res.json() as {
-    device_authorization_endpoint: string;
+    authorization_endpoint: string;
     token_endpoint: string;
     grant_types_supported: string[];
   };
-  assert.ok(meta.device_authorization_endpoint.endsWith("/oauth/device_authorization"));
+  assert.ok(meta.authorization_endpoint.endsWith("/oauth/authorize"));
   assert.ok(meta.token_endpoint.endsWith("/oauth/token"));
   assert.deepEqual(meta.grant_types_supported.sort(), [
     "refresh_token",
-    "urn:ietf:params:oauth:grant-type:device_code",
-  ]);
+    WEB_AUTH_POLL_GRANT,
+  ].sort());
 });
 
 // ── Dynamic client registration (RFC 7591) ───────────────────────────
@@ -161,135 +234,166 @@ test("POST /oauth/register issues a public client (no secret)", async () => {
   assert.match(clientId, /^[A-Za-z0-9_-]+$/);
 });
 
-// ── New-user onboarding: device flow happy path ──────────────────────
+// ── Authorize redirect pins redirect_uri to the Worker (RC2 fix) ─────
 
-test("new-user onboarding: device_authorization + token(device_code) issues tokens", async () => {
+test("GET /oauth/authorize redirects to GitHub with Worker-pinned redirect_uri", async () => {
   const env = makeEnv();
   const clientId = await registerClient(env);
 
-  // Stub GitHub device code + token endpoints + user/installations.
-  let pollCount = 0;
-  fetchHandler = async (req) => {
-    if (req.url === "https://github.com/login/device/code") {
-      return new Response(
-        JSON.stringify({
-          device_code: "gh-device-code-abc",
-          user_code: "WDJB-MJHT",
-          verification_uri: "https://github.com/login/device",
-          expires_in: 600,
-          interval: 0, // keep test fast; we also override next_poll_at directly
-        }),
-        { status: 200, headers: { "Content-Type": "application/json" } },
-      );
-    }
-    if (req.url === "https://github.com/login/oauth/access_token") {
-      pollCount++;
-      if (pollCount === 1) {
-        return new Response(
-          JSON.stringify({ error: "authorization_pending" }),
-          { status: 200, headers: { "Content-Type": "application/json" } },
-        );
-      }
-      return new Response(
-        JSON.stringify({
-          access_token: "ghu_live-access",
-          refresh_token: "ghr_live-refresh",
-          token_type: "bearer",
-          expires_in: 28800,
-          refresh_token_expires_in: 15897600,
-        }),
-        { status: 200, headers: { "Content-Type": "application/json" } },
-      );
-    }
-    if (req.url === "https://api.github.com/user") {
-      return new Response(
-        JSON.stringify({ id: 42, login: "octocat" }),
-        { status: 200, headers: { "Content-Type": "application/json" } },
-      );
-    }
-    if (req.url.startsWith("https://api.github.com/user/installations")) {
-      return new Response(
-        JSON.stringify({
-          installations: [
-            { account: { id: 42 } },
-            { account: { id: 4242 } },
-          ],
-        }),
-        { status: 200, headers: { "Content-Type": "application/json" } },
-      );
-    }
-    throw new Error(`Unexpected upstream fetch: ${req.url}`);
-  };
-
-  // Device authorization
-  const daRes = await handleOAuthRequest(
-    formRequest("https://worker.example.com/oauth/device_authorization", { client_id: clientId }),
+  const state = "state-worker-redirect-check";
+  const res = await handleOAuthRequest(
+    new Request(
+      `https://worker.example.com/oauth/authorize?client_id=${encodeURIComponent(clientId)}&state=${encodeURIComponent(state)}&scope=read:user`,
+    ),
     env,
   );
-  assert.ok(daRes);
-  assert.equal(daRes.status, 200);
-  const daBody = await daRes.json() as {
-    device_code: string;
-    user_code: string;
-    verification_uri: string;
-    verification_uri_complete: string;
-    expires_in: number;
-    interval: number;
-  };
-  assert.equal(daBody.device_code, "gh-device-code-abc");
-  assert.equal(daBody.user_code, "WDJB-MJHT");
-  assert.equal(daBody.verification_uri, "https://github.com/login/device");
-  assert.ok(daBody.verification_uri_complete.includes("user_code=WDJB-MJHT"));
+  assert.ok(res);
+  assert.equal(res.status, 302);
 
-  // First poll: authorization_pending
-  const pendingRes = await handleOAuthRequest(
+  const location = res.headers.get("Location") ?? "";
+  assert.ok(
+    location.startsWith("https://github.com/login/oauth/authorize"),
+    "authorize must redirect to GitHub's web OAuth",
+  );
+  const target = new URL(location);
+  // RC2 fix: redirect_uri is pinned to the Worker, never to the client's host.
+  assert.equal(
+    target.searchParams.get("redirect_uri"),
+    "https://worker.example.com/oauth/callback",
+  );
+  assert.equal(target.searchParams.get("state"), state);
+  assert.equal(target.searchParams.get("client_id"), "test-github-client-id");
+});
+
+test("GET /oauth/authorize rejects missing state", async () => {
+  const env = makeEnv();
+  const clientId = await registerClient(env);
+  const res = await handleOAuthRequest(
+    new Request(`https://worker.example.com/oauth/authorize?client_id=${encodeURIComponent(clientId)}`),
+    env,
+  );
+  assert.ok(res);
+  assert.equal(res.status, 400);
+});
+
+// ── Polling: pending state ───────────────────────────────────────────
+
+test("POST /oauth/token(web_authorization_poll) returns authorization_pending while state is pending", async () => {
+  const env = makeEnv();
+  const clientId = await registerClient(env);
+  const state = "state-pending-1234";
+
+  const authRes = await handleOAuthRequest(
+    new Request(
+      `https://worker.example.com/oauth/authorize?client_id=${encodeURIComponent(clientId)}&state=${encodeURIComponent(state)}`,
+    ),
+    env,
+  );
+  assert.equal(authRes!.status, 302);
+
+  const pollRes = await handleOAuthRequest(
     formRequest("https://worker.example.com/oauth/token", {
-      grant_type: "urn:ietf:params:oauth:grant-type:device_code",
-      device_code: daBody.device_code,
+      grant_type: WEB_AUTH_POLL_GRANT,
+      state,
       client_id: clientId,
     }),
     env,
   );
-  assert.ok(pendingRes);
-  assert.equal(pendingRes.status, 400);
-  const pendingBody = await pendingRes.json() as { error: string };
-  assert.equal(pendingBody.error, "authorization_pending");
+  assert.ok(pollRes);
+  assert.equal(pollRes.status, 400);
+  const body = await pollRes.json() as { error: string };
+  assert.equal(body.error, "authorization_pending");
+});
 
-  // Second poll: approval → token pair issued
-  const okRes = await handleOAuthRequest(
-    formRequest("https://worker.example.com/oauth/token", {
-      grant_type: "urn:ietf:params:oauth:grant-type:device_code",
-      device_code: daBody.device_code,
-      client_id: clientId,
-    }),
+// ── Happy path: authorize → callback → poll → token pair ─────────────
+
+test("new-user onboarding: authorize + callback + poll issues tokens", async () => {
+  const env = makeEnv();
+  const clientId = await registerClient(env);
+
+  const { access_token, refresh_token } = await onboardUser(
     env,
+    clientId,
+    "state-new-user-abcdef",
+    { id: 42, login: "octocat" },
+    [42, 4242],
   );
-  assert.ok(okRes);
-  assert.equal(okRes.status, 200);
-  const tokenBody = await okRes.json() as {
-    access_token: string;
-    refresh_token: string;
-    token_type: string;
-    expires_in: number;
-  };
-  assert.equal(tokenBody.token_type, "Bearer");
-  assert.ok(tokenBody.access_token);
-  assert.ok(tokenBody.refresh_token);
-  assert.ok(tokenBody.expires_in > 0);
 
   // The issued access_token validates against the middleware and carries props.
   const authReq = new Request("https://worker.example.com/mcp", {
-    headers: { Authorization: `Bearer ${tokenBody.access_token}` },
+    headers: { Authorization: `Bearer ${access_token}` },
   });
   const authResult = await authenticateApiRequest(authReq, env);
   assert.ok("auth" in authResult, "Bearer must validate");
   assert.equal(authResult.auth.props.githubLogin, "octocat");
   assert.equal(authResult.auth.props.githubUserId, 42);
-  // accessibleAccountIds must include user + org installation ids, de-duplicated.
   assert.deepEqual(
     [...authResult.auth.props.accessibleAccountIds].sort((a, b) => a - b),
     [42, 4242],
   );
+
+  // Refresh token is also persisted and usable.
+  assert.ok(refresh_token);
+});
+
+test("polling the same state twice returns expired_token after the first consume", async () => {
+  const env = makeEnv();
+  const clientId = await registerClient(env);
+  const state = "state-consumed-once-xyz";
+  await onboardUser(env, clientId, state, { id: 7, login: "consumer" }, []);
+
+  // Second poll against the same state must fail — the record was consumed.
+  const secondPoll = await handleOAuthRequest(
+    formRequest("https://worker.example.com/oauth/token", {
+      grant_type: WEB_AUTH_POLL_GRANT,
+      state,
+      client_id: clientId,
+    }),
+    env,
+  );
+  assert.equal(secondPoll!.status, 400);
+  const body = await secondPoll!.json() as { error: string };
+  assert.equal(body.error, "expired_token");
+});
+
+// ── User-denied callback ─────────────────────────────────────────────
+
+test("GitHub access_denied on /oauth/callback surfaces as access_denied on next poll", async () => {
+  const env = makeEnv();
+  const clientId = await registerClient(env);
+  const state = "state-denied-qrst";
+
+  // Start the authorize state.
+  await handleOAuthRequest(
+    new Request(
+      `https://worker.example.com/oauth/authorize?client_id=${encodeURIComponent(clientId)}&state=${encodeURIComponent(state)}`,
+    ),
+    env,
+  );
+
+  // User declines on the GitHub consent screen. No upstream fetch is needed
+  // because the callback short-circuits on the error parameter.
+  const cbRes = await handleOAuthRequest(
+    new Request(
+      `https://worker.example.com/oauth/callback?error=access_denied&state=${encodeURIComponent(state)}`,
+    ),
+    env,
+  );
+  assert.ok(cbRes);
+  assert.equal(cbRes.status, 200);
+
+  // Next poll returns access_denied so the bridge can stop and surface a clear error.
+  const pollRes = await handleOAuthRequest(
+    formRequest("https://worker.example.com/oauth/token", {
+      grant_type: WEB_AUTH_POLL_GRANT,
+      state,
+      client_id: clientId,
+    }),
+    env,
+  );
+  assert.equal(pollRes!.status, 400);
+  const body = await pollRes!.json() as { error: string };
+  assert.equal(body.error, "access_denied");
 });
 
 // ── Unknown / missing Bearer ─────────────────────────────────────────
@@ -316,50 +420,12 @@ test("authenticateApiRequest rejects unknown token", async () => {
   assert.equal(res.response.status, 401);
 });
 
-// ── Refresh rotation (concurrent-instance scenario) ──────────────────
+// ── Refresh rotation ─────────────────────────────────────────────────
 
 test("refresh_token rotation invalidates the previous access and refresh tokens", async () => {
   const env = makeEnv();
   const clientId = await registerClient(env);
-
-  // Onboard first so we have a real token pair to rotate.
-  fetchHandler = async (req) => {
-    if (req.url === "https://github.com/login/device/code") {
-      return new Response(JSON.stringify({
-        device_code: "dc-rot", user_code: "AAAA-BBBB",
-        verification_uri: "https://github.com/login/device",
-        expires_in: 600, interval: 0,
-      }), { status: 200, headers: { "Content-Type": "application/json" } });
-    }
-    if (req.url === "https://github.com/login/oauth/access_token") {
-      return new Response(JSON.stringify({
-        access_token: "ghu_x", refresh_token: "ghr_x",
-        token_type: "bearer", expires_in: 28800,
-      }), { status: 200, headers: { "Content-Type": "application/json" } });
-    }
-    if (req.url === "https://api.github.com/user") {
-      return new Response(JSON.stringify({ id: 7, login: "rotuser" }),
-        { status: 200, headers: { "Content-Type": "application/json" } });
-    }
-    if (req.url.startsWith("https://api.github.com/user/installations")) {
-      return new Response(JSON.stringify({ installations: [] }),
-        { status: 200, headers: { "Content-Type": "application/json" } });
-    }
-    throw new Error(`Unexpected: ${req.url}`);
-  };
-
-  await handleOAuthRequest(
-    formRequest("https://worker.example.com/oauth/device_authorization", { client_id: clientId }),
-    env,
-  );
-  const issueRes = await handleOAuthRequest(
-    formRequest("https://worker.example.com/oauth/token", {
-      grant_type: "urn:ietf:params:oauth:grant-type:device_code",
-      device_code: "dc-rot", client_id: clientId,
-    }),
-    env,
-  );
-  const first = await issueRes!.json() as { access_token: string; refresh_token: string };
+  const first = await onboardUser(env, clientId, "state-rotation-aaaa", { id: 7, login: "rotuser" }, []);
 
   // Rotate via refresh_token.
   const rotRes = await handleOAuthRequest(
@@ -413,44 +479,7 @@ test("refresh_token rotation invalidates the previous access and refresh tokens"
 test("process-restart: tokens stored in KV remain valid across fresh authenticator invocations", async () => {
   const env = makeEnv();
   const clientId = await registerClient(env);
-
-  fetchHandler = async (req) => {
-    if (req.url === "https://github.com/login/device/code") {
-      return new Response(JSON.stringify({
-        device_code: "dc-persist", user_code: "CCCC-DDDD",
-        verification_uri: "https://github.com/login/device",
-        expires_in: 600, interval: 0,
-      }), { status: 200, headers: { "Content-Type": "application/json" } });
-    }
-    if (req.url === "https://github.com/login/oauth/access_token") {
-      return new Response(JSON.stringify({
-        access_token: "ghu_persist", refresh_token: "ghr_persist",
-        token_type: "bearer", expires_in: 28800,
-      }), { status: 200, headers: { "Content-Type": "application/json" } });
-    }
-    if (req.url === "https://api.github.com/user") {
-      return new Response(JSON.stringify({ id: 99, login: "persist" }),
-        { status: 200, headers: { "Content-Type": "application/json" } });
-    }
-    if (req.url.startsWith("https://api.github.com/user/installations")) {
-      return new Response(JSON.stringify({ installations: [] }),
-        { status: 200, headers: { "Content-Type": "application/json" } });
-    }
-    throw new Error(`Unexpected: ${req.url}`);
-  };
-
-  await handleOAuthRequest(
-    formRequest("https://worker.example.com/oauth/device_authorization", { client_id: clientId }),
-    env,
-  );
-  const tokRes = await handleOAuthRequest(
-    formRequest("https://worker.example.com/oauth/token", {
-      grant_type: "urn:ietf:params:oauth:grant-type:device_code",
-      device_code: "dc-persist", client_id: clientId,
-    }),
-    env,
-  );
-  const issued = await tokRes!.json() as { access_token: string };
+  const issued = await onboardUser(env, clientId, "state-persist-uvwx", { id: 99, login: "persist" }, []);
 
   // Simulate a process restart: drop the fetch stub (nothing should be called),
   // then validate the same access_token again via a brand-new Request.
@@ -465,26 +494,19 @@ test("process-restart: tokens stored in KV remain valid across fresh authenticat
   assert.equal(reopened.auth.props.githubLogin, "persist");
 });
 
-// ── GitHub 'device_flow_disabled' returns 503 so clients can surface a clear message
+// ── Unsupported grant_type guard ─────────────────────────────────────
 
-test("GitHub device_flow_disabled surfaces as 503 (not a silent auth loop)", async () => {
+test("unsupported grant_type returns 400 unsupported_grant_type", async () => {
   const env = makeEnv();
   const clientId = await registerClient(env);
-
-  fetchHandler = async (req) => {
-    if (req.url === "https://github.com/login/device/code") {
-      return new Response(JSON.stringify({
-        error: "device_flow_disabled",
-        error_description: "Device flow is not enabled on this GitHub App.",
-      }), { status: 200, headers: { "Content-Type": "application/json" } });
-    }
-    throw new Error(`Unexpected: ${req.url}`);
-  };
-
   const res = await handleOAuthRequest(
-    formRequest("https://worker.example.com/oauth/device_authorization", { client_id: clientId }),
+    formRequest("https://worker.example.com/oauth/token", {
+      grant_type: "urn:ietf:params:oauth:grant-type:device_code",
+      client_id: clientId,
+    }),
     env,
   );
-  assert.ok(res);
-  assert.equal(res.status, 503);
+  assert.equal(res!.status, 400);
+  const body = await res!.json() as { error: string };
+  assert.equal(body.error, "unsupported_grant_type");
 });
