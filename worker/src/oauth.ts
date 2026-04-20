@@ -244,13 +244,29 @@ export function createOAuthProvider(
     // PKCE: S256 only (OAuth 2.1 requirement for public clients)
     allowPlainPKCE: false,
 
-    // Token exchange callback to propagate GitHub token refresh
+    // Token exchange callback to propagate GitHub token refresh.
+    //
+    // Always return `{ newProps }` so the library receives a grant-update
+    // signal for every grantType. The previous conditional returned `undefined`
+    // for non-refresh_token grants, and the `as never` cast on the comparison
+    // suggested the runtime grantType string may not match the library's
+    // typed union — meaning the branch could be permanently skipped at runtime.
+    // That behavior is suspected of contributing to the KV grant loss tracked
+    // in #187 and the callback/auth-loop symptoms tracked in #195.
+    //
+    // The expanded `[oauth-diag]` log lets `wrangler tail` confirm the real
+    // runtime grantType and the props keys present at exchange time.
     tokenExchangeCallback: async ({ grantType, props }) => {
       const ghProps = props as unknown as GitHubUserProps | undefined;
-      console.log(`[oauth] tokenExchange: grantType=${grantType}, user=${ghProps?.githubLogin ?? "unknown"}`);
-      if (grantType === "refresh_token" as never) {
-        return { newProps: props };
-      }
+      console.log(
+        `[oauth-diag] tokenExchange entry: grantType=${JSON.stringify(grantType)}, ` +
+          `userId=${ghProps?.githubUserId ?? "n/a"}, ` +
+          `login=${ghProps?.githubLogin ?? "n/a"}, ` +
+          `propsKeys=${Object.keys(ghProps ?? {}).join(",")}, ` +
+          `hasAccessToken=${!!ghProps?.githubAccessToken}, ` +
+          `hasRefreshToken=${!!ghProps?.githubRefreshToken}`,
+      );
+      return { newProps: props };
     },
   });
 }
