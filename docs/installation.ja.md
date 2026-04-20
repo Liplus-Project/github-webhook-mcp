@@ -17,17 +17,40 @@
 
 ### 初回認証（OAuth Device Flow）
 
-v0.11.0 以降、MCP クライアントは **OAuth 2.1 Device Authorization Grant (RFC 8628)** で認証します。初回接続時に以下のメッセージが Claude Code の stderr ログに出力されます:
+v0.11.0 以降、MCP クライアントは **OAuth 2.1 Device Authorization Grant (RFC 8628)** で認証します。v0.11.1 以降は初回のツール呼び出し時に以下が同時に起きます:
+
+1. **ブラウザが自動で開きます**（`verification_uri_complete`、コード事前入力済み URL）
+2. **ツール呼び出しの応答として `user_code` と URL が即座に返ります**（600 秒待たされません）
+
+Claude Code / Claude Desktop のチャット上には、おおよそ次のような応答が表示されます:
+
+```
+OAuth device authorization required.
+
+Open (code pre-filled): https://github.com/login/device?user_code=WDJB-MJHT
+
+Or visit https://github.com/login/device and enter the code:
+  WDJB-MJHT
+
+Code expires in about 10 minutes.
+A browser window should have opened automatically. Retry the same tool call
+after approving — subsequent calls will succeed once authorization completes.
+```
+
+ブラウザで承認するとバックグラウンドのポーリングが完了し、`~/.github-webhook-mcp/oauth-tokens.json` にトークンが保存されます。その後同じツールを呼び直すと通常どおり結果が返ります。以降の起動では保存済みトークンが再利用され、期限切れ前に自動でリフレッシュされます。
+
+並行して、stderr ログにも同じ情報が出力されます（ログを見たい場合のフォールバック）:
 
 ```
 [github-webhook-mcp] OAuth device authorization required.
 [github-webhook-mcp] Visit: https://github.com/login/device
 [github-webhook-mcp] Enter code: WDJB-MJHT
 [github-webhook-mcp] Or open directly: https://github.com/login/device?user_code=WDJB-MJHT
+[github-webhook-mcp] Opening browser for authentication...
 [github-webhook-mcp] Waiting for approval (expires in 600s)...
 ```
 
-ブラウザで `https://github.com/login/device` を開き、表示された 8 文字の `user_code` を入力してください。承認後、自動的にトークンが発行され、`~/.github-webhook-mcp/oauth-tokens.json` に保存されます。以降の起動では保存済みトークンが再利用され、期限切れ前に自動でリフレッシュされます。
+> **ブラウザ自動オープンが失敗した場合:** 応答と stderr ログに URL がそのまま残るので、手動でコピーしてブラウザに貼り付けてください。Windows では `start`、macOS では `open`、Linux では `xdg-open` を使用します。
 
 > **旧バージョンからの移行:** v0.10.x 以前の localhost callback flow を使っていた場合、初回起動時に旧トークンファイルが自動削除され、migration 通知が stderr に出力されます。表示される device code を入力して一度だけ再認証してください。
 

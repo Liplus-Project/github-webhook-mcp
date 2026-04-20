@@ -19,9 +19,10 @@ import {
   CallToolRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { readFile, writeFile, mkdir, unlink } from "node:fs/promises";
-import { homedir } from "node:os";
+import { homedir, platform as osPlatform } from "node:os";
 import { join } from "node:path";
 import { createRequire } from "node:module";
+import { spawn } from "node:child_process";
 import WebSocketClient from "ws";
 
 const require = createRequire(import.meta.url);
@@ -71,6 +72,15 @@ let _cachedTokens = null;
 let _refreshLock = null;
 let _deviceFlowLock = null;
 let _legacyMigrationNotified = false;
+
+/**
+ * Tracks the in-flight device authorization so tool calls can return an
+ * auth-required response immediately (instead of blocking for ~600s) while
+ * polling continues in the background. Cleared on success or failure so the
+ * next tool call after expiry starts a fresh device code.
+ */
+let _pendingDeviceAuth = null;
+let _pendingDeviceAuthError = null;
 
 // ── OAuth Discovery & Registration ───────────────────────────────────────────
 
@@ -182,6 +192,49 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/**
+ * Best-effort platform-native browser launcher for the device-flow
+ * verification URL. Failures are non-fatal: we still surface the URL on
+ * stderr / in the tool response so the user can open it manually.
+ */
+function openBrowser(url) {
+  if (!url || typeof url !== "string") return;
+  try {
+    const plat = osPlatform();
+    let command;
+    let args;
+    let options = { detached: true, stdio: "ignore" };
+
+    if (plat === "win32") {
+      // `start` is a cmd.exe builtin, not a standalone executable.
+      // The empty "" argument is the window title placeholder expected by
+      // `start` when the URL is quoted.
+      command = "cmd.exe";
+      args = ["/c", "start", "", url];
+    } else if (plat === "darwin") {
+      command = "open";
+      args = [url];
+    } else {
+      command = "xdg-open";
+      args = [url];
+    }
+
+    const child = spawn(command, args, options);
+    child.on("error", (err) => {
+      process.stderr.write(
+        `[github-webhook-mcp] Failed to auto-open browser (${err.message || err}). ` +
+        `Open this URL manually: ${url}\n`,
+      );
+    });
+    if (typeof child.unref === "function") child.unref();
+  } catch (err) {
+    process.stderr.write(
+      `[github-webhook-mcp] Failed to auto-open browser (${err && err.message ? err.message : err}). ` +
+      `Open this URL manually: ${url}\n`,
+    );
+  }
+}
+
 async function requestDeviceAuthorization(metadata, client) {
   const endpoint =
     metadata.device_authorization_endpoint ||
@@ -279,24 +332,40 @@ async function pollForDeviceToken(metadata, client, deviceAuth) {
   );
 }
 
+/**
+ * Start a device authorization flow: obtain device_code/user_code, surface the
+ * verification URL (stderr + auto-open browser), and kick off a background
+ * poll. Callers that await the returned promise will block until the user
+ * approves — this is what the WebSocket bootstrap does. Callers that only
+ * need the deviceAuth metadata (for a non-blocking tool response) can read
+ * `_pendingDeviceAuth` as soon as this function resolves past the await
+ * below; see `getAccessTokenOrPendingAuth()`.
+ *
+ * Serialization: _deviceFlowLock ensures that concurrent callers (WebSocket
+ * bootstrap racing the first tool call) share a single device code rather
+ * than each launching their own approval prompt.
+ */
 async function performOAuthFlow() {
-  // Serialize concurrent device-flow starts (e.g. WebSocket boot racing the
-  // first tool call). Whichever caller wins runs the flow; others await.
   if (_deviceFlowLock) {
     return await _deviceFlowLock;
   }
 
-  _deviceFlowLock = (async () => {
+  // Phase 1: obtain the device code. This is fast (one HTTP round-trip) and
+  // we surface the verification URL as soon as it returns.
+  const startPromise = (async () => {
     await checkLegacyTokensMigration();
 
     const metadata = await discoverOAuthMetadata();
     const client = await ensureClientRegistration(metadata);
-
     const deviceAuth = await requestDeviceAuthorization(metadata, client);
 
-    // stdio MCP clients have no UI surface, so we publish the user_code and
-    // verification URI on stderr where Claude Code surfaces the log.
     const complete = deviceAuth.verification_uri_complete;
+    const browserUrl = complete || deviceAuth.verification_uri;
+
+    // stdio MCP clients have no UI surface of their own, so we publish the
+    // user_code and verification URI on stderr where the host logs land. The
+    // auth-required tool response (below) is the primary channel for Claude
+    // Code / Desktop; stderr is the fallback surface.
     const lines = [
       "",
       "[github-webhook-mcp] OAuth device authorization required.",
@@ -307,38 +376,81 @@ async function performOAuthFlow() {
       lines.push(`[github-webhook-mcp] Or open directly: ${complete}`);
     }
     lines.push(
+      `[github-webhook-mcp] Opening browser for authentication...`,
       `[github-webhook-mcp] Waiting for approval (expires in ${deviceAuth.expires_in || "?"}s)...`,
       "",
     );
     process.stderr.write(lines.join("\n"));
 
-    const tokenData = await pollForDeviceToken(metadata, client, deviceAuth);
+    // Best-effort browser auto-open. Failures are logged to stderr but do
+    // not abort the flow — the URL is still available in the tool response.
+    openBrowser(browserUrl);
 
-    if (!tokenData.access_token) {
-      throw new Error(
-        `Token response missing access_token: ${JSON.stringify(tokenData).slice(0, 200)}`,
-      );
-    }
+    const expiresAt = deviceAuth.expires_in
+      ? Date.now() + Number(deviceAuth.expires_in) * 1000
+      : undefined;
 
-    const tokens = {
-      flow: TOKENS_FLOW_MARKER,
-      access_token: tokenData.access_token,
-      refresh_token: tokenData.refresh_token,
-      expires_at: tokenData.expires_in
-        ? Date.now() + tokenData.expires_in * 1000
-        : undefined,
+    _pendingDeviceAuth = {
+      user_code: deviceAuth.user_code,
+      verification_uri: deviceAuth.verification_uri,
+      verification_uri_complete: complete || null,
+      expires_at: expiresAt,
     };
+    _pendingDeviceAuthError = null;
 
-    await saveTokens(tokens);
-    process.stderr.write("[github-webhook-mcp] OAuth device authorization complete.\n");
-    return tokens;
+    return { metadata, client, deviceAuth };
   })();
 
-  try {
-    return await _deviceFlowLock;
-  } finally {
-    _deviceFlowLock = null;
-  }
+  // Phase 2: poll in the background (still inside the same lock promise so
+  // that simultaneous callers await one shared flow). Errors are recorded
+  // and re-thrown so awaiting callers see them.
+  _deviceFlowLock = (async () => {
+    try {
+      const { metadata, client, deviceAuth } = await startPromise;
+      const tokenData = await pollForDeviceToken(metadata, client, deviceAuth);
+
+      if (!tokenData.access_token) {
+        throw new Error(
+          `Token response missing access_token: ${JSON.stringify(tokenData).slice(0, 200)}`,
+        );
+      }
+
+      const tokens = {
+        flow: TOKENS_FLOW_MARKER,
+        access_token: tokenData.access_token,
+        refresh_token: tokenData.refresh_token,
+        expires_at: tokenData.expires_in
+          ? Date.now() + tokenData.expires_in * 1000
+          : undefined,
+      };
+
+      await saveTokens(tokens);
+      _cachedTokens = tokens;
+      _pendingDeviceAuth = null;
+      _pendingDeviceAuthError = null;
+      process.stderr.write("[github-webhook-mcp] OAuth device authorization complete.\n");
+      return tokens;
+    } catch (err) {
+      _pendingDeviceAuth = null;
+      _pendingDeviceAuthError = err && err.message ? err.message : String(err);
+      throw err;
+    }
+  })();
+
+  // Make sure the caller-visible promise settles deterministically when the
+  // background poll finishes (or errors). Don't await inside the lock itself;
+  // other callers may want to see _pendingDeviceAuth without blocking.
+  const lockPromise = _deviceFlowLock;
+  lockPromise.finally(() => {
+    if (_deviceFlowLock === lockPromise) {
+      _deviceFlowLock = null;
+    }
+  });
+
+  // Wait for phase 1 so the caller sees _pendingDeviceAuth populated (or the
+  // startPromise's error) before we return the outer promise.
+  await startPromise;
+  return lockPromise;
 }
 
 async function refreshAccessToken(refreshToken) {
@@ -425,10 +537,111 @@ async function getAccessToken() {
   return _cachedTokens.access_token;
 }
 
-/** Build common headers with OAuth Bearer auth */
-async function authHeaders(extra) {
+/**
+ * Sentinel thrown by `getAccessTokenForToolCall()` when the device flow is
+ * still pending approval. The tool handler catches this and returns a
+ * structured auth-required response to the MCP client without blocking on
+ * the poll loop.
+ */
+class AuthRequiredError extends Error {
+  constructor(pending, note) {
+    super(note || "OAuth device authorization required");
+    this.name = "AuthRequiredError";
+    this.pending = pending;
+  }
+}
+
+/**
+ * Like getAccessToken(), but never blocks on the device-flow poll. If no
+ * tokens are available, it starts the flow (if not already running) and
+ * throws an AuthRequiredError carrying the current device-code details so
+ * the caller can surface them in the tool response immediately.
+ */
+async function getAccessTokenForToolCall() {
+  if (!_cachedTokens) {
+    _cachedTokens = await loadTokens();
+  }
+
+  if (_cachedTokens) {
+    const REFRESH_BUFFER_MS = 5 * 60_000;
+    if (!_cachedTokens.expires_at || _cachedTokens.expires_at > Date.now() + REFRESH_BUFFER_MS) {
+      return _cachedTokens.access_token;
+    }
+
+    if (_cachedTokens.refresh_token) {
+      // Refresh synchronously — refresh calls are one round-trip, unlike
+      // the full device flow, so blocking a tool call here is fine.
+      if (!_refreshLock) {
+        _refreshLock = refreshAccessToken(_cachedTokens.refresh_token);
+      }
+      try {
+        _cachedTokens = await _refreshLock;
+        return _cachedTokens.access_token;
+      } catch (err) {
+        console.error(
+          "[oauth] refresh failed, starting device flow in background:",
+          err.message || err,
+        );
+      } finally {
+        _refreshLock = null;
+      }
+    }
+  }
+
+  // No usable tokens. Start the device flow if it isn't already running;
+  // either way, hand the caller the current pending device_code details.
+  if (!_pendingDeviceAuth && !_deviceFlowLock) {
+    // Swallow the outer promise; the background poll settles via
+    // _deviceFlowLock. Errors during phase 1 (e.g. network failure to
+    // /oauth/device_authorization) propagate synchronously below.
+    performOAuthFlow().catch((err) => {
+      // Already captured into _pendingDeviceAuthError; log for operators.
+      console.error("[oauth] device flow background poll ended with error:", err.message || err);
+    });
+
+    // Wait briefly (phase 1 is a single HTTP round-trip) so _pendingDeviceAuth
+    // is populated before we throw — but never block for the full poll.
+    // performOAuthFlow() only returns once phase 1 has resolved, so we can
+    // await the lock promise safely. The lock is created synchronously inside
+    // performOAuthFlow(), so it's guaranteed to be non-null here.
+    if (_deviceFlowLock) {
+      try {
+        // Awaiting the lock resolves when polling finishes. We instead await
+        // via a tick to give startPromise time to populate _pendingDeviceAuth.
+        await Promise.race([
+          // Let phase 1 populate _pendingDeviceAuth.
+          new Promise((resolve) => setImmediate(resolve)),
+          // If phase 1 fails fast, the lock rejects and we re-throw.
+          _deviceFlowLock.then(() => undefined, (err) => { throw err; }),
+        ]);
+      } catch (err) {
+        throw err;
+      }
+    }
+  }
+
+  // Give phase 1 a little more time to finish (device_authorization request
+  // is a single round-trip — normally sub-second). Poll the state briefly
+  // so we return a populated auth-required response instead of an empty one.
+  const phase1Deadline = Date.now() + 15_000;
+  while (!_pendingDeviceAuth && !_pendingDeviceAuthError && Date.now() < phase1Deadline) {
+    await sleep(100);
+  }
+
+  if (_pendingDeviceAuthError && !_pendingDeviceAuth) {
+    throw new Error(`OAuth device flow failed: ${_pendingDeviceAuthError}`);
+  }
+
+  if (_pendingDeviceAuth) {
+    throw new AuthRequiredError(_pendingDeviceAuth);
+  }
+
+  // Phase 1 timed out — surface as a regular error.
+  throw new Error("OAuth device flow did not produce a verification URL in time.");
+}
+
+async function buildAuthHeaders(token, extra) {
   const h = { ...extra };
-  const token = await getAccessToken();
   if (token) h["Authorization"] = `Bearer ${token}`;
   return h;
 }
@@ -437,12 +650,12 @@ async function authHeaders(extra) {
 
 let _sessionId = null;
 
-async function getSessionId() {
+async function getSessionIdWithToken(token) {
   if (_sessionId) return _sessionId;
 
   const res = await fetch(`${WORKER_URL}/mcp`, {
     method: "POST",
-    headers: await authHeaders({
+    headers: await buildAuthHeaders(token, {
       "Content-Type": "application/json",
       Accept: "application/json, text/event-stream",
     }),
@@ -462,12 +675,12 @@ async function getSessionId() {
   return _sessionId;
 }
 
-async function callRemoteTool(name, args, _retried = false) {
-  const sessionId = await getSessionId();
+async function callRemoteToolWithToken(name, args, token, _retried = false) {
+  const sessionId = await getSessionIdWithToken(token);
 
   const res = await fetch(`${WORKER_URL}/mcp`, {
     method: "POST",
-    headers: await authHeaders({
+    headers: await buildAuthHeaders(token, {
       "Content-Type": "application/json",
       Accept: "application/json, text/event-stream",
       "mcp-session-id": sessionId,
@@ -480,14 +693,16 @@ async function callRemoteTool(name, args, _retried = false) {
     }),
   });
 
-  // 401 = token expired or revoked, re-authenticate and retry once
+  // 401 = token expired or revoked. Clear session + token cache and retry
+  // once with a freshly acquired token (refresh or full flow).
   if (res.status === 401) {
     if (_retried) {
       return { content: [{ type: "text", text: "Authentication failed after retry. Please re-authenticate." }] };
     }
     _cachedTokens = null;
     _sessionId = null;
-    return callRemoteTool(name, args, true);
+    const freshToken = await getAccessTokenForToolCall();
+    return callRemoteToolWithToken(name, args, freshToken, true);
   }
 
   const text = await res.text();
@@ -500,7 +715,7 @@ async function callRemoteTool(name, args, _retried = false) {
     // Session expired — retry once with a fresh session
     if ((json.error.code === -32600 || json.error.code === -32001) && !_retried) {
       _sessionId = null;
-      return callRemoteTool(name, args, true);
+      return callRemoteToolWithToken(name, args, token, true);
     }
     return { content: [{ type: "text", text: JSON.stringify(json.error) }] };
   }
@@ -610,14 +825,49 @@ const TOOLS = [
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
 
+function formatAuthRequiredResponse(pending) {
+  const parts = [];
+  parts.push("OAuth device authorization required.");
+  parts.push("");
+  if (pending.verification_uri_complete) {
+    parts.push(`Open (code pre-filled): ${pending.verification_uri_complete}`);
+    parts.push("");
+    parts.push(`Or visit ${pending.verification_uri} and enter the code:`);
+  } else {
+    parts.push(`Visit: ${pending.verification_uri}`);
+    parts.push("Enter the code:");
+  }
+  parts.push(`  ${pending.user_code}`);
+  parts.push("");
+  if (pending.expires_at) {
+    const remainingMs = pending.expires_at - Date.now();
+    if (remainingMs > 0) {
+      const mins = Math.max(1, Math.round(remainingMs / 60_000));
+      parts.push(`Code expires in about ${mins} minute${mins === 1 ? "" : "s"}.`);
+    }
+  }
+  parts.push(
+    "A browser window should have opened automatically. " +
+      "Retry the same tool call after approving — subsequent calls will succeed once authorization completes.",
+  );
+  return parts.join("\n");
+}
+
 server.setRequestHandler(CallToolRequestSchema, async (req) => {
   const { name, arguments: args } = req.params;
   try {
-    const result = await callRemoteTool(name, args ?? {});
+    const token = await getAccessTokenForToolCall();
+    const result = await callRemoteToolWithToken(name, args ?? {}, token);
     // First successful tool call confirms OAuth is working
     markOAuthEstablished();
     return result;
   } catch (err) {
+    if (err instanceof AuthRequiredError) {
+      return {
+        content: [{ type: "text", text: formatAuthRequiredResponse(err.pending) }],
+        isError: true,
+      };
+    }
     return {
       content: [{ type: "text", text: `Failed to reach worker: ${err}` }],
       isError: true,
