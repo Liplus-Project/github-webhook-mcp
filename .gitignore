@@ -3,4 +3,5 @@ mcp-server/node_modules/
 mcp-server/*.mcpb
 worker/node_modules/
 worker/.wrangler/
+worker/dist/
 local-mcp/node_modules/
