@@ -171,11 +171,20 @@ function openBrowser(url) {
     let options = { detached: true, stdio: "ignore" };
 
     if (plat === "win32") {
-      // `start` is a cmd.exe builtin, not a standalone executable.
-      // The empty "" argument is the window title placeholder expected by
-      // `start` when the URL is quoted.
-      command = "cmd.exe";
-      args = ["/c", "start", "", url];
+      // `start` is a cmd.exe builtin, not a standalone executable, so the
+      // command must run through a shell. The empty "" is the window-title
+      // placeholder expected by `start` when the following token is quoted.
+      //
+      // URL-quoting is mandatory on Windows: cmd.exe treats `&` as a command
+      // separator unless the argument is wrapped in double quotes, so an
+      // unquoted OAuth authorize URL like
+      //   https://worker/oauth/authorize?client_id=X&state=Y
+      // would truncate at `&state=` and drop the `state` parameter (v0.11.2
+      // fix for #211). `shell: true` hands the full command string to
+      // cmd.exe so the outer quotes survive argv reassembly intact.
+      command = `start "" "${url}"`;
+      args = [];
+      options.shell = true;
     } else if (plat === "darwin") {
       command = "open";
       args = [url];
