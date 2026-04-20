@@ -1,30 +1,32 @@
 /**
- * Cloudflare Worker entrypoint for github-webhook-mcp
+ * Cloudflare Worker entrypoint for github-webhook-mcp.
  *
- * Routes (handled by OAuthProvider wrapper):
- *   /.well-known/oauth-authorization-server — RFC 8414 metadata discovery
- *   /oauth/register  — RFC 7591 dynamic client registration
- *   /oauth/token     — Token issuance and refresh
+ * OAuth model: bespoke Device Authorization Grant (RFC 8628) implementation.
+ * See worker/src/oauth.ts. The legacy @cloudflare/workers-oauth-provider
+ * wrapper and its /oauth/authorize + /oauth/callback localhost flow were
+ * removed in v0.11.0 (see #198) because they caused a chronic auth loop
+ * (#195) across process restarts.
  *
- * Routes (OAuth-protected API, validated by OAuthProvider):
- *   POST /mcp   — McpAgent DO (Streamable HTTP MCP protocol)
- *   GET  /events — SSE/WebSocket stream via tenant WebhookStore DO
+ * Routes:
+ *   GET  /.well-known/oauth-authorization-server   RFC 8414 metadata (oauth.ts)
+ *   POST /oauth/register                           RFC 7591 (oauth.ts)
+ *   POST /oauth/device_authorization               RFC 8628 §3.1 (oauth.ts)
+ *   POST /oauth/token                              RFC 8628 §3.4 + refresh (oauth.ts)
+ *   GET  /oauth/device                             Device approval redirect (oauth.ts)
+ *   GET  /oauth/authorize, /oauth/callback         410 Gone (oauth.ts)
  *
- * Routes (defaultHandler, no OAuth token required):
- *   POST /webhooks/github — GitHub webhook receiver
- *     Auth chain: IP allowlist → rate limit → signature → tenant → quota
- *   GET  /oauth/authorize  — Start GitHub OAuth flow
- *   GET  /oauth/callback   — GitHub OAuth callback
+ *   POST /webhooks/github                          Webhook ingest (no auth)
+ *   POST /mcp                                      MCP protocol (Bearer token)
+ *   GET  /events                                   SSE/WebSocket stream (Bearer token)
  */
 import { WebhookMcpAgent } from "./agent.js";
 import { WebhookStore } from "./store.js";
 import { TenantRegistry } from "./tenant.js";
 import {
-  createOAuthProvider,
-  handleAuthorize,
-  handleGitHubCallback,
-  type OAuthEnv,
+  authenticateApiRequest,
+  handleOAuthRequest,
   type GitHubUserProps,
+  type OAuthEnv,
 } from "./oauth.js";
 import { isGitHubWebhookIP } from "./github-ip.js";
 import { checkWebhookRateLimit, checkApiRateLimit, checkTenantQuota, rateLimitResponse } from "./rate-limit.js";
@@ -71,7 +73,6 @@ async function resolveInstallationTenant(
   const registryId = env.TENANT_REGISTRY.idFromName("global");
   const registry = env.TENANT_REGISTRY.get(registryId);
 
-  // Handle installation lifecycle events
   if (eventType === "installation") {
     const action = (payload as { action?: string }).action;
     const installation = payload.installation as {
@@ -113,7 +114,6 @@ async function resolveInstallationTenant(
     }
   }
 
-  // Normal resolution: lookup installation_id -> account_id
   const resolveRes = await registry.fetch(
     new Request(`https://registry/resolve?installation_id=${installationId}`),
   );
@@ -125,42 +125,43 @@ async function resolveInstallationTenant(
 }
 
 // McpAgent.serve() returns a fetch handler for MCP protocol.
-// It reads ctx.props (set by OAuthProvider) and passes them to the DO via getAgentByName.
+// It reads ctx.props (set below from the authenticated grant) and passes them
+// to the DO via getAgentByName.
 const mcpHandler = WebhookMcpAgent.serve("/mcp");
 
 /**
- * Inner handler — processes requests after OAuthProvider routing.
- *
- * For API routes (/mcp, /events): OAuthProvider has already validated the
- * access token and set ctx.props with GitHubUserProps.
- *
- * For default routes: OAuthProvider passes through without token validation.
- * env.OAUTH_PROVIDER is set with OAuthHelpers for the authorize/callback flow.
+ * Top-level fetch handler. Routes OAuth endpoints to oauth.ts, authenticates
+ * API routes (/mcp, /events) via Bearer token, and passes through webhook and
+ * other routes directly.
  */
-const innerHandler: ExportedHandler<Env> = {
+export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
 
+    // ── OAuth endpoints ────────────────────────────────────────
+    // oauth.ts owns metadata discovery, registration, device authorization,
+    // token issuance/refresh, and the 410 Gone responses for the removed
+    // /oauth/authorize + /oauth/callback endpoints.
+    if (
+      url.pathname.startsWith("/oauth/") ||
+      url.pathname === "/.well-known/oauth-authorization-server"
+    ) {
+      const res = await handleOAuthRequest(request, env);
+      if (res) return res;
+    }
+
     // ── Webhook receiver (no OAuth required) ──────────────────
-    // Authentication check order:
-    //   1. IP allowlist (cheapest — no body read, no crypto)
-    //   2. Per-IP rate limit (in-memory, no I/O)
-    //   3. Signature verification (requires body read + HMAC)
-    //   4. Tenant resolution (DO call)
-    //   5. Per-tenant quota check (DO call, atomic increment)
-    //   6. Forward to WebhookStore DO
-    // Each layer blocks before the next to minimize DO calls on invalid requests.
+    // Authentication chain mirrors the pre-v0.11.0 order:
+    //   IP allowlist → per-IP rate limit → signature → tenant resolution
+    //   → per-tenant quota → WebhookStore DO /ingest
     if (url.pathname === "/webhooks/github" && request.method === "POST") {
-      // 1. IP allowlist — block non-GitHub IPs before any processing
       if (!(await isGitHubWebhookIP(request))) {
         return new Response("Forbidden", { status: 403 });
       }
 
-      // 2. Rate limit per IP — lightweight in-memory check
       const webhookIP = request.headers.get("CF-Connecting-IP") || "unknown";
       if (!checkWebhookRateLimit(webhookIP)) return rateLimitResponse();
 
-      // 3. Signature verification — read body and verify HMAC
       const body = await request.text();
 
       if (env.GITHUB_WEBHOOK_SECRET) {
@@ -181,7 +182,6 @@ const innerHandler: ExportedHandler<Env> = {
         return new Response("Invalid JSON payload", { status: 400 });
       }
 
-      // 4. Tenant resolution — resolve installation_id → account via TenantRegistry DO
       const installation = payload.installation as { id: number } | undefined;
       const installationId = installation?.id;
 
@@ -200,9 +200,6 @@ const innerHandler: ExportedHandler<Env> = {
         );
       }
 
-      // 5. Per-tenant quota check — atomic check-and-increment in TenantRegistry DO
-      //    Prevents a single tenant from consuming unbounded storage.
-      //    Skip for installation lifecycle events (created/deleted) to avoid blocking registration.
       if (eventType !== "installation") {
         const registryId = env.TENANT_REGISTRY.idFromName("global");
         const registry = env.TENANT_REGISTRY.get(registryId);
@@ -212,7 +209,6 @@ const innerHandler: ExportedHandler<Env> = {
         }
       }
 
-      // 6. Forward to tenant-specific WebhookStore DO (store-{accountId})
       const storeName = `store-${tenant.account_id}`;
       const doId = env.WEBHOOK_STORE.idFromName(storeName);
       const stub = env.WEBHOOK_STORE.get(doId);
@@ -243,210 +239,182 @@ const innerHandler: ExportedHandler<Env> = {
     const apiIP = request.headers.get("CF-Connecting-IP") || "unknown";
     if (!checkApiRateLimit(apiIP)) return rateLimitResponse();
 
-    // ── SSE/WebSocket stream (OAuth-protected, ctx.props set) ─
-    if (url.pathname === "/events" && (request.method === "GET" || request.headers.get("Upgrade") === "websocket")) {
-      const props = (ctx as unknown as { props: GitHubUserProps }).props;
-      if (!props?.githubUserId) {
-        return new Response("Unauthorized", { status: 401 });
+    // ── Protected API routes (/mcp, /events) ─────────────────
+    // Authenticate once here so both routes share the same middleware.
+    const isMcpRoute = url.pathname.startsWith("/mcp");
+    const isEventsRoute = url.pathname === "/events";
+    if (isMcpRoute || isEventsRoute) {
+      const result = await authenticateApiRequest(request, env);
+      if ("response" in result) {
+        return result.response;
+      }
+      const props = result.auth.props;
+
+      if (isEventsRoute && (request.method === "GET" || request.headers.get("Upgrade") === "websocket")) {
+        return handleEvents(request, env, ctx, props);
       }
 
-      // Resolve all accessible account stores (user + orgs).
-      // Webhooks are ingested into store-{account_id} keyed by the GitHub App
-      // installation's account, so org events live in org stores, not user stores.
-      const accountIds = props.accessibleAccountIds?.length
-        ? props.accessibleAccountIds
-        : [props.githubUserId];
-      const storeStubs = accountIds.map((id) => {
-        const doId = env.WEBHOOK_STORE.idFromName(`store-${id}`);
-        return env.WEBHOOK_STORE.get(doId);
-      });
-
-      // Single store — direct pass-through (no fanout overhead)
-      if (storeStubs.length === 1) {
-        return storeStubs[0].fetch(request);
-      }
-
-      // ── Multi-store fanout: WebSocket ──
-      if (request.headers.get("Upgrade") === "websocket") {
-        const clientPair = new WebSocketPair();
-        const clientWs = clientPair[0];
-        const serverWs = clientPair[1];
-
-        // Accept the server-side WebSocket (we manage the lifecycle)
-        serverWs.accept();
-
-        // Track upstream connections for cleanup
-        const upstreamSockets: WebSocket[] = [];
-
-        // Connect to each store DO via internal WebSocket
-        for (const stub of storeStubs) {
-          const upstreamRes = await stub.fetch(
-            new Request("https://do/events", {
-              headers: { "Upgrade": "websocket" },
-            }),
-          );
-          const upstreamWs = upstreamRes.webSocket;
-          if (!upstreamWs) continue;
-
-          upstreamWs.accept();
-          upstreamSockets.push(upstreamWs);
-
-          // Forward upstream messages to the client (skip initial "connected" from each DO)
-          let firstMessage = true;
-          upstreamWs.addEventListener("message", (event: MessageEvent) => {
-            if (firstMessage) {
-              firstMessage = false;
-              // Skip individual DO "connected" messages; we send our own below
-              return;
-            }
-            try {
-              serverWs.send(typeof event.data === "string" ? event.data : "");
-            } catch {
-              // Client disconnected
-            }
-          });
-
-          upstreamWs.addEventListener("close", () => {
-            // Upstream closed; remove from tracking
-            const idx = upstreamSockets.indexOf(upstreamWs);
-            if (idx >= 0) upstreamSockets.splice(idx, 1);
-          });
-        }
-
-        // Forward client messages (e.g. "ping") to all upstream DOs
-        serverWs.addEventListener("message", (event: MessageEvent) => {
-          for (const ws of upstreamSockets) {
-            try {
-              ws.send(typeof event.data === "string" ? event.data : "");
-            } catch { /* upstream gone */ }
-          }
-        });
-
-        // When client disconnects, close all upstream connections
-        serverWs.addEventListener("close", () => {
-          for (const ws of upstreamSockets) {
-            try { ws.close(1000, "client disconnected"); } catch { /* ok */ }
-          }
-        });
-
-        // Send unified "connected" message to client
-        serverWs.send(JSON.stringify({ status: "connected", stores: accountIds.length }));
-
-        return new Response(null, { status: 101, webSocket: clientWs });
-      }
-
-      // ── Multi-store fanout: SSE ──
-      const sseEncoder = new TextEncoder();
-      const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
-      const writer = writable.getWriter();
-
-      // Send initial connected message
-      writer.write(sseEncoder.encode(
-        `data: ${JSON.stringify({ status: "connected", stores: accountIds.length })}\n\n`,
-      ));
-
-      // Track abort controllers for upstream fetches
-      const upstreamAborts: AbortController[] = [];
-
-      // Connect to each store DO via internal SSE
-      for (const stub of storeStubs) {
-        const abortCtrl = new AbortController();
-        upstreamAborts.push(abortCtrl);
-
-        const upstreamRes = await stub.fetch(
-          new Request("https://do/events", {
-            signal: abortCtrl.signal,
-          }),
-        );
-
-        if (!upstreamRes.body) continue;
-
-        // Pipe upstream SSE data to client (runs in background)
-        const reader = upstreamRes.body.getReader();
-        const pump = async () => {
-          let skipFirst = true;
-          let buffer = "";
-          try {
-            while (true) {
-              const { done, value } = await reader.read();
-              if (done) break;
-              // Parse SSE frames to skip initial "connected" message from each DO
-              const text = new TextDecoder().decode(value);
-              buffer += text;
-              const frames = buffer.split("\n\n");
-              buffer = frames.pop() || ""; // last element is incomplete or empty
-              for (const frame of frames) {
-                if (!frame.trim()) continue;
-                if (skipFirst) {
-                  skipFirst = false;
-                  continue; // Skip DO's own "connected" message
-                }
-                await writer.write(sseEncoder.encode(frame + "\n\n"));
-              }
-            }
-          } catch {
-            // Stream ended or aborted
-          }
+      if (isMcpRoute) {
+        // Rewrite ctx.props to TenantProps shape expected by WebhookMcpAgent.
+        (ctx as unknown as { props: { account_id: number; account_login: string; accessible_account_ids: number[] } }).props = {
+          account_id: props.githubUserId,
+          account_login: props.githubLogin,
+          accessible_account_ids: props.accessibleAccountIds ?? [props.githubUserId],
         };
-        // Don't await — let all pumps run concurrently
-        ctx.waitUntil(pump());
+        return mcpHandler.fetch(request, env, ctx);
       }
-
-      // Cleanup on client disconnect
-      request.signal.addEventListener("abort", () => {
-        for (const ctrl of upstreamAborts) {
-          ctrl.abort();
-        }
-        writer.close().catch(() => {});
-      });
-
-      return new Response(readable, {
-        headers: {
-          "Content-Type": "text/event-stream",
-          "Cache-Control": "no-cache",
-          "Connection": "keep-alive",
-        },
-      });
-    }
-
-    // ── MCP endpoint (OAuth-protected, ctx.props set) ────────
-    // McpAgent.serve() handler reads ctx.props automatically and passes
-    // them to the DO via getAgentByName. The agent uses props.account_id
-    // to resolve its tenant-specific WebhookStore.
-    if (url.pathname.startsWith("/mcp")) {
-      const props = (ctx as unknown as { props: GitHubUserProps }).props;
-      if (!props?.githubUserId) {
-        return new Response("Unauthorized", { status: 401 });
-      }
-
-      // Rewrite ctx.props to TenantProps shape expected by WebhookMcpAgent.
-      // accessible_account_ids includes the user's own ID plus any org IDs
-      // whose App installations the user has access to, enabling cross-org event visibility.
-      (ctx as unknown as { props: { account_id: number; account_login: string; accessible_account_ids: number[] } }).props = {
-        account_id: props.githubUserId,
-        account_login: props.githubLogin,
-        accessible_account_ids: props.accessibleAccountIds ?? [props.githubUserId],
-      };
-
-      return mcpHandler.fetch(request, env, ctx);
-    }
-
-    // ── OAuth authorize (redirect to GitHub) ─────────────────
-    if (url.pathname === "/oauth/authorize") {
-      const oauthHelpers = (env as unknown as { OAUTH_PROVIDER: Parameters<typeof handleAuthorize>[2] }).OAUTH_PROVIDER;
-      return handleAuthorize(request, env, oauthHelpers);
-    }
-
-    // ── OAuth callback (GitHub redirects back here) ──────────
-    if (url.pathname === "/oauth/callback") {
-      const oauthHelpers = (env as unknown as { OAUTH_PROVIDER: Parameters<typeof handleGitHubCallback>[2] }).OAUTH_PROVIDER;
-      return handleGitHubCallback(request, env, oauthHelpers);
     }
 
     return new Response("Not found", { status: 404 });
   },
-};
+} satisfies ExportedHandler<Env>;
 
-// OAuthProvider wraps the inner handler, adding OAuth endpoints
-// and protecting /mcp and /events routes with access token validation.
-export default createOAuthProvider(innerHandler as unknown as ExportedHandler<OAuthEnv & Record<string, unknown>>);
+/**
+ * Handle /events — WebSocket or SSE fanout across all accessible tenant stores.
+ * Extracted from the inline handler to keep the top-level routing legible.
+ */
+async function handleEvents(
+  request: Request,
+  env: Env,
+  ctx: ExecutionContext,
+  props: GitHubUserProps,
+): Promise<Response> {
+  const accountIds = props.accessibleAccountIds?.length
+    ? props.accessibleAccountIds
+    : [props.githubUserId];
+  const storeStubs = accountIds.map((id) => {
+    const doId = env.WEBHOOK_STORE.idFromName(`store-${id}`);
+    return env.WEBHOOK_STORE.get(doId);
+  });
+
+  // Single store — direct pass-through (no fanout overhead).
+  if (storeStubs.length === 1) {
+    return storeStubs[0].fetch(request);
+  }
+
+  // ── Multi-store fanout: WebSocket ──
+  if (request.headers.get("Upgrade") === "websocket") {
+    const clientPair = new WebSocketPair();
+    const clientWs = clientPair[0];
+    const serverWs = clientPair[1];
+    serverWs.accept();
+
+    const upstreamSockets: WebSocket[] = [];
+
+    for (const stub of storeStubs) {
+      const upstreamRes = await stub.fetch(
+        new Request("https://do/events", {
+          headers: { "Upgrade": "websocket" },
+        }),
+      );
+      const upstreamWs = upstreamRes.webSocket;
+      if (!upstreamWs) continue;
+
+      upstreamWs.accept();
+      upstreamSockets.push(upstreamWs);
+
+      let firstMessage = true;
+      upstreamWs.addEventListener("message", (event: MessageEvent) => {
+        if (firstMessage) {
+          firstMessage = false;
+          return;
+        }
+        try {
+          serverWs.send(typeof event.data === "string" ? event.data : "");
+        } catch {
+          // Client disconnected.
+        }
+      });
+
+      upstreamWs.addEventListener("close", () => {
+        const idx = upstreamSockets.indexOf(upstreamWs);
+        if (idx >= 0) upstreamSockets.splice(idx, 1);
+      });
+    }
+
+    serverWs.addEventListener("message", (event: MessageEvent) => {
+      for (const ws of upstreamSockets) {
+        try {
+          ws.send(typeof event.data === "string" ? event.data : "");
+        } catch { /* upstream gone */ }
+      }
+    });
+
+    serverWs.addEventListener("close", () => {
+      for (const ws of upstreamSockets) {
+        try { ws.close(1000, "client disconnected"); } catch { /* ok */ }
+      }
+    });
+
+    serverWs.send(JSON.stringify({ status: "connected", stores: accountIds.length }));
+
+    return new Response(null, { status: 101, webSocket: clientWs });
+  }
+
+  // ── Multi-store fanout: SSE ──
+  const sseEncoder = new TextEncoder();
+  const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
+  const writer = writable.getWriter();
+
+  writer.write(sseEncoder.encode(
+    `data: ${JSON.stringify({ status: "connected", stores: accountIds.length })}\n\n`,
+  ));
+
+  const upstreamAborts: AbortController[] = [];
+
+  for (const stub of storeStubs) {
+    const abortCtrl = new AbortController();
+    upstreamAborts.push(abortCtrl);
+
+    const upstreamRes = await stub.fetch(
+      new Request("https://do/events", {
+        signal: abortCtrl.signal,
+      }),
+    );
+
+    if (!upstreamRes.body) continue;
+
+    const reader = upstreamRes.body.getReader();
+    const pump = async () => {
+      let skipFirst = true;
+      let buffer = "";
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          const text = new TextDecoder().decode(value);
+          buffer += text;
+          const frames = buffer.split("\n\n");
+          buffer = frames.pop() || "";
+          for (const frame of frames) {
+            if (!frame.trim()) continue;
+            if (skipFirst) {
+              skipFirst = false;
+              continue;
+            }
+            await writer.write(sseEncoder.encode(frame + "\n\n"));
+          }
+        }
+      } catch {
+        // Stream ended or aborted.
+      }
+    };
+    ctx.waitUntil(pump());
+  }
+
+  request.signal.addEventListener("abort", () => {
+    for (const ctrl of upstreamAborts) {
+      ctrl.abort();
+    }
+    writer.close().catch(() => {});
+  });
+
+  return new Response(readable, {
+    headers: {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      "Connection": "keep-alive",
+    },
+  });
+}
+
