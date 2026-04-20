@@ -15,7 +15,15 @@ jobs:
         with:
           node-version: "22"
       - run: node --check mcp-server/server/index.js
-      - run: cd worker && npm ci && npx wrangler deploy --dry-run --outdir dist
+      - name: mcp-server client migration tests
+        run: node --test test/*.test.mjs
+        working-directory: mcp-server
+      - name: worker install + dry-run deploy + OAuth device-flow tests
+        run: |
+          npm ci
+          npx wrangler deploy --dry-run --outdir dist
+          npm test
+        working-directory: worker
 
   # Gate job: single Required status check for branch protection.
   # Add new jobs to `needs` when CI grows. No Settings change needed.

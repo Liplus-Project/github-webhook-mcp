@@ -15,6 +15,22 @@
 
 > **前提:** Node.js 18+ が必要です（ローカル MCP ブリッジの実行に使用）。
 
+### 初回認証（OAuth Device Flow）
+
+v0.11.0 以降、MCP クライアントは **OAuth 2.1 Device Authorization Grant (RFC 8628)** で認証します。初回接続時に以下のメッセージが Claude Code の stderr ログに出力されます:
+
+```
+[github-webhook-mcp] OAuth device authorization required.
+[github-webhook-mcp] Visit: https://github.com/login/device
+[github-webhook-mcp] Enter code: WDJB-MJHT
+[github-webhook-mcp] Or open directly: https://github.com/login/device?user_code=WDJB-MJHT
+[github-webhook-mcp] Waiting for approval (expires in 600s)...
+```
+
+ブラウザで `https://github.com/login/device` を開き、表示された 8 文字の `user_code` を入力してください。承認後、自動的にトークンが発行され、`~/.github-webhook-mcp/oauth-tokens.json` に保存されます。以降の起動では保存済みトークンが再利用され、期限切れ前に自動でリフレッシュされます。
+
+> **旧バージョンからの移行:** v0.10.x 以前の localhost callback flow を使っていた場合、初回起動時に旧トークンファイルが自動削除され、migration 通知が stderr に出力されます。表示される device code を入力して一度だけ再認証してください。
+
 ### Claude Desktop — デスクトップ拡張 (.mcpb)
 
 [Releases](https://github.com/Liplus-Project/github-webhook-mcp/releases) から `mcp-server.mcpb` をダウンロード:
@@ -142,11 +158,16 @@ id = "<ここに KV Namespace ID を貼り付け>"
 
 #### OAuth 設定（MCP リモート接続に必要）
 
-| 項目 | 値 |
-|------|-----|
-| **Callback URL** | `https://<your-worker>/oauth/callback` |
+v0.11.0 以降、OAuth は **Device Authorization Grant (RFC 8628)** で動作します。ローカル MCP クライアントは localhost callback ポートに依存しません。
 
-Client ID と Client secret を生成・メモしてください（ステップ 5 で使用）。
+1. **Identifying and authorizing users** セクションで **"Enable Device Flow"** チェックボックスを **ON** にする（必須）
+   - 未有効の場合、Worker の `/oauth/device_authorization` が `503 device_flow_disabled` を返し、MCP クライアントが認証できません
+2. **Callback URL** は **空欄のままで構いません**（device flow では使用されない。旧フローとの後方互換のため任意のダミー URL を入れてもよい）
+3. Client ID を生成・メモしてください（ステップ 5 で使用）
+4. **Client secret は不要です**（device flow の public client として動作するため）
+   - 既存 App で secret を発行済みの場合はそのままでも問題ありません（未使用のまま）
+
+> **重要:** v0.11.0 より前の localhost callback flow から移行するユーザーは、初回接続時に自動的に device flow で再認証が要求されます（`~/.github-webhook-mcp/oauth-tokens.json` の旧ファイルは自動で破棄され、stderr に移行通知が出力されます）。Claude Code のログで `https://github.com/login/device` の案内と `user_code` を確認して入力してください。
 
 #### パーミッション
 
@@ -178,20 +199,23 @@ Client ID と Client secret を生成・メモしてください（ステップ 
 
 ### 5. シークレットの設定
 
-3 つのシークレットを Cloudflare に登録。ダッシュボードの **Workers & Pages** → Worker → **Settings** → **Variables and Secrets** から設定するか、wrangler CLI で設定します:
+必要なシークレットを Cloudflare に登録。ダッシュボードの **Workers & Pages** → Worker → **Settings** → **Variables and Secrets** から設定するか、wrangler CLI で設定します:
 
 ```bash
-# GitHub App の Webhook secret
+# GitHub App の Webhook secret（必須）
 npx wrangler secret put GITHUB_WEBHOOK_SECRET
 
-# GitHub App の OAuth Client ID
+# GitHub App の Client ID（device flow で必須）
 npx wrangler secret put GITHUB_CLIENT_ID
 
-# GitHub App の OAuth Client Secret
+# GitHub App の Client Secret（device flow では未使用だが、upstream API が
+# 将来 confidential client に変わった場合に備えて設定を残してあります）
 npx wrangler secret put GITHUB_CLIENT_SECRET
 ```
 
 各コマンドでプロンプトが表示されるので、対応する値を入力してください。
+
+> **注意:** device flow の public client として動作するため `GITHUB_CLIENT_SECRET` は実際の認証には使用されません。未登録でも認証は成立しますが、互換性のためダミー値（例: `unused`）を入れておくことを推奨します。
 
 ### 6. カスタムドメイン（オプション）
 
@@ -199,7 +223,7 @@ npx wrangler secret put GITHUB_CLIENT_SECRET
 
 1. Cloudflare ダッシュボード → **Workers & Pages** → Worker → **Settings** → **Domains & Routes**
 2. カスタムドメインを追加（例: `github-webhook.example.com`）
-3. GitHub App の Webhook URL と Callback URL をカスタムドメインに更新
+3. GitHub App の Webhook URL をカスタムドメインに更新（device flow は Callback URL 不要）
 4. MCP クライアント設定の `WEBHOOK_WORKER_URL` を更新
 
 ### 7. WAF ルール（推奨）
@@ -245,6 +269,9 @@ claude --dangerously-load-development-channels server:github-webhook-mcp
 |------|-----------|
 | Webhook が 403 を返す | `GITHUB_WEBHOOK_SECRET` が GitHub App の設定と一致していない。両方の値を確認 |
 | Webhook が 429 を返す | テナントクォータ（デフォルト 10,000 イベント）を超過。古いイベントを `mark_processed` で処理 |
-| OAuth ログインが失敗する | `GITHUB_CLIENT_ID` と `GITHUB_CLIENT_SECRET` が正しいか確認。Callback URL が一致しているか確認 |
+| `/oauth/device_authorization` が 503 を返す | GitHub App で **"Enable Device Flow"** が有効になっていない。ステップ 4 の OAuth 設定で再確認 |
+| `/oauth/authorize` / `/oauth/callback` が 410 Gone を返す | v0.10.x 以前のクライアントが使っていた旧エンドポイント。MCP クライアントを最新版に更新してください（新クライアントは自動的に device flow にフォールバック） |
+| Claude Code のログに device code が表示されない | stderr の出力を確認。`[github-webhook-mcp] OAuth device authorization required.` のセクションに `user_code` と `https://github.com/login/device` が出力されているはず |
+| `~/.github-webhook-mcp/oauth-tokens.json` が消えた | v0.11.0 移行時に旧フローのトークンが自動削除された正常動作。device flow で再認証してください |
 | KV エラーが出る | `wrangler.toml` の KV ID が `wrangler kv namespace create` の出力と一致しているか確認 |
 | MCP ツールが応答しない | Worker がデプロイされているか `wrangler tail` でログを確認 |
