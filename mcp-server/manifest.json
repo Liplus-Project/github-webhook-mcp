@@ -2,7 +2,7 @@
   "manifest_version": "0.3",
   "name": "github-webhook-mcp",
   "display_name": "GitHub Webhook MCP",
-  "version": "1.0.0",
+  "version": "0.11.1",
   "description": "Real-time GitHub webhook notifications via Cloudflare Worker + Durable Object.",
   "long_description": "GitHub Webhook MCP bridges GitHub webhook events to Claude via a Cloudflare Worker backend. Events are stored in a Durable Object with SQLite, queried through MCP tools, and optionally pushed in real-time via SSE channel notifications. No local webhook receiver needed — just point your GitHub webhook at the Worker URL.",
   "author": {

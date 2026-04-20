@@ -158,6 +158,8 @@ Worker は OAuth 2.1 Device Authorization Grant を自前実装する（`@cloudf
 | F7.6 | 旧 `GET /oauth/authorize` および `GET /oauth/callback` は **HTTP 410 Gone** を返す（localhost callback flow は v0.11.0 で廃止） |
 | F7.7 | 保護対象 API ルート（`/mcp`, `/events`）は `Authorization: Bearer <access_token>` ヘッダによる独自 token 検証 middleware で認可する |
 | F7.8 | KV schema は自前設計: `client:{client_id}` / `device:{device_code}` / `user_code:{user_code}` / `token:{access_token}` / `refresh:{refresh_token}` / `grant:{grant_id}` |
+| F7.9 | ローカルブリッジは device authorization 応答受信直後に `verification_uri_complete`（なければ `verification_uri`）を platform 既定のブラウザで自動オープンする。Windows は `cmd /c start`、macOS は `open`、Linux は `xdg-open` を使う。オープン失敗は fatal にしない（stderr に警告を残し、URL は応答と stderr で伝える） |
+| F7.10 | ローカルブリッジは初回ツール呼び出しで device flow が完了していない場合、polling をバックグラウンドに維持したまま、`user_code` / `verification_uri_complete` / `verification_uri` / 残り有効秒数を本文に含む `isError: true` の構造化ツール応答を即座に返す。2 回目以降の同一ツール呼び出しは、承認完了なら通常処理、未完了なら同じ auth-required 応答を返す（ポーリングは 1 本に serialize） |
 
 **GitHub App 前提条件:**
 
