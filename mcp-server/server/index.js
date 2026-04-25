@@ -780,6 +780,86 @@ const TOOLS = [
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
 
+/**
+ * Build a short natural-language summary of a `get_pending_status` payload.
+ * Target length is around 100 characters so the wrapped `additionalContext`
+ * stays useful as Claude Code UserPromptSubmit context without bloating the
+ * prompt. Defensive about field shape because the remote handler's schema
+ * may evolve.
+ */
+function formatPendingStatusSummary(payload) {
+  const count =
+    payload && typeof payload.pending_count === "number"
+      ? payload.pending_count
+      : 0;
+  if (count === 0) {
+    return "No pending GitHub webhook events.";
+  }
+  const typesObj =
+    payload && payload.types && typeof payload.types === "object"
+      ? payload.types
+      : null;
+  const typesStr = typesObj
+    ? Object.entries(typesObj)
+        .map(([type, n]) => `${type}:${n}`)
+        .join(", ")
+    : "";
+  const latest =
+    payload && typeof payload.latest_received_at === "string"
+      ? ` latest ${payload.latest_received_at}`
+      : "";
+  return (
+    `${count} pending GitHub webhook events` +
+    (typesStr ? ` (${typesStr})` : "") +
+    `.${latest}`
+  );
+}
+
+/**
+ * Re-shape a `get_pending_status` MCP tool result into the Claude Code
+ * UserPromptSubmit hook decision JSON form documented at
+ * https://code.claude.com/docs/en/hooks (search: `type: "mcp_tool"`).
+ *
+ * Why: with `LI_PLUS_WEBHOOK_DELIVERY=mcp_hook`, this tool is invoked from a
+ * `type: "mcp_tool"` UserPromptSubmit hook. Claude Code parses the tool's
+ * text content as JSON: a valid decision shape is injected into the prompt
+ * context, anything else is silently discarded. The remote handler currently
+ * returns generic `{pending_count, types, latest_received_at}` JSON which
+ * parses fine but matches no decision schema, so the hook output never
+ * reaches the AI. Wrapping the payload as `hookSpecificOutput.additionalContext`
+ * keeps the Cloudflare Worker side untouched (per #215 constraint) while
+ * making the hook output AI-visible.
+ *
+ * Manual `tool_use` callers still get a JSON object back; AI can read the
+ * decision shape directly. No `decision: "block"` field is set, so the
+ * user's prompt is never blocked.
+ */
+function wrapGetPendingStatusAsDecisionJson(result) {
+  if (!result || !Array.isArray(result.content) || result.content.length === 0) {
+    return result;
+  }
+  const first = result.content[0];
+  if (!first || first.type !== "text" || typeof first.text !== "string") {
+    return result;
+  }
+  let summary;
+  try {
+    summary = formatPendingStatusSummary(JSON.parse(first.text));
+  } catch {
+    summary = first.text.slice(0, 200);
+  }
+  const decision = {
+    hookSpecificOutput: {
+      hookEventName: "UserPromptSubmit",
+      additionalContext: summary,
+    },
+  };
+  return {
+    ...result,
+    content: [{ type: "text", text: JSON.stringify(decision) }],
+  };
+}
+
 function formatAuthRequiredResponse(pending) {
   const parts = [];
   parts.push("OAuth authorization required.");
@@ -807,6 +887,9 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     const result = await callRemoteToolWithToken(name, args ?? {}, token);
     // First successful tool call confirms OAuth is working
     markOAuthEstablished();
+    if (name === "get_pending_status") {
+      return wrapGetPendingStatusAsDecisionJson(result);
+    }
     return result;
   } catch (err) {
     if (err instanceof AuthRequiredError) {
