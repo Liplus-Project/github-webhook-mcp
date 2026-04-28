@@ -62,7 +62,8 @@ Add the server to your MCP client configuration. Example for Claude Desktop (`cl
   "mcpServers": {
     "github-webhook": {
       "command": "npx",
-      "args": ["-y", "github-webhook-mcp"]
+      "args": ["-y", "github-webhook-mcp"],
+      "alwaysLoad": true
     }
   }
 }
@@ -76,6 +77,7 @@ To target a self-hosted Worker, set the `WEBHOOK_WORKER_URL` environment variabl
     "github-webhook": {
       "command": "npx",
       "args": ["-y", "github-webhook-mcp"],
+      "alwaysLoad": true,
       "env": {
         "WEBHOOK_WORKER_URL": "https://your-worker.example.workers.dev"
       }
@@ -83,6 +85,8 @@ To target a self-hosted Worker, set the `WEBHOOK_WORKER_URL` environment variabl
   }
 }
 ```
+
+`alwaysLoad: true` requires Claude Code v2.1.121 or later. It exempts this server's tools from tool-search deferral so they remain immediately callable every turn (recommended because the server is invoked every turn via the UserPromptSubmit hook).
 
 ### Codex (`config.toml`)
 

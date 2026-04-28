@@ -66,6 +66,7 @@ A browser window should have opened automatically. Sign in on GitHub, then retry
     "github-webhook-mcp": {
       "command": "npx",
       "args": ["github-webhook-mcp"],
+      "alwaysLoad": true,
       "env": {
         "WEBHOOK_WORKER_URL": "https://github-webhook-mcp.example.workers.dev",
         "WEBHOOK_CHANNEL": "1"
@@ -76,6 +77,8 @@ A browser window should have opened automatically. Sign in on GitHub, then retry
 ```
 
 `WEBHOOK_CHANNEL=1` でリアルタイムチャンネル通知を有効化（Claude Code CLI のみ）。
+
+`alwaysLoad: true` は Claude Code v2.1.121 以降で利用可能。本サーバーのツールを tool-search の deferral 対象から外し、毎ターン即座に利用可能にします（UserPromptSubmit hook 経由で毎ターン呼ばれるため推奨）。
 
 ### Codex — config.toml
 
