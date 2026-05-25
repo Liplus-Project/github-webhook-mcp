@@ -833,6 +833,12 @@ function formatPendingStatusSummary(payload) {
  * Manual `tool_use` callers still get a JSON object back; AI can read the
  * decision shape directly. No `decision: "block"` field is set, so the
  * user's prompt is never blocked.
+ *
+ * Empty silent (#221): when the parsed payload reports `pending_count === 0`,
+ * return the result untouched (no wrap). The raw remote JSON does not match
+ * any Claude Code decision schema, so hook callers receive nothing in
+ * `additionalContext` — eliminating the per-turn empty reminder noise. Manual
+ * callers see the raw payload, which is self-describing.
  */
 function wrapGetPendingStatusAsDecisionJson(result) {
   if (!result || !Array.isArray(result.content) || result.content.length === 0) {
@@ -844,7 +850,11 @@ function wrapGetPendingStatusAsDecisionJson(result) {
   }
   let summary;
   try {
-    summary = formatPendingStatusSummary(JSON.parse(first.text));
+    const payload = JSON.parse(first.text);
+    if (payload && typeof payload === "object" && payload.pending_count === 0) {
+      return result;
+    }
+    summary = formatPendingStatusSummary(payload);
   } catch {
     summary = first.text.slice(0, 200);
   }
