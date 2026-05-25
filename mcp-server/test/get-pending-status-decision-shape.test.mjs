@@ -65,7 +65,11 @@ function wrapGetPendingStatusAsDecisionJson(result) {
   }
   let summary;
   try {
-    summary = formatPendingStatusSummary(JSON.parse(first.text));
+    const payload = JSON.parse(first.text);
+    if (payload && typeof payload === "object" && payload.pending_count === 0) {
+      return result;
+    }
+    summary = formatPendingStatusSummary(payload);
   } catch {
     summary = first.text.slice(0, 200);
   }
@@ -112,7 +116,7 @@ test("wraps non-empty pending payload as UserPromptSubmit decision JSON", () => 
   assert.equal("decision" in decision, false);
 });
 
-test("wraps zero-pending payload with explicit no-events sentence", () => {
+test("returns zero-pending payload untouched (empty silent, #221)", () => {
   const remote = {
     content: [
       {
@@ -126,13 +130,13 @@ test("wraps zero-pending payload with explicit no-events sentence", () => {
     ],
   };
 
-  const decision = JSON.parse(
-    wrapGetPendingStatusAsDecisionJson(remote).content[0].text,
-  );
-  assert.equal(
-    decision.hookSpecificOutput.additionalContext,
-    "No pending GitHub webhook events.",
-  );
+  const wrapped = wrapGetPendingStatusAsDecisionJson(remote);
+  assert.deepEqual(wrapped, remote);
+  // No decision schema is produced; hook callers receive nothing in
+  // additionalContext, eliminating the per-turn empty reminder noise.
+  const parsed = JSON.parse(wrapped.content[0].text);
+  assert.equal(parsed.pending_count, 0);
+  assert.equal("hookSpecificOutput" in parsed, false);
 });
 
 test("falls back to truncated raw text when remote payload is not JSON", () => {
@@ -169,7 +173,7 @@ test("preserves sibling result fields like isError when wrapping", () => {
     content: [
       {
         type: "text",
-        text: JSON.stringify({ pending_count: 0, types: {} }),
+        text: JSON.stringify({ pending_count: 3, types: { issues: 3 } }),
       },
     ],
   };
