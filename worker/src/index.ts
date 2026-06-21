@@ -29,6 +29,7 @@ import {
 } from "./oauth.js";
 import { isGitHubWebhookIP } from "./github-ip.js";
 import { checkWebhookRateLimit, checkApiRateLimit, checkTenantQuota, rateLimitResponse } from "./rate-limit.js";
+import { verifyGitHubSignature } from "./signature.js";
 
 export { WebhookMcpAgent, WebhookStore, TenantRegistry };
 
@@ -37,26 +38,6 @@ interface Env extends OAuthEnv {
   WEBHOOK_STORE: DurableObjectNamespace;
   TENANT_REGISTRY: DurableObjectNamespace;
   GITHUB_WEBHOOK_SECRET?: string;
-}
-
-async function verifyGitHubSignature(
-  secret: string,
-  body: string,
-  signature: string,
-): Promise<boolean> {
-  const encoder = new TextEncoder();
-  const key = await crypto.subtle.importKey(
-    "raw",
-    encoder.encode(secret),
-    { name: "HMAC", hash: "SHA-256" },
-    false,
-    ["sign"],
-  );
-  const sig = await crypto.subtle.sign("HMAC", key, encoder.encode(body));
-  const expected = "sha256=" + Array.from(new Uint8Array(sig))
-    .map((b) => b.toString(16).padStart(2, "0"))
-    .join("");
-  return expected === signature;
 }
 
 /**
