@@ -49,8 +49,14 @@ function parseIPv4(ip: string): number | null {
   return ((nums[0] << 24) | (nums[1] << 16) | (nums[2] << 8) | nums[3]) >>> 0;
 }
 
-/** Check if an IPv4 address matches any of the given CIDRs. */
-function ipMatchesCIDRs(ip: string, cidrs: string[]): boolean {
+/**
+ * Check if an IPv4 address matches any of the given CIDRs.
+ *
+ * Exported for unit testing (#223). IPv6 CIDRs in the list are skipped, and an
+ * IPv6 / unparseable client IP passes through as `true` (GitHub rarely sends
+ * webhooks over IPv6, so the allowlist does not block them).
+ */
+export function ipMatchesCIDRs(ip: string, cidrs: string[]): boolean {
   const ipInt = parseIPv4(ip);
   if (ipInt === null) {
     // IPv6 — check string prefix match against IPv6 CIDRs
