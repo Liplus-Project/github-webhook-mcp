@@ -21,6 +21,15 @@ export interface TenantQuota {
   events_limit: number;
 }
 
+/**
+ * Per-tenant quota window. events_stored is a throughput counter that resets at
+ * the start of each window, so the quota is "events per window" — it can never
+ * become a permanent lifetime lockout. (#231 regression: the counter only ever
+ * incremented and, once it reached events_limit, returned 429 forever because
+ * nothing reset it across the DO's persistent storage.)
+ */
+const QUOTA_WINDOW_MS = 60 * 60 * 1000; // 1 hour (matches the 429 Retry-After: 3600)
+
 export class TenantRegistry extends DurableObject {
   private initialized = false;
 
@@ -46,9 +55,22 @@ export class TenantRegistry extends DurableObject {
       CREATE TABLE IF NOT EXISTS quotas (
         account_id INTEGER PRIMARY KEY,
         events_stored INTEGER NOT NULL DEFAULT 0,
-        events_limit INTEGER NOT NULL DEFAULT 10000
+        events_limit INTEGER NOT NULL DEFAULT 10000,
+        window_started_at INTEGER NOT NULL DEFAULT 0
       )
     `);
+
+    // Migration for quotas tables created before the windowed-quota fix (#231):
+    // add window_started_at if absent. Existing rows keep DEFAULT 0, which
+    // /quota-check treats as an elapsed window and resets on the next check —
+    // clearing the permanent lockout left by the old monotonic counter.
+    try {
+      this.ctx.storage.sql.exec(
+        `ALTER TABLE quotas ADD COLUMN window_started_at INTEGER NOT NULL DEFAULT 0`,
+      );
+    } catch {
+      // Column already exists (table created post-fix) — nothing to migrate.
+    }
 
     this.initialized = true;
   }
@@ -173,14 +195,14 @@ export class TenantRegistry extends DurableObject {
       return Response.json(quota);
     }
 
-    // ── Check quota and atomically increment if within limit ──
+    // ── Check quota and atomically increment if within the current window ──
     // Returns { allowed: true/false, events_stored, events_limit }
     // Used by the Worker to gate webhook ingestion before forwarding to WebhookStore DO.
     if (url.pathname === "/quota-check" && request.method === "POST") {
       const body = await request.json() as { account_id: number };
 
       const rows = this.ctx.storage.sql.exec(
-        `SELECT events_stored, events_limit FROM quotas WHERE account_id = ?`,
+        `SELECT events_stored, events_limit, window_started_at FROM quotas WHERE account_id = ?`,
         body.account_id,
       ).toArray();
 
@@ -191,6 +213,25 @@ export class TenantRegistry extends DurableObject {
 
       const stored = rows[0].events_stored as number;
       const limit = rows[0].events_limit as number;
+      const windowStartedAt = rows[0].window_started_at as number;
+      const now = Date.now();
+
+      // Start a fresh window when the previous one elapsed (or was never set —
+      // e.g. rows migrated from the pre-fix monotonic counter). This counts the
+      // current event as #1 of the new window and clears any stale lockout, so
+      // the quota can never become a permanent 429 (#231).
+      if (windowStartedAt === 0 || now - windowStartedAt >= QUOTA_WINDOW_MS) {
+        this.ctx.storage.sql.exec(
+          `UPDATE quotas SET events_stored = 1, window_started_at = ? WHERE account_id = ?`,
+          now,
+          body.account_id,
+        );
+        return Response.json({
+          allowed: true,
+          events_stored: 1,
+          events_limit: limit,
+        });
+      }
 
       if (stored >= limit) {
         return Response.json({
@@ -201,7 +242,7 @@ export class TenantRegistry extends DurableObject {
         }, { status: 429 });
       }
 
-      // Atomically increment
+      // Within the current window — atomically increment.
       this.ctx.storage.sql.exec(
         `UPDATE quotas SET events_stored = events_stored + 1 WHERE account_id = ?`,
         body.account_id,

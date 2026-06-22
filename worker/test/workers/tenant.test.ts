@@ -107,17 +107,20 @@ describe("TenantRegistry: quota-check (gate + atomic increment)", () => {
     expect(quota.events_stored).toBe(1);
   });
 
-  it("rejects with 429 when stored is at/over the limit, without incrementing", async () => {
+  it("rejects with 429 when stored is at/over the limit within an active window, without incrementing", async () => {
     const stub = registryFor("quota-check-at-limit");
     await createInstallation(stub, { installation_id: 31, account_id: 71 });
 
-    // push events_stored up to the limit (10000) via a single delta increment,
-    // avoiding 10000 individual calls.
-    const inc = await post(stub, "/quota-increment", { account_id: 71, delta: 10000 });
+    // Open the window with one real check (events_stored=1, window_started_at=now),
+    // then push the rest of the way to the limit (10000) within that same window
+    // via a single delta increment, avoiding 10000 individual calls.
+    const first = await post(stub, "/quota-check", { account_id: 71 });
+    expect(await first.json()).toEqual({ allowed: true, events_stored: 1, events_limit: 10000 });
+    const inc = await post(stub, "/quota-increment", { account_id: 71, delta: 9999 });
     expect(inc.status).toBe(200);
     expect(await inc.json()).toEqual({ events_stored: 10000, events_limit: 10000, over_limit: false });
 
-    // stored (10000) >= limit (10000) -> 429
+    // stored (10000) >= limit (10000), window still active -> 429
     const res = await post(stub, "/quota-check", { account_id: 71 });
     expect(res.status).toBe(429);
     expect(await res.json()).toEqual({
@@ -130,6 +133,24 @@ describe("TenantRegistry: quota-check (gate + atomic increment)", () => {
     // no increment happened on the rejected check
     const quota = (await (await stub.fetch(new Request(`${BASE}/quota?account_id=71`))).json()) as TenantQuota;
     expect(quota.events_stored).toBe(10000);
+  });
+
+  it("resets a stale window (events_stored at limit, window_started_at=0) instead of 429ing forever (#231)", async () => {
+    const stub = registryFor("quota-check-stale-window-reset");
+    await createInstallation(stub, { installation_id: 32, account_id: 72 });
+
+    // Reproduce the pre-fix lockout: events_stored pushed to the limit while
+    // window_started_at stays 0 (the migrated monotonic-counter state). Before
+    // the fix this 429'd permanently; the zero/elapsed window now resets it.
+    await post(stub, "/quota-increment", { account_id: 72, delta: 10000 });
+
+    const res = await post(stub, "/quota-check", { account_id: 72 });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ allowed: true, events_stored: 1, events_limit: 10000 });
+
+    // the counter was reset to 1 (this event), not left at the locked 10000
+    const quota = (await (await stub.fetch(new Request(`${BASE}/quota?account_id=72`))).json()) as TenantQuota;
+    expect(quota.events_stored).toBe(1);
   });
 
   it("returns 404 for an unknown tenant", async () => {
