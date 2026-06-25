@@ -7,7 +7,33 @@ import { DurableObject } from "cloudflare:workers";
 import type { WebhookEvent, EventSummary, PendingStatus } from "../../shared/src/types.js";
 import { summarizeEvent } from "../../shared/src/summarize.js";
 
-export class WebhookStore extends DurableObject {
+/**
+ * Minimal local Env shape for this DO. Defined here (not imported from
+ * index.ts's full Env) to avoid a circular import; only the vars this DO
+ * actually reads are declared.
+ */
+interface StoreEnv {
+  PURGE_AFTER_DAYS?: string;
+}
+
+/** Default retention window (days) for processed events when PURGE_AFTER_DAYS is unset. */
+const DEFAULT_PURGE_DAYS = 7;
+
+/**
+ * Resolve the retention window from env. Falls back to DEFAULT_PURGE_DAYS when
+ * unset / non-numeric / negative. A value of 0 means "purge all processed
+ * events immediately on mark".
+ */
+function purgeDays(env: StoreEnv): number {
+  const raw = env.PURGE_AFTER_DAYS;
+  if (raw !== undefined) {
+    const n = Number(raw);
+    if (Number.isFinite(n) && n >= 0) return n;
+  }
+  return DEFAULT_PURGE_DAYS;
+}
+
+export class WebhookStore extends DurableObject<StoreEnv> {
   private initialized = false;
   private sseWriters = new Set<WritableStreamDefaultWriter<Uint8Array>>();
   private sseEncoder = new TextEncoder();
@@ -217,7 +243,18 @@ export class WebhookStore extends DurableObject {
       this.ctx.storage.sql.exec(
         `UPDATE events SET processed = 1 WHERE id = ?`, event_id,
       );
-      return Response.json({ success: true, event_id });
+
+      // Auto-purge: delete processed events whose received_at is older than the
+      // retention window. Unprocessed events are never deleted regardless of age.
+      // This bounds DO storage growth from dead processed rows (re-port of #29).
+      const days = purgeDays(this.env);
+      const cutoff = new Date(Date.now() - days * 86_400_000).toISOString();
+      const cursor = this.ctx.storage.sql.exec(
+        `DELETE FROM events WHERE processed = 1 AND received_at < ?`, cutoff,
+      );
+      const purged = cursor.rowsWritten;
+
+      return Response.json({ success: true, event_id, purged });
     }
 
     return new Response("Not found", { status: 404 });
