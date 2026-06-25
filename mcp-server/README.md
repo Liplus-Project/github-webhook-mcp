@@ -149,6 +149,20 @@ All tools are read-only except `mark_processed`.
 
 If real-time channel notifications are enabled (Claude Code), step 1 can be skipped — the proxy will push event summaries as soon as the Worker receives them. You still need to call `mark_processed` to clear the queue.
 
+## Event retention
+
+The Worker purges stored events automatically so Durable Object storage stays bounded. A time-based sweep runs on a Durable Object Alarm (daily) and reschedules itself, so cleanup happens even when `mark_processed` is never called.
+
+| Event class | Retention window | Worker env var | Default |
+|---|---|---|---|
+| Processed (`mark_processed` called) | events older than the window are deleted | `PURGE_AFTER_DAYS` | `7` days |
+| Unprocessed (never marked) | events older than the window are deleted | `UNPROCESSED_PURGE_AFTER_DAYS` | `90` days |
+
+- The longer window for unprocessed events is intentional — unprocessed means user-unseen, so the margin before dropping is wide (the 7-day vs 90-day asymmetry is by design).
+- Processed events are also purged immediately on `mark_processed` for promptness; the Alarm sweep is the guarantee that covers tenants that stop consuming.
+- Both windows are Worker-side configuration (`worker/wrangler.toml` `[vars]`); set a value to `0` to purge that class immediately on sweep. These env vars live on the Worker, not in this proxy.
+- Known limitation: the windows bound event *age*, not *volume*. A high-rate, never-consumed tenant can still hit Cloudflare's 1 GB-per-DO ceiling before the 90-day window applies.
+
 ## Authentication flow
 
 1. On first tool call (or on startup if cached tokens exist), the proxy discovers OAuth metadata at `${WEBHOOK_WORKER_URL}/.well-known/oauth-authorization-server`.

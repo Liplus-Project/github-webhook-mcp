@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { env } from "cloudflare:test";
+import { env, runInDurableObject, runDurableObjectAlarm } from "cloudflare:test";
 import type { WebhookEvent, EventSummary, PendingStatus } from "../../../shared/src/types.js";
 
 // Each test uses a uniquely-named DO instance for storage isolation. WebhookStore
@@ -274,6 +274,119 @@ describe("WebhookStore: mark-processed auto-purge", () => {
     const statusRes = await stub.fetch(new Request(`${BASE}/pending-status`));
     const status = (await statusRes.json()) as PendingStatus;
     expect(status.pending_count).toBe(1); // only the unprocessed "ancient"
+  });
+});
+
+// Drive the time-based retention sweep on demand (same sweep the DO Alarm runs).
+async function sweep(stub: DurableObjectStub) {
+  const res = await stub.fetch(new Request(`${BASE}/sweep`, { method: "POST" }));
+  expect(res.status).toBe(200);
+  return res.json() as Promise<{ success: boolean; processed: number; unprocessed: number }>;
+}
+
+describe("WebhookStore: time-based sweep (DO Alarm body)", () => {
+  it("purges UNPROCESSED events older than UNPROCESSED_PURGE_AFTER_DAYS (default 90)", async () => {
+    const stub = storeFor("sweep-old-unprocessed");
+    // 100 days old, unprocessed → beyond the 90-day window → must be swept
+    await ingest(stub, makeEvent({ id: "stale", type: "issues", received_at: isoFromNow(-100 * DAY_MS) }));
+
+    const result = await sweep(stub);
+    expect(result.unprocessed).toBe(1);
+
+    // gone
+    const res = await stub.fetch(new Request(`${BASE}/event?id=stale`));
+    expect(res.status).toBe(404);
+  });
+
+  it("keeps UNPROCESSED events within the 90-day window", async () => {
+    const stub = storeFor("sweep-keeps-recent-unprocessed");
+    // 89 days old, unprocessed → inside the window → must survive
+    await ingest(stub, makeEvent({ id: "recent", type: "issues", received_at: isoFromNow(-89 * DAY_MS) }));
+
+    const result = await sweep(stub);
+    expect(result.unprocessed).toBe(0);
+
+    // still present and still pending
+    const res = await stub.fetch(new Request(`${BASE}/event?id=recent`));
+    expect(res.status).toBe(200);
+    const statusRes = await stub.fetch(new Request(`${BASE}/pending-status`));
+    const status = (await statusRes.json()) as PendingStatus;
+    expect(status.pending_count).toBe(1);
+  });
+
+  it("purges PROCESSED events older than PURGE_AFTER_DAYS (default 7) in the same sweep — no mark_processed call required", async () => {
+    const stub = storeFor("sweep-old-processed");
+    // 30 days old, already processed → beyond the 7-day window → swept by the
+    // time-based sweep without any mark_processed trigger
+    await ingest(stub, makeEvent({ id: "doneold", type: "issues", received_at: isoFromNow(-30 * DAY_MS), processed: true }));
+    // fresh processed event stays
+    await ingest(stub, makeEvent({ id: "donefresh", type: "issues", received_at: isoFromNow(-1 * DAY_MS), processed: true }));
+
+    const result = await sweep(stub);
+    expect(result.processed).toBe(1);
+    expect(result.unprocessed).toBe(0);
+
+    const goneRes = await stub.fetch(new Request(`${BASE}/event?id=doneold`));
+    expect(goneRes.status).toBe(404);
+    const keptRes = await stub.fetch(new Request(`${BASE}/event?id=donefresh`));
+    expect(keptRes.status).toBe(200);
+  });
+
+  it("sweeps processed (>7d) and unprocessed (>90d) together while keeping in-window rows of both classes", async () => {
+    const stub = storeFor("sweep-mixed");
+    await ingest(stub, makeEvent({ id: "p-old", received_at: isoFromNow(-30 * DAY_MS), processed: true }));   // swept
+    await ingest(stub, makeEvent({ id: "p-new", received_at: isoFromNow(-2 * DAY_MS), processed: true }));    // kept
+    await ingest(stub, makeEvent({ id: "u-old", received_at: isoFromNow(-120 * DAY_MS) }));                   // swept
+    await ingest(stub, makeEvent({ id: "u-new", received_at: isoFromNow(-30 * DAY_MS) }));                    // kept
+
+    const result = await sweep(stub);
+    expect(result).toEqual({ success: true, processed: 1, unprocessed: 1 });
+
+    expect((await stub.fetch(new Request(`${BASE}/event?id=p-old`))).status).toBe(404);
+    expect((await stub.fetch(new Request(`${BASE}/event?id=u-old`))).status).toBe(404);
+    expect((await stub.fetch(new Request(`${BASE}/event?id=p-new`))).status).toBe(200);
+    expect((await stub.fetch(new Request(`${BASE}/event?id=u-new`))).status).toBe(200);
+  });
+
+  it("reports the swept unprocessed count for a clearly-overdue row under the default window", async () => {
+    const stub = storeFor("sweep-default-window");
+    await ingest(stub, makeEvent({ id: "year-old", received_at: isoFromNow(-365 * DAY_MS) }));
+    const result = await sweep(stub);
+    expect(result.unprocessed).toBe(1);
+  });
+});
+
+describe("WebhookStore: DO Alarm scheduling", () => {
+  it("arms a sweep alarm on first request and reschedules after the alarm fires", async () => {
+    const stub = storeFor("alarm-reschedule");
+    // First request initializes the DO and arms the recurring sweep alarm.
+    await ingest(stub, makeEvent({ id: "x", received_at: isoFromNow(-1 * DAY_MS) }));
+
+    // An alarm should now be scheduled (consumption-independent sweep is armed).
+    const armed = await runInDurableObject(stub, (_instance, state) => state.storage.getAlarm());
+    expect(armed).not.toBeNull();
+
+    // Fire the scheduled alarm; the handler runs the sweep and re-arms the next one.
+    const ran = await runDurableObjectAlarm(stub);
+    expect(ran).toBe(true);
+
+    // After firing, a fresh alarm must be scheduled again (recurring cycle).
+    const rearmed = await runInDurableObject(stub, (_instance, state) => state.storage.getAlarm());
+    expect(rearmed).not.toBeNull();
+  });
+
+  it("alarm() sweeps overdue rows when no consumer ever calls mark_processed", async () => {
+    const stub = storeFor("alarm-sweeps");
+    // Abandoned-tenant shape: an ancient unprocessed event, never consumed.
+    await ingest(stub, makeEvent({ id: "abandoned", received_at: isoFromNow(-200 * DAY_MS) }));
+
+    // Drive the alarm handler directly (simulates the scheduled fire).
+    await runInDurableObject(stub, async (instance: any) => {
+      await instance.alarm();
+    });
+
+    const res = await stub.fetch(new Request(`${BASE}/event?id=abandoned`));
+    expect(res.status).toBe(404);
   });
 });
 
