@@ -21,12 +21,12 @@ interface Env {
 }
 
 /** Tenant context passed via props when creating per-tenant instances */
-export interface TenantProps {
+export type TenantProps = {
   account_id?: number;
   account_login?: string;
   /** All account IDs (user + orgs) whose stores this session can read */
   accessible_account_ids?: number[];
-}
+};
 
 export class WebhookMcpAgent extends McpAgent<Env, unknown, TenantProps> {
   server = new McpServer({

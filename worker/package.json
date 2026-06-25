@@ -6,10 +6,11 @@
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit",
     "test": "tsx --test test/*.test.ts && vitest run --config vitest.workers.config.ts"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.0.0",
+    "@modelcontextprotocol/sdk": "1.26.0",
     "agents": "^0.8.0",
     "zod": "^4.0.0"
   },
@@ -22,9 +23,10 @@
     "wrangler": "^4.0.0"
   },
   "comments": {
-    "overrides": "Pin @cloudflare/workers-types across the tree to the version the worker code is written against; the vitest-pool-workers toolchain otherwise pulls a newer one whose stricter binding types can break existing src types (types-only; runtime unaffected)."
+    "overrides": "Pin @cloudflare/workers-types across the tree to the version the worker code is written against; the vitest-pool-workers toolchain otherwise pulls a newer one whose stricter binding types can break existing src types (types-only; runtime unaffected). Pin @modelcontextprotocol/sdk to 1.26.0 so the tree holds a single copy: agents@0.8.2 nests its own 1.26.0, and a separate worker-direct copy made McpServer's private _serverInfo incompatible at the type level (types-only; 1.26/1.27 are runtime-compatible)."
   },
   "overrides": {
-    "@cloudflare/workers-types": "$@cloudflare/workers-types"
+    "@cloudflare/workers-types": "$@cloudflare/workers-types",
+    "@modelcontextprotocol/sdk": "$@modelcontextprotocol/sdk"
   }
 }
