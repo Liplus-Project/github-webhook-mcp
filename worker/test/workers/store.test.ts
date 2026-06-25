@@ -184,10 +184,19 @@ describe("WebhookStore: get_event (/event?id=)", () => {
   });
 });
 
+// received_at relative to the real wall-clock "now". The DO purges processed
+// events older than PURGE_AFTER_DAYS (default 7); tests bind received_at relative
+// to now so they stay stable regardless of the absolute date.
+function isoFromNow(deltaMs: number): string {
+  return new Date(Date.now() + deltaMs).toISOString();
+}
+const DAY_MS = 86_400_000;
+
 describe("WebhookStore: mark-processed", () => {
-  it("flips processed so the event drops out of pending but remains fetchable by id", async () => {
+  it("flips processed so a within-retention event drops out of pending but remains fetchable by id, returning purged=0", async () => {
     const stub = storeFor("mark-processed");
-    await ingest(stub, makeEvent({ id: "m1", type: "issues", received_at: "2026-01-01T00:00:00Z" }));
+    // received_at is recent (1 day ago) so it survives the default 7-day purge window
+    await ingest(stub, makeEvent({ id: "m1", type: "issues", received_at: isoFromNow(-1 * DAY_MS) }));
 
     const mp = await stub.fetch(
       new Request(`${BASE}/mark-processed`, {
@@ -196,17 +205,75 @@ describe("WebhookStore: mark-processed", () => {
       }),
     );
     expect(mp.status).toBe(200);
-    expect(await mp.json()).toEqual({ success: true, event_id: "m1" });
+    expect(await mp.json()).toEqual({ success: true, event_id: "m1", purged: 0 });
 
     // no longer pending
     const statusRes = await stub.fetch(new Request(`${BASE}/pending-status`));
     const status = (await statusRes.json()) as PendingStatus;
     expect(status.pending_count).toBe(0);
 
-    // but still retrievable by id, with processed = true
+    // but still retrievable by id, with processed = true (within retention, not purged)
     const evRes = await stub.fetch(new Request(`${BASE}/event?id=m1`));
+    expect(evRes.status).toBe(200);
     const ev = (await evRes.json()) as WebhookEvent;
     expect(ev.processed).toBe(true);
+  });
+});
+
+describe("WebhookStore: mark-processed auto-purge", () => {
+  it("deletes processed events older than the retention window and reports the purged count", async () => {
+    const stub = storeFor("purge-old-processed");
+    // An old, already-processed event (30 days ago, beyond the 7-day window)
+    await ingest(
+      stub,
+      makeEvent({ id: "old", type: "issues", received_at: isoFromNow(-30 * DAY_MS), processed: true }),
+    );
+    // A fresh event we will mark now; marking triggers the purge sweep
+    await ingest(stub, makeEvent({ id: "fresh", type: "issues", received_at: isoFromNow(-1 * DAY_MS) }));
+
+    const mp = await stub.fetch(
+      new Request(`${BASE}/mark-processed`, {
+        method: "POST",
+        body: JSON.stringify({ event_id: "fresh" }),
+      }),
+    );
+    expect(mp.status).toBe(200);
+    // the stale "old" row is swept; "fresh" was just marked but is within retention
+    expect(await mp.json()).toEqual({ success: true, event_id: "fresh", purged: 1 });
+
+    // old is gone (404), fresh remains
+    const oldRes = await stub.fetch(new Request(`${BASE}/event?id=old`));
+    expect(oldRes.status).toBe(404);
+    const freshRes = await stub.fetch(new Request(`${BASE}/event?id=fresh`));
+    expect(freshRes.status).toBe(200);
+  });
+
+  it("keeps unprocessed events regardless of age", async () => {
+    const stub = storeFor("purge-keeps-unprocessed");
+    // A very old but UNPROCESSED event must never be purged
+    await ingest(stub, makeEvent({ id: "ancient", type: "issues", received_at: isoFromNow(-365 * DAY_MS) }));
+    // A fresh event to mark
+    await ingest(stub, makeEvent({ id: "trigger", type: "issues", received_at: isoFromNow(-1 * DAY_MS) }));
+
+    const mp = await stub.fetch(
+      new Request(`${BASE}/mark-processed`, {
+        method: "POST",
+        body: JSON.stringify({ event_id: "trigger" }),
+      }),
+    );
+    expect(mp.status).toBe(200);
+    // nothing purged: ancient is unprocessed, trigger is within retention
+    expect(await mp.json()).toEqual({ success: true, event_id: "trigger", purged: 0 });
+
+    // ancient (unprocessed) is still present and still pending
+    const ancientRes = await stub.fetch(new Request(`${BASE}/event?id=ancient`));
+    expect(ancientRes.status).toBe(200);
+    const ancient = (await ancientRes.json()) as WebhookEvent;
+    expect(ancient.processed).toBe(false);
+
+    const statusRes = await stub.fetch(new Request(`${BASE}/pending-status`));
+    const status = (await statusRes.json()) as PendingStatus;
+    expect(status.pending_count).toBe(1); // only the unprocessed "ancient"
   });
 });
 

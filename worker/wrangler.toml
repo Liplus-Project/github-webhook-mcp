@@ -3,6 +3,12 @@ main = "src/index.ts"
 compatibility_date = "2025-03-26"
 compatibility_flags = ["nodejs_compat"]
 
+[vars]
+# Retention window (days) for processed webhook events. On mark_processed, the
+# WebhookStore DO deletes processed events older than this to bound DO storage.
+# Unprocessed events are never purged. 0 = purge processed events immediately.
+PURGE_AFTER_DAYS = "7"
+
 [durable_objects]
 bindings = [
   { name = "MCP_OBJECT", class_name = "WebhookMcpAgent" },
