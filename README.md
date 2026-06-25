@@ -125,6 +125,30 @@ All checks passed.
 | `get_webhook_events` | Full payloads for all pending events |
 | `mark_processed` | Mark an event as processed |
 
+## Event Retention
+
+Stored events are purged automatically to bound Durable Object storage. The Worker
+runs a time-based sweep on a Durable Object Alarm (daily), so cleanup happens even
+for tenants that never call `mark_processed`:
+
+| Event class | Retention window | Env var | Default |
+|-------------|------------------|---------|---------|
+| Processed (`mark_processed` called) | older than the window is deleted | `PURGE_AFTER_DAYS` | `7` days |
+| Unprocessed (never marked) | older than the window is deleted | `UNPROCESSED_PURGE_AFTER_DAYS` | `90` days |
+
+- The longer window for unprocessed events is intentional: unprocessed means
+  user-unseen, so the safety margin before dropping is wide (the 7-day vs 90-day
+  asymmetry is by design).
+- The sweep runs via a Durable Object Alarm on a daily cadence and reschedules
+  itself, so it fires independently of consumption. Processed events are also
+  purged immediately on `mark_processed` for promptness; the Alarm sweep is the
+  guarantee that covers abandoned tenants.
+- Both windows are configurable in `worker/wrangler.toml` (`[vars]`). Setting a
+  value to `0` purges that class immediately on sweep.
+- Known limitation: the windows bound event *age*, not *volume*. A high-rate,
+  never-consumed tenant can still reach Cloudflare's 1 GB-per-DO ceiling before
+  the 90-day window applies. A volume-based hard cap is tracked separately.
+
 ## Monorepo Structure
 
 ```

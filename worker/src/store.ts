@@ -14,23 +14,44 @@ import { summarizeEvent } from "../../shared/src/summarize.js";
  */
 interface StoreEnv {
   PURGE_AFTER_DAYS?: string;
+  UNPROCESSED_PURGE_AFTER_DAYS?: string;
 }
 
 /** Default retention window (days) for processed events when PURGE_AFTER_DAYS is unset. */
 const DEFAULT_PURGE_DAYS = 7;
 
 /**
- * Resolve the retention window from env. Falls back to DEFAULT_PURGE_DAYS when
- * unset / non-numeric / negative. A value of 0 means "purge all processed
- * events immediately on mark".
+ * Default retention window (days) for UNPROCESSED events when
+ * UNPROCESSED_PURGE_AFTER_DAYS is unset. Deliberately much longer than the
+ * processed window: unprocessed = user-unseen, so the safety margin before
+ * silently dropping is wide (the 7d-vs-90d asymmetry is intentional).
  */
-function purgeDays(env: StoreEnv): number {
-  const raw = env.PURGE_AFTER_DAYS;
+const DEFAULT_UNPROCESSED_PURGE_DAYS = 90;
+
+/** Sweep cadence: how often the DO Alarm fires to run the time-based purge. */
+const SWEEP_INTERVAL_MS = 86_400_000; // 24h (daily)
+
+/**
+ * Resolve a retention window (days) from an env value. Falls back to
+ * `fallback` when unset / non-numeric / negative. A value of 0 means "purge
+ * matching events immediately" (no retention).
+ */
+function resolveDays(raw: string | undefined, fallback: number): number {
   if (raw !== undefined) {
     const n = Number(raw);
     if (Number.isFinite(n) && n >= 0) return n;
   }
-  return DEFAULT_PURGE_DAYS;
+  return fallback;
+}
+
+/** Retention window (days) for processed events. */
+function purgeDays(env: StoreEnv): number {
+  return resolveDays(env.PURGE_AFTER_DAYS, DEFAULT_PURGE_DAYS);
+}
+
+/** Retention window (days) for unprocessed events. */
+function unprocessedPurgeDays(env: StoreEnv): number {
+  return resolveDays(env.UNPROCESSED_PURGE_AFTER_DAYS, DEFAULT_UNPROCESSED_PURGE_DAYS);
 }
 
 export class WebhookStore extends DurableObject<StoreEnv> {
@@ -38,7 +59,7 @@ export class WebhookStore extends DurableObject<StoreEnv> {
   private sseWriters = new Set<WritableStreamDefaultWriter<Uint8Array>>();
   private sseEncoder = new TextEncoder();
 
-  private ensureTable() {
+  private ensureSchema() {
     if (this.initialized) return;
     this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS events (
@@ -52,6 +73,69 @@ export class WebhookStore extends DurableObject<StoreEnv> {
       )
     `);
     this.initialized = true;
+  }
+
+  /**
+   * Initialize on the request path: create the schema and ensure the recurring
+   * sweep alarm is armed. Alarm arming is split out of the alarm() handler,
+   * which reschedules itself directly.
+   */
+  private async ensureTable() {
+    this.ensureSchema();
+    await this.ensureAlarm();
+  }
+
+  /**
+   * Arm the recurring sweep alarm if one is not already scheduled. This is the
+   * consumption-independent path: abandoned tenants never call mark_processed,
+   * so a mark-only trigger would never reach the very tenants whose unprocessed
+   * events accumulate. The DO Alarm fires even with zero consumption (#236).
+   */
+  private async ensureAlarm() {
+    const existing = await this.ctx.storage.getAlarm();
+    if (existing === null) {
+      await this.ctx.storage.setAlarm(Date.now() + SWEEP_INTERVAL_MS);
+    }
+  }
+
+  /**
+   * Time-based retention sweep. Deletes:
+   *  - processed events older than PURGE_AFTER_DAYS (default 7), and
+   *  - UNPROCESSED events older than UNPROCESSED_PURGE_AFTER_DAYS (default 90).
+   * Returns the per-class purged counts. Bounds DO storage growth from the only
+   * remaining unbounded path (unprocessed rows on abandoned tenants, #236).
+   */
+  private sweep(): { processed: number; unprocessed: number } {
+    const now = Date.now();
+
+    const processedCutoff = new Date(now - purgeDays(this.env) * 86_400_000).toISOString();
+    const processedCursor = this.ctx.storage.sql.exec(
+      `DELETE FROM events WHERE processed = 1 AND received_at < ?`,
+      processedCutoff,
+    );
+    const processed = processedCursor.rowsWritten;
+
+    const unprocessedCutoff = new Date(now - unprocessedPurgeDays(this.env) * 86_400_000).toISOString();
+    const unprocessedCursor = this.ctx.storage.sql.exec(
+      `DELETE FROM events WHERE processed = 0 AND received_at < ?`,
+      unprocessedCutoff,
+    );
+    const unprocessed = unprocessedCursor.rowsWritten;
+
+    return { processed, unprocessed };
+  }
+
+  /**
+   * DO Alarm handler — the consumption-independent retention guarantee. Runs the
+   * full sweep (processed + unprocessed) and reschedules the next sweep so the
+   * cycle keeps running on a hibernating, never-consumed tenant.
+   */
+  async alarm() {
+    this.ensureSchema();
+    this.sweep();
+    // Reschedule the next periodic sweep. alarm() is invoked after the prior
+    // alarm has been cleared, so this re-arms the recurring cycle.
+    await this.ctx.storage.setAlarm(Date.now() + SWEEP_INTERVAL_MS);
   }
 
   /** Broadcast to all connected WebSocket and SSE clients */
@@ -78,7 +162,7 @@ export class WebhookStore extends DurableObject<StoreEnv> {
   }
 
   async fetch(request: Request): Promise<Response> {
-    this.ensureTable();
+    await this.ensureTable();
     const url = new URL(request.url);
 
     // ── WebSocket upgrade ──
@@ -255,6 +339,16 @@ export class WebhookStore extends DurableObject<StoreEnv> {
       const purged = cursor.rowsWritten;
 
       return Response.json({ success: true, event_id, purged });
+    }
+
+    // ── sweep (time-based retention purge) ──
+    // Runs the same sweep the DO Alarm runs: purge processed > PURGE_AFTER_DAYS
+    // and unprocessed > UNPROCESSED_PURGE_AFTER_DAYS. Exposed as a route so the
+    // sweep can be driven on demand (and asserted in tests) independently of the
+    // alarm scheduler.
+    if (url.pathname === "/sweep" && request.method === "POST") {
+      const purged = this.sweep();
+      return Response.json({ success: true, ...purged });
     }
 
     return new Response("Not found", { status: 404 });

@@ -4,10 +4,17 @@ compatibility_date = "2025-03-26"
 compatibility_flags = ["nodejs_compat"]
 
 [vars]
-# Retention window (days) for processed webhook events. On mark_processed, the
-# WebhookStore DO deletes processed events older than this to bound DO storage.
-# Unprocessed events are never purged. 0 = purge processed events immediately.
+# Retention window (days) for processed webhook events. On mark_processed and on
+# the periodic DO Alarm sweep, the WebhookStore DO deletes processed events older
+# than this to bound DO storage. 0 = purge processed events immediately.
 PURGE_AFTER_DAYS = "7"
+# Retention window (days) for UNPROCESSED webhook events. The DO Alarm sweep
+# deletes unprocessed events older than this. Much longer than the processed
+# window because unprocessed = user-unseen (the asymmetry is intentional). This
+# closes the last unbounded storage-growth path: abandoned tenants that never
+# call mark_processed. The sweep runs on a time-based DO Alarm, independent of
+# consumption. 0 = purge unprocessed events immediately on sweep.
+UNPROCESSED_PURGE_AFTER_DAYS = "90"
 
 [durable_objects]
 bindings = [
