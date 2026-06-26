@@ -155,10 +155,10 @@ The Worker purges stored events automatically so Durable Object storage stays bo
 
 | Event class | Retention window | Worker env var | Default |
 |---|---|---|---|
-| Processed (`mark_processed` called) | events older than the window are deleted | `PURGE_AFTER_DAYS` | `7` days |
+| Processed (`mark_processed` called) | events older than the window are deleted | `PURGE_AFTER_DAYS` | `3` days |
 | Unprocessed (never marked) | events older than the window are deleted | `UNPROCESSED_PURGE_AFTER_DAYS` | `90` days |
 
-- The longer window for unprocessed events is intentional — unprocessed means user-unseen, so the margin before dropping is wide (the 7-day vs 90-day asymmetry is by design).
+- The longer window for unprocessed events is intentional — unprocessed means user-unseen, so the margin before dropping is wide (the 3-day vs 90-day asymmetry is by design).
 - Processed events are also purged immediately on `mark_processed` for promptness; the Alarm sweep is the guarantee that covers tenants that stop consuming.
 - Both windows are Worker-side configuration (`worker/wrangler.toml` `[vars]`); set a value to `0` to purge that class immediately on sweep. These env vars live on the Worker, not in this proxy.
 - Known limitation: the windows bound event *age*, not *volume*. A high-rate, never-consumed tenant can still hit Cloudflare's 1 GB-per-DO ceiling before the 90-day window applies.

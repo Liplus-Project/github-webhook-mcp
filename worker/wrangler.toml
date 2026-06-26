@@ -7,7 +7,7 @@ compatibility_flags = ["nodejs_compat"]
 # Retention window (days) for processed webhook events. On mark_processed and on
 # the periodic DO Alarm sweep, the WebhookStore DO deletes processed events older
 # than this to bound DO storage. 0 = purge processed events immediately.
-PURGE_AFTER_DAYS = "7"
+PURGE_AFTER_DAYS = "3"
 # Retention window (days) for UNPROCESSED webhook events. The DO Alarm sweep
 # deletes unprocessed events older than this. Much longer than the processed
 # window because unprocessed = user-unseen (the asymmetry is intentional). This

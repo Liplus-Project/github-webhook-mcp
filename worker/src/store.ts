@@ -18,13 +18,13 @@ interface StoreEnv {
 }
 
 /** Default retention window (days) for processed events when PURGE_AFTER_DAYS is unset. */
-const DEFAULT_PURGE_DAYS = 7;
+const DEFAULT_PURGE_DAYS = 3;
 
 /**
  * Default retention window (days) for UNPROCESSED events when
  * UNPROCESSED_PURGE_AFTER_DAYS is unset. Deliberately much longer than the
  * processed window: unprocessed = user-unseen, so the safety margin before
- * silently dropping is wide (the 7d-vs-90d asymmetry is intentional).
+ * silently dropping is wide (the 3d-vs-90d asymmetry is intentional).
  */
 const DEFAULT_UNPROCESSED_PURGE_DAYS = 90;
 
@@ -100,7 +100,7 @@ export class WebhookStore extends DurableObject<StoreEnv> {
 
   /**
    * Time-based retention sweep. Deletes:
-   *  - processed events older than PURGE_AFTER_DAYS (default 7), and
+   *  - processed events older than PURGE_AFTER_DAYS (default 3), and
    *  - UNPROCESSED events older than UNPROCESSED_PURGE_AFTER_DAYS (default 90).
    * Returns the per-class purged counts. Bounds DO storage growth from the only
    * remaining unbounded path (unprocessed rows on abandoned tenants, #236).

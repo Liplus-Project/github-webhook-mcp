@@ -185,7 +185,7 @@ describe("WebhookStore: get_event (/event?id=)", () => {
 });
 
 // received_at relative to the real wall-clock "now". The DO purges processed
-// events older than PURGE_AFTER_DAYS (default 7); tests bind received_at relative
+// events older than PURGE_AFTER_DAYS (default 3); tests bind received_at relative
 // to now so they stay stable regardless of the absolute date.
 function isoFromNow(deltaMs: number): string {
   return new Date(Date.now() + deltaMs).toISOString();
@@ -195,7 +195,7 @@ const DAY_MS = 86_400_000;
 describe("WebhookStore: mark-processed", () => {
   it("flips processed so a within-retention event drops out of pending but remains fetchable by id, returning purged=0", async () => {
     const stub = storeFor("mark-processed");
-    // received_at is recent (1 day ago) so it survives the default 7-day purge window
+    // received_at is recent (1 day ago) so it survives the default 3-day purge window
     await ingest(stub, makeEvent({ id: "m1", type: "issues", received_at: isoFromNow(-1 * DAY_MS) }));
 
     const mp = await stub.fetch(
@@ -223,7 +223,7 @@ describe("WebhookStore: mark-processed", () => {
 describe("WebhookStore: mark-processed auto-purge", () => {
   it("deletes processed events older than the retention window and reports the purged count", async () => {
     const stub = storeFor("purge-old-processed");
-    // An old, already-processed event (30 days ago, beyond the 7-day window)
+    // An old, already-processed event (30 days ago, beyond the 3-day window)
     await ingest(
       stub,
       makeEvent({ id: "old", type: "issues", received_at: isoFromNow(-30 * DAY_MS), processed: true }),
@@ -314,9 +314,9 @@ describe("WebhookStore: time-based sweep (DO Alarm body)", () => {
     expect(status.pending_count).toBe(1);
   });
 
-  it("purges PROCESSED events older than PURGE_AFTER_DAYS (default 7) in the same sweep — no mark_processed call required", async () => {
+  it("purges PROCESSED events older than PURGE_AFTER_DAYS (default 3) in the same sweep — no mark_processed call required", async () => {
     const stub = storeFor("sweep-old-processed");
-    // 30 days old, already processed → beyond the 7-day window → swept by the
+    // 30 days old, already processed → beyond the 3-day window → swept by the
     // time-based sweep without any mark_processed trigger
     await ingest(stub, makeEvent({ id: "doneold", type: "issues", received_at: isoFromNow(-30 * DAY_MS), processed: true }));
     // fresh processed event stays
@@ -332,7 +332,7 @@ describe("WebhookStore: time-based sweep (DO Alarm body)", () => {
     expect(keptRes.status).toBe(200);
   });
 
-  it("sweeps processed (>7d) and unprocessed (>90d) together while keeping in-window rows of both classes", async () => {
+  it("sweeps processed (>3d) and unprocessed (>90d) together while keeping in-window rows of both classes", async () => {
     const stub = storeFor("sweep-mixed");
     await ingest(stub, makeEvent({ id: "p-old", received_at: isoFromNow(-30 * DAY_MS), processed: true }));   // swept
     await ingest(stub, makeEvent({ id: "p-new", received_at: isoFromNow(-2 * DAY_MS), processed: true }));    // kept

@@ -133,11 +133,11 @@ for tenants that never call `mark_processed`:
 
 | Event class | Retention window | Env var | Default |
 |-------------|------------------|---------|---------|
-| Processed (`mark_processed` called) | older than the window is deleted | `PURGE_AFTER_DAYS` | `7` days |
+| Processed (`mark_processed` called) | older than the window is deleted | `PURGE_AFTER_DAYS` | `3` days |
 | Unprocessed (never marked) | older than the window is deleted | `UNPROCESSED_PURGE_AFTER_DAYS` | `90` days |
 
 - The longer window for unprocessed events is intentional: unprocessed means
-  user-unseen, so the safety margin before dropping is wide (the 7-day vs 90-day
+  user-unseen, so the safety margin before dropping is wide (the 3-day vs 90-day
   asymmetry is by design).
 - The sweep runs via a Durable Object Alarm on a daily cadence and reschedules
   itself, so it fires independently of consumption. Processed events are also
