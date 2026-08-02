@@ -66,7 +66,7 @@
     },
     {
       "name": "mark_processed",
-      "description": "Mark a webhook event as processed so it won't appear again."
+      "description": "Mark webhook events as processed so they won't appear again. Accepts a single event_id or a batch of event_ids."
     }
   ],
   "compatibility": {

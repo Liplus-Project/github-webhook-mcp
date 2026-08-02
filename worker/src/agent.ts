@@ -13,12 +13,20 @@ import { McpAgent } from "agents/mcp";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { PendingStatus, EventSummary, WebhookEvent } from "../../shared/src/types.js";
+import { mergeMarkResults, type StoreBatchResponse } from "./mark-results.js";
 
 interface Env {
   MCP_OBJECT: DurableObjectNamespace;
   WEBHOOK_STORE: DurableObjectNamespace;
   TENANT_REGISTRY: DurableObjectNamespace;
 }
+
+/**
+ * Upper bound on ids per batched mark_processed call. Matches the 100 ceiling
+ * the listing tools use for `limit`, so a batch can always clear one full page
+ * of pending events.
+ */
+const MARK_BATCH_MAX = 100;
 
 /** Tenant context passed via props when creating per-tenant instances */
 export type TenantProps = {
@@ -55,6 +63,17 @@ export class WebhookMcpAgent extends McpAgent<Env, unknown, TenantProps> {
       const id = this.env.WEBHOOK_STORE.idFromName(name);
       return this.env.WEBHOOK_STORE.get(id);
     });
+  }
+
+  /** POST a mark-processed body (singular or batch) to one store. */
+  private markRequest(store: DurableObjectStub, body: unknown): Promise<Response> {
+    return store.fetch(
+      new Request("https://store/mark-processed", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      }),
+    );
   }
 
   async init() {
@@ -152,21 +171,38 @@ export class WebhookMcpAgent extends McpAgent<Env, unknown, TenantProps> {
 
     this.server.tool(
       "mark_processed",
-      "Mark a webhook event as processed",
-      { event_id: z.string() },
-      async ({ event_id }) => {
-        // Try all stores — the event lives in exactly one, others are no-ops
+      "Mark webhook events as processed. Pass event_ids to clear a whole batch in one call (preferred when several events were handled together); event_id marks a single event.",
+      {
+        event_id: z.string().optional(),
+        event_ids: z.array(z.string()).min(1).max(MARK_BATCH_MAX).optional(),
+      },
+      async ({ event_id, event_ids }) => {
         const stores = this.getStores();
+
+        // ── Batch form (#245): one round trip for N ids ──
+        if (event_ids) {
+          const perStore = await Promise.all(
+            stores.map((s) =>
+              this.markRequest(s, { event_ids }).then((r) => r.json() as Promise<StoreBatchResponse>),
+            ),
+          );
+
+          // Per-id verdict resolution across the fan-out lives in
+          // mark-results.ts (unit-tested there).
+          const summary = mergeMarkResults(event_ids, perStore);
+          return { content: [{ type: "text", text: JSON.stringify(summary, null, 2) }] };
+        }
+
+        // ── Singular form: response shape unchanged ──
+        if (!event_id) {
+          return {
+            content: [{ type: "text", text: "mark_processed requires event_id or event_ids" }],
+            isError: true,
+          };
+        }
+        // Try all stores — the event lives in exactly one, others are no-ops
         const results = await Promise.all(
-          stores.map((s) =>
-            s.fetch(
-              new Request("https://store/mark-processed", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ event_id }),
-              }),
-            ).then((r) => r.json()),
-          ),
+          stores.map((s) => this.markRequest(s, { event_id }).then((r) => r.json())),
         );
         // Return the first successful result
         return { content: [{ type: "text", text: JSON.stringify(results[0]) }] };

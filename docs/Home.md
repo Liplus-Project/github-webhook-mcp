@@ -55,7 +55,7 @@ GitHub --POST--> Cloudflare Worker --> Durable Object (SQLite)
 | `list_pending_events` | 未処理イベントのサマリー（フルペイロードなし） |
 | `get_event` | ID 指定で単一イベントのフルペイロード取得 |
 | `get_webhook_events` | 全未処理イベントのフルペイロード取得 |
-| `mark_processed` | イベントを処理済みにマーク |
+| `mark_processed` | イベントを処理済みにマーク（`event_ids` で複数件を 1 呼び出しにまとめられる） |
 
 ## モノレポ構成
 

@@ -758,21 +758,28 @@ const TOOLS = [
   },
   {
     name: "mark_processed",
-    title: "Mark Event Processed",
+    title: "Mark Events Processed",
     description:
-      "Mark a webhook event as processed so it won't appear again.",
+      "Mark webhook events as processed so they won't appear again. Pass event_ids to clear a whole batch in one call (preferred when several events were handled together); event_id marks a single event.",
     inputSchema: {
       type: "object",
       properties: {
         event_id: {
           type: "string",
-          description: "The event ID to mark as processed",
+          description: "A single event ID to mark as processed",
+        },
+        event_ids: {
+          type: "array",
+          items: { type: "string" },
+          minItems: 1,
+          maxItems: 100,
+          description:
+            "Event IDs to mark as processed in one call (1-100). Returns a per-id success/failure verdict; ids that succeed stay marked even if others fail.",
         },
       },
-      required: ["event_id"],
     },
     annotations: {
-      title: "Mark Event Processed",
+      title: "Mark Events Processed",
       destructiveHint: true,
     },
   },

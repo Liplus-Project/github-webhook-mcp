@@ -91,7 +91,8 @@ PR #42 "Fix login timeout" was opened by @alice in repo acme/web-app
 > "I've reviewed all the push notifications, mark them as done."
 
 **Expected output:**
-The AI calls `list_pending_events` to find push events, then `mark_processed` for each one:
+The AI calls `list_pending_events` to find push events, then clears them with a single
+`mark_processed({ event_ids: [...] })` call:
 
 ```
 Marked 2 push events as processed:
@@ -123,7 +124,7 @@ All checks passed.
 | `list_pending_events` | Summaries of pending events (no full payloads) |
 | `get_event` | Full payload for a single event by ID |
 | `get_webhook_events` | Full payloads for all pending events |
-| `mark_processed` | Mark an event as processed |
+| `mark_processed` | Mark events as processed (`event_id` for one, `event_ids` for a batch) |
 
 ## Event Retention
 

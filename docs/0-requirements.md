@@ -102,11 +102,20 @@ WebhookMcpAgent DO が以下のツールセットを提供する。ローカル�
 | F3.2 | `list_pending_events` | limit (1-100, default 20) | サマリー配列 | 未処理イベントのメタデータ一覧を返す（ペイロード含まず） |
 | F3.3 | `get_event` | event_id | 完全イベント or error | UUID 指定で完全なペイロードを返す |
 | F3.4 | `get_webhook_events` | limit (1-100, default 20) | 未処理イベント配列 | 未処理イベントをフルペイロード付きで返す |
-| F3.5 | `mark_processed` | event_id | success, event_id, purged | イベントを処理済みにマークし、保持期間超過の処理済みイベントを自動削除する。`purged` は今回削除された件数 |
+| F3.5 | `mark_processed` | event_id **または** event_ids (1-100) | 単数形: success, event_id, purged／バッチ形: success, marked, failed, results (id 単位の判定), purged | イベントを処理済みにマークし、保持期間超過の処理済みイベントを自動削除する。`purged` は今回削除された件数 |
 
 **F3.1 Local bridge shaping:** The local bridge wraps `get_pending_status` results into the Claude Code UserPromptSubmit hook decision JSON shape (`hookSpecificOutput.hookEventName="UserPromptSubmit"` plus a natural-language summary of pending_count / types / latest_received_at in `additionalContext`). This is required so values returned via `type: "mcp_tool"` UserPromptSubmit hooks reach the AI prompt context; manual tool calls receive the same shape. The remote (Worker + DO) return contract is unchanged.
 
 **F3.1 Empty silent (#221):** When `pending_count == 0`, the local bridge returns the remote payload untouched (no wrap). Claude Code silently discards JSON that does not match a decision schema, so hook callers receive nothing in `additionalContext` — eliminating the per-turn empty-reminder noise. Manual tool callers see the raw payload (`{pending_count: 0, types: {}, latest_received_at: null}`) and can interpret it directly.
+
+**F3.5 Batch form (#245):** `mark_processed` accepted exactly one event per call, so consuming the 6-10 self-operation acknowledgement events a single PR generates cost one round trip each. `event_ids: string[]` is added so the round trips collapse while the caller still enumerates ids explicitly (filter-based bulk consumption is deliberately not offered: it can silently consume external events).
+
+- **Backward compatibility:** the existing singular `event_id` call is unchanged, response shape included. It still answers `success: true` for an id that was never ingested.
+- **Per-id verdict:** the batch form returns `{event_id, success, error?}` per id. `error` is `not found` (no store held it) or `invalid event_id` (not a string / empty).
+- **Partial failure:** one failing id does not fail the call. Marks for the successful ids are already committed, so the caller retries only the failed ids. Partial failure is reported in the body, not as a tool error.
+- **Multi-account:** an event lives in exactly one store, so the same batch goes to every accessible store and an id marked by **any** store counts as marked. Only an id missed by every store failed.
+- **Purge cadence:** the retention purge runs once per batch call, not once per id.
+- **MCP proxy:** the static schemas (`mcp-server/server/index.js` / `local-mcp/src/index.ts`) must be updated. A new param is not picked up by reconnecting; the npm package has to be republished.
 
 **イベントサマリー構造:**
 
@@ -154,7 +163,7 @@ WebhookMcpAgent DO が以下のツールセットを提供する。ローカル�
 | 1 | `get_pending_status()` を 60 秒間隔でポーリング |
 | 2 | `pending_count > 0` なら `list_pending_events()` でサマリー取得 |
 | 3 | フルペイロードが必要なイベントのみ `get_event(event_id)` で取得 |
-| 4 | 処理完了後 `mark_processed(event_id)` でマーク |
+| 4 | 処理完了後 `mark_processed` でマーク。複数件をまとめて処理した場合は `event_ids` で 1 呼び出しに畳む |
 
 ### F7. OAuth 認証（Worker-hosted web OAuth）
 
