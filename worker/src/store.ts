@@ -126,6 +126,48 @@ export class WebhookStore extends DurableObject<StoreEnv> {
   }
 
   /**
+   * Purge processed events whose received_at is older than PURGE_AFTER_DAYS.
+   * Unprocessed events are never touched here regardless of age (the time-based
+   * sweep owns that class). Returns the number of rows deleted.
+   *
+   * Shared by the singular and the batch mark-processed paths so a batch runs
+   * exactly one purge instead of one per id — that per-call collapse is the
+   * point of the batch form (#245).
+   */
+  private purgeProcessed(): number {
+    const cutoff = new Date(Date.now() - purgeDays(this.env) * 86_400_000).toISOString();
+    const cursor = this.ctx.storage.sql.exec(
+      `DELETE FROM events WHERE processed = 1 AND received_at < ?`, cutoff,
+    );
+    return cursor.rowsWritten;
+  }
+
+  /**
+   * Mark one event processed, reporting whether a row in THIS store matched.
+   * `success: false` here means "not in this store" — with multi-account
+   * fan-out the caller asks every accessible store and merges, so a miss is
+   * expected on all but one. The agent decides the final per-id verdict.
+   *
+   * Each id is isolated: a throw on one id is caught and reported, leaving the
+   * writes already applied for the other ids intact (partial-failure contract).
+   */
+  private markOne(rawId: unknown): { event_id: unknown; success: boolean; error?: string } {
+    if (typeof rawId !== "string" || rawId.length === 0) {
+      return { event_id: rawId, success: false, error: "invalid event_id" };
+    }
+    try {
+      const cursor = this.ctx.storage.sql.exec(
+        `UPDATE events SET processed = 1 WHERE id = ?`, rawId,
+      );
+      return cursor.rowsWritten > 0
+        ? { event_id: rawId, success: true }
+        : { event_id: rawId, success: false, error: "not found" };
+    } catch (err) {
+      return { event_id: rawId, success: false, error: String(err) };
+    }
+  }
+
+  /**
    * DO Alarm handler — the consumption-independent retention guarantee. Runs the
    * full sweep (processed + unprocessed) and reschedules the next sweep so the
    * cycle keeps running on a hibernating, never-consumed tenant.
@@ -322,23 +364,28 @@ export class WebhookStore extends DurableObject<StoreEnv> {
     }
 
     // ── mark_processed ──
+    // Two request forms on one route:
+    //   { event_id }        → singular, response shape frozen for compatibility
+    //   { event_ids: [...] } → batch, per-id verdicts in `results`
+    // Auto-purge runs once per call either way: it deletes processed events whose
+    // received_at is older than the retention window, bounding DO storage growth
+    // from dead processed rows (re-port of #29). Unprocessed events are never
+    // deleted here regardless of age.
     if (url.pathname === "/mark-processed" && request.method === "POST") {
-      const { event_id } = await request.json() as { event_id: string };
+      const body = await request.json() as { event_id?: string; event_ids?: unknown[] };
+
+      if (Array.isArray(body.event_ids)) {
+        // Marks are applied id-by-id before the purge, so ids that failed do not
+        // undo the ones that succeeded — the successes are already committed.
+        const results = body.event_ids.map((id) => this.markOne(id));
+        return Response.json({ success: true, results, purged: this.purgeProcessed() });
+      }
+
+      const { event_id } = body as { event_id: string };
       this.ctx.storage.sql.exec(
         `UPDATE events SET processed = 1 WHERE id = ?`, event_id,
       );
-
-      // Auto-purge: delete processed events whose received_at is older than the
-      // retention window. Unprocessed events are never deleted regardless of age.
-      // This bounds DO storage growth from dead processed rows (re-port of #29).
-      const days = purgeDays(this.env);
-      const cutoff = new Date(Date.now() - days * 86_400_000).toISOString();
-      const cursor = this.ctx.storage.sql.exec(
-        `DELETE FROM events WHERE processed = 1 AND received_at < ?`, cutoff,
-      );
-      const purged = cursor.rowsWritten;
-
-      return Response.json({ success: true, event_id, purged });
+      return Response.json({ success: true, event_id, purged: this.purgeProcessed() });
     }
 
     // ── sweep (time-based retention purge) ──

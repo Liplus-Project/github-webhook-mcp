@@ -138,14 +138,14 @@ All tools are read-only except `mark_processed`.
 | `list_pending_events` | Summary list of pending events (`limit`: 1-100, default 20). Returns metadata only — `id`, `type`, `action`, `repo`, `sender`, `number`, `title`, `url`, `received_at` — without the full payload. |
 | `get_event` | Full payload for a single webhook event by `event_id`. |
 | `get_webhook_events` | Pending events with full payloads. Prefer `get_pending_status` or `list_pending_events` for polling and only fall back to this when you really need everything. |
-| `mark_processed` | Mark an event as processed by `event_id` so it will no longer appear in pending queries. Required to keep the pending queue from growing unbounded. |
+| `mark_processed` | Mark events as processed so they no longer appear in pending queries. Pass `event_id` for one event, or `event_ids` (1-100) to clear a whole batch in a single call. Required to keep the pending queue from growing unbounded. |
 
 ### Recommended polling flow
 
 1. Poll `get_pending_status()` periodically (e.g. every 60 seconds).
 2. If `pending_count > 0`, call `list_pending_events()` for summaries.
 3. Call `get_event(event_id)` only for events that need the full payload.
-4. Call `mark_processed(event_id)` after handling each event.
+4. Call `mark_processed` after handling the events — `event_ids: [...]` clears the whole set in one call, which is the normal case when a batch of events was handled together.
 
 If real-time channel notifications are enabled (Claude Code), step 1 can be skipped — the proxy will push event summaries as soon as the Worker receives them. You still need to call `mark_processed` to clear the queue.
 

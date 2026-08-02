@@ -218,6 +218,136 @@ describe("WebhookStore: mark-processed", () => {
     const ev = (await evRes.json()) as WebhookEvent;
     expect(ev.processed).toBe(true);
   });
+
+  // The batch form (#245) reports a per-id "not found", but the singular form
+  // never did and must not start: callers depend on the flat, always-success
+  // response shape. Pinned so adding batch strictness cannot leak into it.
+  it("still answers success for an unknown id in the singular form", async () => {
+    const stub = storeFor("mark-processed-unknown-id");
+    const mp = await stub.fetch(
+      new Request(`${BASE}/mark-processed`, {
+        method: "POST",
+        body: JSON.stringify({ event_id: "never-ingested" }),
+      }),
+    );
+    expect(mp.status).toBe(200);
+    expect(await mp.json()).toEqual({ success: true, event_id: "never-ingested", purged: 0 });
+  });
+});
+
+// Batch form of /mark-processed (#245): { event_ids: [...] } in place of
+// { event_id }. Returns a per-id verdict so the caller can see which ids missed
+// without re-sending the batch.
+type BatchResult = { event_id: unknown; success: boolean; error?: string };
+type BatchResponse = { success: boolean; results: BatchResult[]; purged: number };
+
+async function markBatch(stub: DurableObjectStub, event_ids: unknown[]) {
+  const res = await stub.fetch(
+    new Request(`${BASE}/mark-processed`, {
+      method: "POST",
+      body: JSON.stringify({ event_ids }),
+    }),
+  );
+  expect(res.status).toBe(200);
+  return res.json() as Promise<BatchResponse>;
+}
+
+describe("WebhookStore: mark-processed batch (event_ids)", () => {
+  it("marks every id in one call and reports a per-id verdict", async () => {
+    const stub = storeFor("batch-marks-all");
+    for (const id of ["b1", "b2", "b3"]) {
+      await ingest(stub, makeEvent({ id, received_at: isoFromNow(-1 * DAY_MS) }));
+    }
+
+    const body = await markBatch(stub, ["b1", "b2", "b3"]);
+    expect(body.success).toBe(true);
+    expect(body.results).toEqual([
+      { event_id: "b1", success: true },
+      { event_id: "b2", success: true },
+      { event_id: "b3", success: true },
+    ]);
+
+    // all three dropped out of pending, all three still fetchable as processed
+    const status = (await (await stub.fetch(new Request(`${BASE}/pending-status`))).json()) as PendingStatus;
+    expect(status.pending_count).toBe(0);
+    for (const id of ["b1", "b2", "b3"]) {
+      const ev = (await (await stub.fetch(new Request(`${BASE}/event?id=${id}`))).json()) as WebhookEvent;
+      expect(ev.processed).toBe(true);
+    }
+  });
+
+  it("commits the successful ids when one id in the batch fails", async () => {
+    const stub = storeFor("batch-partial-failure");
+    await ingest(stub, makeEvent({ id: "ok1", received_at: isoFromNow(-1 * DAY_MS) }));
+    await ingest(stub, makeEvent({ id: "ok2", received_at: isoFromNow(-1 * DAY_MS) }));
+
+    // "ghost" is not in the store, and "" is not a usable id — neither may
+    // prevent ok1 / ok2 from being marked.
+    const body = await markBatch(stub, ["ok1", "ghost", "ok2", ""]);
+    expect(body.success).toBe(true); // the call itself did not fail
+    expect(body.results).toEqual([
+      { event_id: "ok1", success: true },
+      { event_id: "ghost", success: false, error: "not found" },
+      { event_id: "ok2", success: true },
+      { event_id: "", success: false, error: "invalid event_id" },
+    ]);
+
+    // the successes are durable: both are processed and out of pending
+    const status = (await (await stub.fetch(new Request(`${BASE}/pending-status`))).json()) as PendingStatus;
+    expect(status.pending_count).toBe(0);
+    for (const id of ["ok1", "ok2"]) {
+      const ev = (await (await stub.fetch(new Request(`${BASE}/event?id=${id}`))).json()) as WebhookEvent;
+      expect(ev.processed).toBe(true);
+    }
+  });
+
+  it("runs the retention purge once for the whole batch", async () => {
+    const stub = storeFor("batch-purges-once");
+    // one stale processed row: a per-id purge would report it repeatedly,
+    // a single per-call purge reports it exactly once
+    await ingest(stub, makeEvent({ id: "stale", received_at: isoFromNow(-30 * DAY_MS), processed: true }));
+    await ingest(stub, makeEvent({ id: "n1", received_at: isoFromNow(-1 * DAY_MS) }));
+    await ingest(stub, makeEvent({ id: "n2", received_at: isoFromNow(-1 * DAY_MS) }));
+
+    const body = await markBatch(stub, ["n1", "n2"]);
+    expect(body.purged).toBe(1);
+    expect((await stub.fetch(new Request(`${BASE}/event?id=stale`))).status).toBe(404);
+  });
+
+  it("treats an empty id list as a no-op that still succeeds", async () => {
+    const stub = storeFor("batch-empty");
+    await ingest(stub, makeEvent({ id: "untouched", received_at: isoFromNow(-1 * DAY_MS) }));
+
+    const body = await markBatch(stub, []);
+    expect(body).toEqual({ success: true, results: [], purged: 0 });
+
+    const status = (await (await stub.fetch(new Request(`${BASE}/pending-status`))).json()) as PendingStatus;
+    expect(status.pending_count).toBe(1);
+  });
+
+  it("is idempotent: re-marking an already-processed id still reports success", async () => {
+    const stub = storeFor("batch-idempotent");
+    await ingest(stub, makeEvent({ id: "twice", received_at: isoFromNow(-1 * DAY_MS) }));
+
+    expect((await markBatch(stub, ["twice"])).results).toEqual([{ event_id: "twice", success: true }]);
+    expect((await markBatch(stub, ["twice"])).results).toEqual([{ event_id: "twice", success: true }]);
+  });
+
+  it("leaves the singular event_id form untouched when both keys could apply", async () => {
+    // event_ids selects the batch form; the singular response shape is reserved
+    // for requests that carry event_id alone.
+    const stub = storeFor("batch-form-selection");
+    await ingest(stub, makeEvent({ id: "s1", received_at: isoFromNow(-1 * DAY_MS) }));
+
+    const res = await stub.fetch(
+      new Request(`${BASE}/mark-processed`, {
+        method: "POST",
+        body: JSON.stringify({ event_id: "s1", event_ids: ["s1"] }),
+      }),
+    );
+    const body = (await res.json()) as BatchResponse;
+    expect(body.results).toEqual([{ event_id: "s1", success: true }]);
+  });
 });
 
 describe("WebhookStore: mark-processed auto-purge", () => {

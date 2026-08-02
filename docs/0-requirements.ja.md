@@ -102,11 +102,20 @@ WebhookMcpAgent DO が以下のツールセットを提供する。ローカル�
 | F3.2 | `list_pending_events` | limit (1-100, default 20) | サマリー配列 | 未処理イベントのメタデータ一覧を返す（ペイロード含まず） |
 | F3.3 | `get_event` | event_id | 完全イベント or error | UUID 指定で完全なペイロードを返す |
 | F3.4 | `get_webhook_events` | limit (1-100, default 20) | 未処理イベント配列 | 未処理イベントをフルペイロード付きで返す |
-| F3.5 | `mark_processed` | event_id | success, event_id, purged | イベントを処理済みにマークし、保持期間超過の処理済みイベントを自動削除する。`purged` は今回削除された件数 |
+| F3.5 | `mark_processed` | event_id **または** event_ids (1-100) | 単数形: success, event_id, purged／バッチ形: success, marked, failed, results (id 単位の判定), purged | イベントを処理済みにマークし、保持期間超過の処理済みイベントを自動削除する。`purged` は今回削除された件数 |
 
 **F3.1 ローカルブリッジ整形:** ローカルブリッジは `get_pending_status` の戻り値を Claude Code UserPromptSubmit hook の decision JSON shape (`hookSpecificOutput.hookEventName="UserPromptSubmit"` + `additionalContext` に pending_count / types / latest_received_at の自然文要約) にラップして返す。これは `type: "mcp_tool"` UserPromptSubmit hook 経由の呼び出しで戻り値が AI 文脈に注入されるための要件であり、手動 tool 呼び出し時も同 shape で返る。リモート (Worker + DO) 側の戻り値構造は変更しない。
 
 **F3.1 空状態の silent (empty silent, #221):** `pending_count == 0` の場合はラップせずリモート戻り値をそのまま返す。Claude Code 側で decision schema に一致しない JSON は silent discard されるため、hook 経由の呼び出しで `additionalContext` に何も注入されず、毎ターン空 reminder のノイズが消える。手動 tool 呼び出しではリモートの raw payload (`{pending_count: 0, types: {}, latest_received_at: null}`) が返り、AI は内容を直接判定できる。
+
+**F3.5 バッチ形 (#245):** `mark_processed` が 1 呼び出しにつき 1 イベントしか受けなかったため、自己操作 1 回で 6〜10 件生じる到達確認イベントの消費が呼び出し回数に比例していた。`event_ids: string[]` を追加し、id を明示列挙したまま往復だけ畳む（filter 一括消費は外部イベントを誤って消しうるため採らない）。
+
+- **後方互換:** 既存の単数 `event_id` 呼び出しは戻り値の形も含めて不変。存在しない id でも `success: true` を返す旧挙動を維持する。
+- **id 単位の判定:** バッチ形は id ごとに `{event_id, success, error?}` を返す。tool 表層で `error` が取る値は `not found`（どの store にも無い）のみ。空の id は store に届く前に tool schema が弾くため、誤解を招く `not found` に化けることはない。
+- **部分失敗:** 1 件の失敗で全体を落とさない。成功した id のマークは確定済みで、呼び出し側は失敗した id だけ再送すればよい。部分失敗は tool error ではなく本文で報告する。
+- **マルチアカウント:** イベントは 1 つの store にのみ存在するため、アクセス可能な全 store に同じバッチを投げ、**いずれかの store が一致した id を成功**とする。全 store が取り逃した id のみ失敗。
+- **purge 回数:** 保持期間 purge はバッチ 1 回につき 1 回のみ走る（id ごとではない）。
+- **MCP proxy:** 静的スキーマ (`mcp-server/server/index.js` / `local-mcp/src/index.ts`) の更新が要る。新 param は再接続では反映されず npm 再公開が必要。
 
 **イベントサマリー構造:**
 
@@ -154,7 +163,7 @@ WebhookMcpAgent DO が以下のツールセットを提供する。ローカル�
 | 1 | `get_pending_status()` を 60 秒間隔でポーリング |
 | 2 | `pending_count > 0` なら `list_pending_events()` でサマリー取得 |
 | 3 | フルペイロードが必要なイベントのみ `get_event(event_id)` で取得 |
-| 4 | 処理完了後 `mark_processed(event_id)` でマーク |
+| 4 | 処理完了後 `mark_processed` でマーク。複数件をまとめて処理した場合は `event_ids` で 1 呼び出しに畳む |
 
 ### F7. OAuth 認証（Worker-hosted web OAuth）
 
