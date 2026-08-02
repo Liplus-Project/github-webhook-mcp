@@ -5,3 +5,7 @@ worker/node_modules/
 worker/.wrangler/
 worker/dist/
 local-mcp/node_modules/
+
+# Li+ workspace artifacts (workspace root owns these, not this repo) — #243
+.claude/
+Li+config.md
