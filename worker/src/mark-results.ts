@@ -55,6 +55,11 @@ export function mergeMarkResults(
     for (const r of store.results ?? []) {
       // Only successes are promoted: a miss from one store says nothing about
       // the others, and the map already holds "not found" as the default.
+      // Store-side `error` strings are deliberately NOT propagated — a
+      // per-store reason describes one store, not the merged verdict. This is
+      // why "not found" is the only error the tool surface emits, and why the
+      // tool schema rejects empty ids rather than letting them arrive here as
+      // a store-level "invalid event_id" that this merge would flatten.
       if (r.success && typeof r.event_id === "string" && verdicts.has(r.event_id)) {
         verdicts.set(r.event_id, { event_id: r.event_id, success: true });
       }

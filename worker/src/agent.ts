@@ -174,7 +174,11 @@ export class WebhookMcpAgent extends McpAgent<Env, unknown, TenantProps> {
       "Mark webhook events as processed. Pass event_ids to clear a whole batch in one call (preferred when several events were handled together); event_id marks a single event.",
       {
         event_id: z.string().optional(),
-        event_ids: z.array(z.string()).min(1).max(MARK_BATCH_MAX).optional(),
+        // min(1) on the ITEM, not just the array: an empty-string id would pass
+        // schema validation, miss in every store, and reach the caller as
+        // "not found" — a misleading verdict for what is really a malformed
+        // request. Rejecting it here keeps "not found" the only per-id error.
+        event_ids: z.array(z.string().min(1)).min(1).max(MARK_BATCH_MAX).optional(),
       },
       async ({ event_id, event_ids }) => {
         const stores = this.getStores();

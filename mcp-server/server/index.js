@@ -770,7 +770,7 @@ const TOOLS = [
         },
         event_ids: {
           type: "array",
-          items: { type: "string" },
+          items: { type: "string", minLength: 1 },
           minItems: 1,
           maxItems: 100,
           description:

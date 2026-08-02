@@ -806,7 +806,7 @@ const TOOLS = [
         event_id: { type: "string", description: "A single event ID to mark" },
         event_ids: {
           type: "array",
-          items: { type: "string" },
+          items: { type: "string", minLength: 1 },
           minItems: 1,
           maxItems: 100,
           description:

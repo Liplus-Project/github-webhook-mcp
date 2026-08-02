@@ -111,7 +111,7 @@ WebhookMcpAgent DO が以下のツールセットを提供する。ローカル�
 **F3.5 Batch form (#245):** `mark_processed` accepted exactly one event per call, so consuming the 6-10 self-operation acknowledgement events a single PR generates cost one round trip each. `event_ids: string[]` is added so the round trips collapse while the caller still enumerates ids explicitly (filter-based bulk consumption is deliberately not offered: it can silently consume external events).
 
 - **Backward compatibility:** the existing singular `event_id` call is unchanged, response shape included. It still answers `success: true` for an id that was never ingested.
-- **Per-id verdict:** the batch form returns `{event_id, success, error?}` per id. `error` is `not found` (no store held it) or `invalid event_id` (not a string / empty).
+- **Per-id verdict:** the batch form returns `{event_id, success, error?}` per id. `not found` (no store held that id) is the only value `error` takes at the tool surface — an empty id is rejected by the tool schema before it reaches a store, so it never turns into a misleading `not found`.
 - **Partial failure:** one failing id does not fail the call. Marks for the successful ids are already committed, so the caller retries only the failed ids. Partial failure is reported in the body, not as a tool error.
 - **Multi-account:** an event lives in exactly one store, so the same batch goes to every accessible store and an id marked by **any** store counts as marked. Only an id missed by every store failed.
 - **Purge cadence:** the retention purge runs once per batch call, not once per id.
