@@ -56,9 +56,8 @@ Sign in on GitHub (2FA works as usual), approve access, and close the tab when t
 npx resolves the package version once, at process start — including when the client config pins
 `@latest`. A client that is already running keeps the version it launched with, so a new npm
 release does not reach it until that process is replaced: **restart the MCP client (Claude Desktop,
-Claude Code, Codex) to pick up a new version.** On restart npx fetches the new version into a fresh
-cache directory; the cache directories used before keep the old version and are simply no longer
-selected.
+Claude Code, Codex) to pick up a new version.** The restart is what moves the client onto the new
+version.
 
 This matters most for releases that change the tool schemas the proxy advertises, because those
 schemas are served from the proxy's own code rather than fetched from the Worker — until the
