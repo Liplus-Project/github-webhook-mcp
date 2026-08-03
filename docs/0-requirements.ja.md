@@ -237,15 +237,42 @@ Worker は GitHub の web OAuth flow をホストする独自実装を備える�
 
 | トリガー | ジョブ | 内容 |
 |---------|--------|------|
-| `v*` タグ push | build-mcpb | `mcpb pack` で .mcpb 生成 |
-| `v*` タグ push | release | GitHub Release 作成 + .mcpb 添付 |
-| `v*` タグ push | npm-publish | npm レジストリに公開 |
+| release published | build-mcpb | `mcpb pack` で .mcpb 生成 |
+| release published | attach-mcpb | `gh release upload` で .mcpb をリリースに添付（build-mcpb 後） |
+| release published | npm-publish | npm レジストリに公開 |
 
 リリースフロー:
-1. `v*` タグを push する
-2. CD が自動実行: .mcpb 生成 → release 作成 → .mcpb 添付 → npm publish
-3. npm publish 時にタグ名から自動でバージョンを同期する（package.json の手動更新不要）
+1. AI が `gh release create` でリリースを作成する（PAT 経由で release イベントが発火する）
+2. Release published イベントで CD ワークフローが発火: .mcpb 生成 → .mcpb リリース添付 → npm publish
+3. npm publish 時にリリースタグ名から自動でバージョンを同期する（package.json の手動更新不要）
 4. プレリリースタグ（`-` を含む）は `next` dist-tag で公開、正式リリースは `latest` で公開
+
+### 配送鎖と完了条件
+
+```
+merge → gh release create → CD (npm-publish) → registry の latest 更新
+      → 利用側 MCP クライアントの再起動 → npx が新版を解決 → 利用側に到達
+```
+
+後半 2 段は CD の外側にあり、リポジトリ側からは実行できない。npx がパッケージのバージョンを解決するの
+はプロセス起動時の一度きりであり（クライアント設定で `@latest` を指定していても同じ）、すでに起動して
+いるプロセスは registry がどう変わっても起動時のバージョンを保持し続ける（v0.11.9 のリリース直後に実
+測: registry が 0.11.9 を返している間、稼働中のクライアントは 0.11.8 のままだった。0.11.9 に移ったの
+は Claude Desktop を再起動した時点である）。
+
+したがって **「registry が新版を返す」はリリース完了の判定基準にならない**。特にプロキシの静的ツール
+スキーマを変更したリリースは、利用側プロセスが再起動して初めて成果が現れる。リリース完了報告を
+registry の確認で締めると、届いていない状態を届いたと報告することになる。
+
+registry の確認には `--prefer-online` を付ける。npm CLI は registry のメタデータをキャッシュするため、
+publish 直後の `npm view github-webhook-mcp version` は旧版を返しうる（同じく v0.11.9 で実測）。
+
+```bash
+npm view github-webhook-mcp version --prefer-online
+```
+
+npx のキャッシュ解決挙動そのものは本リポジトリの管理外であり、規定できるのは
+「再起動が要る」という事実と上記の確認手段までとする。
 
 ## 依存関係
 

@@ -54,6 +54,21 @@ See the [Installation wiki page](https://github.com/Liplus-Project/github-webhoo
 - **MCP Client Setup** for Claude Desktop, Claude Code CLI, and Codex
 - **Self-Hosting Guide** for Cloudflare Workers deployment
 
+## Updating
+
+A published release does not reach a running client on its own. npx resolves the package version
+once, when the process starts — including when the client config pins `@latest` — so an MCP client
+that is already running keeps the version it started with no matter what the registry serves.
+**Restart the MCP client (Claude Desktop, Claude Code, Codex) to pick up a new release.** The
+restart is what moves the client onto the new version.
+
+Check what the registry actually has with `--prefer-online`. The npm CLI caches registry metadata,
+so a bare `npm view` can still report the previous version shortly after a publish:
+
+```bash
+npm view github-webhook-mcp version --prefer-online
+```
+
 ## Usage Examples
 
 ### Example 1: Check pending webhook status

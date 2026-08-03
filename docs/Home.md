@@ -47,6 +47,16 @@ GitHub --POST--> Cloudflare Worker --> Durable Object (SQLite)
 - **MCP クライアント設定** — Claude Desktop、Claude Code CLI、Codex 向け
 - **セルフホスティングガイド** — Cloudflare Workers デプロイ
 
+## 更新
+
+公開されたリリースは、稼働中のクライアントに自動では届きません。npx がパッケージのバージョンを解決するのはプロセス起動時の一度きりで（クライアント設定で `@latest` を指定していても同じです）、すでに起動しているクライアントは registry が何を返すようになっても起動時のバージョンを保持し続けます。**新しいリリースを反映するには MCP クライアント（Claude Desktop / Claude Code / Codex）を再起動してください。** クライアントが新しいバージョンに移るのは、この再起動によってです。
+
+registry 側の確認には `--prefer-online` を付けてください。npm CLI は registry のメタデータをキャッシュするため、publish 直後の `npm view` は旧バージョンを返すことがあります。
+
+```bash
+npm view github-webhook-mcp version --prefer-online
+```
+
 ## MCP ツール
 
 | ツール | 説明 |
