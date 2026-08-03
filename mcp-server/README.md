@@ -51,6 +51,26 @@ Sign in on GitHub (2FA works as usual), approve access, and close the tab when t
 
 > **Configure the Callback URL on self-hosted GitHub Apps.** If you self-host the Worker with your own GitHub App, register `https://<your-worker>/oauth/callback` as the **Callback URL**. Without it, the Worker's `/oauth/callback` step fails with "Authorization failed" because GitHub will reject the redirect. **Device Flow** is not used and can stay off. See the [self-hosting guide](https://github.com/Liplus-Project/github-webhook-mcp/blob/main/docs/installation.md) for step-by-step instructions.
 
+## Updating
+
+npx resolves the package version once, at process start — including when the client config pins
+`@latest`. A client that is already running keeps the version it launched with, so a new npm
+release does not reach it until that process is replaced: **restart the MCP client (Claude Desktop,
+Claude Code, Codex) to pick up a new version.** On restart npx fetches the new version into a fresh
+cache directory; the cache directories used before keep the old version and are simply no longer
+selected.
+
+This matters most for releases that change the tool schemas the proxy advertises, because those
+schemas are served from the proxy's own code rather than fetched from the Worker — until the
+process restarts, the client keeps seeing the old tool definitions.
+
+Verify what the registry holds with `--prefer-online`. The npm CLI caches registry metadata, so a
+bare `npm view` can report the previous version shortly after a publish:
+
+```bash
+npm view github-webhook-mcp version --prefer-online
+```
+
 ## Client configuration
 
 ### Claude Desktop / Claude Code

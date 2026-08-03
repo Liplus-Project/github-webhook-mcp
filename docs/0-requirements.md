@@ -287,6 +287,33 @@ Node.js >= 18.0.0 が必要。
 
 manifest.json のバージョンも一致させる。
 
+### 配送鎖と完了条件
+
+```
+merge → gh release create → CD (npm-publish) → registry の latest 更新
+      → 利用側 MCP クライアントの再起動 → npx が新版を解決 → 利用側に到達
+```
+
+後半 2 段は CD の外側にあり、リポジトリ側からは実行できない。npx がパッケージのバージョンを解決するの
+はプロセス起動時の一度きりであり（クライアント設定で `@latest` を指定していても同じ）、すでに起動して
+いるプロセスは registry がどう変わっても起動時のバージョンを保持し続ける（v0.11.9 のリリース直後に実
+測: registry は 0.11.9、npx キャッシュ内の実体は 3 ディレクトリすべて 0.11.8 のまま。Claude Desktop
+再起動後、新規ディレクトリに 0.11.9 が取得された）。
+
+したがって **「registry が新版を返す」はリリース完了の判定基準にならない**。特にプロキシの静的ツール
+スキーマを変更したリリースは、利用側プロセスが再起動して初めて成果が現れる。リリース完了報告を
+registry の確認で締めると、届いていない状態を届いたと報告することになる。
+
+registry の確認には `--prefer-online` を付ける。npm CLI は registry のメタデータをキャッシュするため、
+publish 直後の `npm view github-webhook-mcp version` は旧版を返しうる（同じく v0.11.9 で実測）。
+
+```bash
+npm view github-webhook-mcp version --prefer-online
+```
+
+npx のキャッシュ解決挙動そのものは本リポジトリの管理外であり、規定できるのは
+「再起動が要る」という事実と上記の確認手段までとする。
+
 ## Distribution Channels
 
 | チャネル | 用途 | ステータス | 要件 |
