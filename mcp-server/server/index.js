@@ -19,6 +19,19 @@
  *      a sibling Claude Code process may have refreshed already, so we adopt
  *      its rotation rather than starting a fresh web flow.
  *
+ * The bridge has two independent protocol faces (issue #249):
+ *
+ *   Claude Desktop -> bridge : SDK v1 stdio server, 2025-era. Unchanged.
+ *   bridge -> Worker         : SDK v2 client pinned to protocol revision
+ *                              2026-07-28. Stateless — no `initialize`
+ *                              handshake and no `mcp-session-id`; every
+ *                              request carries the per-request `_meta`
+ *                              envelope the revision requires.
+ *
+ * The Worker's revision is a private contract between the artifacts of this
+ * repository (`server.json` declares stdio transport only, so nothing else
+ * reaches the Worker), so the Desktop face is not bound by it.
+ *
  * Discord MCP pattern: data lives in the cloud, local MCP is a thin bridge.
  */
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -34,6 +47,7 @@ import { createRequire } from "node:module";
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import WebSocketClient from "ws";
+import { createRemoteClient } from "./remote-client.js";
 
 const require = createRequire(import.meta.url);
 const { version: PACKAGE_VERSION } = require("../package.json");
@@ -595,87 +609,37 @@ async function getAccessTokenForToolCall() {
   throw new Error("OAuth web flow did not produce an authorize URL in time.");
 }
 
-async function buildAuthHeaders(token, extra) {
-  const h = { ...extra };
-  if (token) h["Authorization"] = `Bearer ${token}`;
-  return h;
-}
+// ── Remote MCP Client (lazy, reused) ─────────────────────────────────────────
+// Construction and caching live in ./remote-client.js so they can be tested
+// without importing this module (which connects the stdio transport on import).
+//
+// There is no session here any more: the 2026-07-28 revision makes every
+// request self-contained, so `getSessionIdWithToken` and the `mcp-session-id`
+// header are gone rather than migrated. The 401 retry that used to be wired by
+// hand around the session is now the transport's, driven by `onUnauthorized`.
 
-// ── Remote MCP Session (lazy, reused) ────────────────────────────────────────
+const remote = createRemoteClient({
+  workerUrl: WORKER_URL,
+  clientVersion: PACKAGE_VERSION,
+  // The OAuth flow above stays the source of tokens; this only hands the
+  // current one over, and clears the cache when the Worker says it is stale so
+  // the next `token()` re-mints.
+  authProvider: {
+    token: () => getAccessTokenForToolCall(),
+    onUnauthorized: async () => {
+      _cachedTokens = null;
+      await getAccessTokenForToolCall();
+    },
+  },
+});
 
-let _sessionId = null;
+async function callRemoteTool(name, args) {
+  // Resolve credentials first so an authorization requirement surfaces as
+  // AuthRequiredError from here, where the caller already handles it, rather
+  // than from inside the transport wrapped as a network failure.
+  await getAccessTokenForToolCall();
 
-async function getSessionIdWithToken(token) {
-  if (_sessionId) return _sessionId;
-
-  const res = await fetch(`${WORKER_URL}/mcp`, {
-    method: "POST",
-    headers: await buildAuthHeaders(token, {
-      "Content-Type": "application/json",
-      Accept: "application/json, text/event-stream",
-    }),
-    body: JSON.stringify({
-      jsonrpc: "2.0",
-      method: "initialize",
-      params: {
-        protocolVersion: "2024-11-05",
-        capabilities: {},
-        clientInfo: { name: "local-bridge", version: "1.0.0" },
-      },
-      id: "init",
-    }),
-  });
-
-  _sessionId = res.headers.get("mcp-session-id") || "";
-  return _sessionId;
-}
-
-async function callRemoteToolWithToken(name, args, token, _retried = false) {
-  const sessionId = await getSessionIdWithToken(token);
-
-  const res = await fetch(`${WORKER_URL}/mcp`, {
-    method: "POST",
-    headers: await buildAuthHeaders(token, {
-      "Content-Type": "application/json",
-      Accept: "application/json, text/event-stream",
-      "mcp-session-id": sessionId,
-    }),
-    body: JSON.stringify({
-      jsonrpc: "2.0",
-      method: "tools/call",
-      params: { name, arguments: args },
-      id: crypto.randomUUID(),
-    }),
-  });
-
-  // 401 = token expired or revoked. Clear session + token cache and retry
-  // once with a freshly acquired token (refresh or full flow).
-  if (res.status === 401) {
-    if (_retried) {
-      return { content: [{ type: "text", text: "Authentication failed after retry. Please re-authenticate." }] };
-    }
-    _cachedTokens = null;
-    _sessionId = null;
-    const freshToken = await getAccessTokenForToolCall();
-    return callRemoteToolWithToken(name, args, freshToken, true);
-  }
-
-  const text = await res.text();
-
-  // Streamable HTTP may return SSE format
-  const dataLine = text.split("\n").find((l) => l.startsWith("data: "));
-  const json = dataLine ? JSON.parse(dataLine.slice(6)) : JSON.parse(text);
-
-  if (json.error) {
-    // Session expired — retry once with a fresh session
-    if ((json.error.code === -32600 || json.error.code === -32001) && !_retried) {
-      _sessionId = null;
-      return callRemoteToolWithToken(name, args, token, true);
-    }
-    return { content: [{ type: "text", text: JSON.stringify(json.error) }] };
-  }
-
-  return json.result;
+  return await remote.callTool(name, args);
 }
 
 // ── MCP Server Setup ─────────────────────────────────────────────────────────
@@ -900,8 +864,7 @@ function formatAuthRequiredResponse(pending) {
 server.setRequestHandler(CallToolRequestSchema, async (req) => {
   const { name, arguments: args } = req.params;
   try {
-    const token = await getAccessTokenForToolCall();
-    const result = await callRemoteToolWithToken(name, args ?? {}, token);
+    const result = await callRemoteTool(name, args ?? {});
     // First successful tool call confirms OAuth is working
     markOAuthEstablished();
     if (name === "get_pending_status") {

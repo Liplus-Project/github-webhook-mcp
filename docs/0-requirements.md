@@ -22,8 +22,8 @@ GitHub ──POST──▶ Cloudflare Worker ──▶ TenantRegistry DO
                   │                    WebhookStore DO (SQLite) [per-tenant]
                   │                             │
                   ├── /mcp (Streamable HTTP)     ├── WebSocket / SSE real-time stream
-                  │    WebhookMcpAgent DO        └── REST endpoints
-                  │    [per-tenant]                   /pending-status
+                  │    createMcpHandler          └── REST endpoints
+                  │    [stateless, per-request]       /pending-status
                   │    └── tools → WebhookStore       /pending-events
                   │                                   /webhook-events
                   ├── /events (WebSocket/SSE)          /event
@@ -51,9 +51,25 @@ GitHub ──POST──▶ Cloudflare Worker ──▶ TenantRegistry DO
 1. **Cloudflare Worker** — webhook 受信、署名検証、テナントルーティング
 2. **TenantRegistry Durable Object** — installation_id → account_id マッピング管理、テナント単位クォータ管理（単一インスタンス）
 3. **WebhookStore Durable Object** — SQLite によるイベント永続化、REST/WebSocket/SSE エンドポイント（テナント別インスタンス: `store-{accountId}`）
-4. **WebhookMcpAgent Durable Object** — MCP Streamable HTTP サーバー、ツール定義（テナント別インスタンス: `tenant-{accountId}`）
+4. **ステートレス MCP ハンドラ** — MCP Streamable HTTP サーバー、ツール定義。プロトコル版 2026-07-28 でセッションが消えたため Durable Object ではなく、リクエストごとに `createMcpHandler` が組み立てる（#249）
 
 ローカルブリッジ（mcp-server/）は Worker に対するプロキシであり、データを保持しない。
+
+### プロトコル版と単レーン切替（#249）
+
+Worker は MCP プロトコル版 **2026-07-28（ステートレスコア）のみ**を提供する。`createMcpHandler` に `legacy: "reject"` を渡しており、2025 系のリクエスト（`initialize` を含む）は、この endpoint が提供する唯一の版を名指しした unsupported-protocol-version エラーで返る。
+
+Worker のプロトコル版は、本 repo の 2 成果物（Worker と npx ブリッジ）のあいだの私的な契約である。`mcp-server/server.json` は stdio トランスポートのみを宣言しており、リモートトランスポートの宣言が無いため、第三者クライアントが Worker に直接到達する経路は存在しない。したがって Claude Desktop 側の対応状況は Worker 側移行の条件ではない。ブリッジは二面を持ち、両面は独立している:
+
+| 面 | 実装 | 版 |
+|---|---|---|
+| Claude Desktop に対してサーバー | SDK v1 stdio（`Server` クラス） | 2025 系 |
+| Worker に対してクライアント | SDK v2（`@modelcontextprotocol/client`） | 2026-07-28 に pin |
+
+**互換レーンは実装しない。** 保守されないフォールバック経路は放置されて死にコード化する。畳む条件が観測可能（旧レーンへの到達がゼロになる）であっても、観測できることと観測しに行くことは別であり、運用上その判断は忘れられる。破断の吸収はコードではなく、**minor リリース + README 注意書き**という別チャネルで行う。
+
+非対称の所在: Worker は全員共有の 1 デプロイなので一斉に飛ぶ。ブリッジは利用者ごとで、各自の MCP クライアント再起動で追随する（`@latest` 指定でも起動済みプロセスは古い版を保持する — #247 / #248）。版を固定している外部利用者は再起動しても復旧しない。**この層の切り捨てを受け入れる**というのが本決定である。
+
 
 ## Functional Requirements
 
@@ -94,7 +110,7 @@ GitHub ──POST──▶ Cloudflare Worker ──▶ TenantRegistry DO
 
 ### F3. MCP ツール
 
-WebhookMcpAgent DO が以下のツールセットを提供する。ローカルブリッジはこれをプロキシする。
+ステートレス MCP ハンドラが以下のツールセットを提供する。ローカルブリッジはこれをプロキシする。
 
 | ID | ツール名 | 引数 | 戻り値 | 要件 |
 |----|---------|------|--------|------|
@@ -183,6 +199,14 @@ Worker は GitHub の web OAuth flow をホストする独自実装を備える�
 | F7.10 | ローカルブリッジは初回ツール呼び出しで web flow が完了していない場合、polling をバックグラウンドに維持したまま、authorize URL と残り有効秒数を本文に含む `isError: true` の構造化ツール応答を即座に返す。2 回目以降の同一ツール呼び出しは、承認完了なら通常処理、未完了なら同じ auth-required 応答を返す（ポーリングは 1 本に serialize） |
 | F7.11 | ローカルブリッジは refresh 時に `invalid_grant` を受けた場合、直ちに全面 re-auth に遷移せず tokens file を再読み込みする。別プロセスが既に rotation を完了していれば、その最新 refresh_token を採用して再試行する（RC1: refresh desync の最小 fix。file lock は導入しない） |
 
+**Dynamic Client Registration の位置づけ（#249 で確認、撤去は本 issue の範囲外）:**
+
+MCP 2026-07-28 の deprecated レジストリ 6 件のうち本 repo に該当するのは Dynamic Client Registration（F7.2）のみ。移行先は Client ID Metadata Documents。最短撤去は 2027-07-28 以降の最初のリビジョンであり、しかも「最短撤去」は撤去が可能になる時点にすぎず、実際の撤去は Core Maintainer 判断でそれ以降にずれうる。仕様からの撤去は SDK に削除義務を課さない。
+
+本移行では撤去しない。理由は相乗りの前提が成立しないこと — 本移行は OAuth の実装に一切触れておらず（ブリッジ側は transport の `authProvider` に繋ぎ直しただけ）、DCR 撤去は両面の認証設計変更になる。プロトコル切替と同一リリースに載せると、利用者が再起動して降りてくる先で破断面が二つ同時に開く。
+
+該当しないもの: Roots / Sampling / Logging / `includeContext`（未使用）、HTTP+SSE トランスポート（Streamable HTTP のみを提供しているため未露出）。
+
 **GitHub App 前提条件:**
 
 - 使用する upstream endpoint: `https://github.com/login/oauth/authorize`（web）, `POST https://github.com/login/oauth/access_token`
@@ -235,10 +259,11 @@ Worker は GitHub の web OAuth flow をホストする独自実装を備える�
 
 | ID | 制約 |
 |----|------|
-| N3.1 | WebhookStore / McpAgent DO はテナント別インスタンス（`idFromName("store-{accountId}")` / `getAgentByName("tenant-{accountId}")`）で動作する。TenantRegistry DO は単一インスタンスで全テナントの installation-account マッピングを管理する |
-| N3.4 | Web OAuth callback 処理時に `GET /user/installations` で取得した accessible_account_ids（ユーザー + org）を GitHubUserProps に保存し、McpAgent が複数 store を並列クエリして結果をマージする。これにより org インストールのイベントもメンバーの MCP セッションから参照できる |
+| N3.1 | WebhookStore DO はテナント別インスタンス（`idFromName("store-{accountId}")`）で動作する。MCP 側にテナント別インスタンスは無い（2026-07-28 でセッションが消え、リクエストごとの props から store 名を解決する）。TenantRegistry DO は単一インスタンスで全テナントの installation-account マッピングを管理する |
+| N3.4 | Web OAuth callback 処理時に `GET /user/installations` で取得した accessible_account_ids（ユーザー + org）を GitHubUserProps に保存し、MCP ツールが複数 store を並列クエリして結果をマージする。これにより org インストールのイベントもメンバーからも参照できる。accessible_account_ids はリクエストごとの props から読む |
 | N3.2 | WebSocket / SSE 接続は DO のメモリ内で管理される（DO eviction 時に切断） |
-| N3.3 | ローカルブリッジはツール呼び出しごとに Worker セッションを再利用する（セッション失効時は自動リトライ） |
+| N3.3 | Worker とブリッジのあいだにセッションは無い（2026-07-28 ステートレスコア、#249）。ブリッジが再利用するのは MCP クライアントとその transport であり、切断のコストは再接続一回に閉じる |
+| N3.5 | Worker は 2026-07-28 のみを提供し、2025 系リクエスト（`initialize` を含む）を `legacy: "reject"` で拒否する。互換レーンは持たない（#249 決定 1）。ブリッジのクライアント面も同じ版に pin する |
 
 ## Dependencies
 
@@ -246,8 +271,8 @@ Worker は GitHub の web OAuth flow をホストする独自実装を備える�
 
 | パッケージ | 用途 |
 |-----------|------|
-| agents | Cloudflare Agents SDK (McpAgent) |
-| @modelcontextprotocol/sdk | MCP SDK |
+| agents | Cloudflare Agents SDK (`createMcpHandler` — Worker 向けステートレス MCP ハンドラ) |
+| @modelcontextprotocol/server | MCP SDK v2 サーバー（プロトコル版 2026-07-28。`agents` が非 optional peer として exact 2.0.0 を要求するため exact 固定） |
 | zod | スキーマバリデーション |
 
 OAuth 実装は自前（`worker/src/oauth.ts` + `worker/src/oauth-store.ts`）。`@cloudflare/workers-oauth-provider` は v0.11.0 で撤去済み。v0.11.1 で Worker-hosted web OAuth に切り替え（device authorization grant は撤去）。
@@ -256,7 +281,8 @@ OAuth 実装は自前（`worker/src/oauth.ts` + `worker/src/oauth-store.ts`）�
 
 | パッケージ | 用途 |
 |-----------|------|
-| @modelcontextprotocol/sdk | MCP SDK（`Server` クラス直接使用） |
+| @modelcontextprotocol/sdk | MCP SDK v1（Claude Desktop に対するサーバー面。`Server` クラス直接使用） |
+| @modelcontextprotocol/client | MCP SDK v2 クライアント（Worker に対するクライアント面。版 2026-07-28 に pin） |
 
 Node.js >= 18.0.0 が必要。
 
@@ -344,7 +370,8 @@ npx のキャッシュ解決挙動そのものは本リポジトリの管理外�
 | パス | 用途 |
 |-----|------|
 | `worker/src/index.ts` | Cloudflare Worker エントリポイント |
-| `worker/src/agent.ts` | WebhookMcpAgent DO（MCP ツール定義、テナント別インスタンス） |
+| `worker/src/mcp.ts` | MCP サーバー factory（ツール定義。リクエストごとに生成、テナントは props から解決） |
+| `worker/src/retired-do.ts` | 退役した WebhookMcpAgent クラス（過去 migration 制約のためだけに残す） |
 | `worker/src/store.ts` | WebhookStore DO（SQLite + SSE、テナント別インスタンス） |
 | `worker/src/tenant.ts` | TenantRegistry DO（installation-account マッピング、クォータ管理） |
 | `worker/src/oauth.ts` | Worker-hosted web OAuth 自前実装（metadata / register / authorize / callback / token / 独自 token 検証 middleware） |

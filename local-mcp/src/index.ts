@@ -17,6 +17,15 @@
  *      a sibling Claude Code process may have refreshed already, so we adopt
  *      its rotation rather than starting a fresh web flow.
  *
+ * The bridge has two independent protocol faces (issue #249):
+ *
+ *   Claude Desktop -> bridge : SDK v1 stdio server, 2025-era. Unchanged.
+ *   bridge -> Worker         : SDK v2 client pinned to protocol revision
+ *                              2026-07-28. Stateless — no `initialize`
+ *                              handshake and no `mcp-session-id`; every
+ *                              request carries the per-request `_meta`
+ *                              envelope the revision requires.
+ *
  * Discord MCP pattern: data lives in the cloud, local MCP is a thin bridge.
  */
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -25,6 +34,7 @@ import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
+import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
 import WebSocket from "ws";
 import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { homedir, platform as osPlatform } from "node:os";
@@ -645,95 +655,88 @@ async function getAccessTokenForToolCall(): Promise<string> {
   throw new Error("OAuth web flow did not produce an authorize URL in time.");
 }
 
-async function buildAuthHeaders(
-  token: string | undefined,
-  extra?: Record<string, string>,
-): Promise<Record<string, string>> {
-  const h: Record<string, string> = { ...extra };
-  if (token) h["Authorization"] = `Bearer ${token}`;
-  return h;
-}
+// ── Remote MCP Client (lazy, reused) ─────────────────────────────────────────
+//
+// Protocol revision 2026-07-28, pinned (issue #249). The Worker serves that one
+// revision and rejects every other, so negotiation would only add a round trip
+// and a fallback branch that can never succeed.
+//
+// There is no session here any more: the revision makes every request
+// self-contained, so `getSessionIdWithToken` and the `mcp-session-id` header
+// are gone rather than migrated. The 401 retry that used to be wired by hand
+// around the session is now the transport's, driven by `onUnauthorized`. What
+// stays cached is the client object and its transport, not server state — a
+// dropped connection costs a reconnect, never a lost session.
+//
+// This is the TypeScript twin of `mcp-server/server/remote-client.js`. Keep the
+// two in step; the published bridge is the one users run.
 
-// ── Remote MCP Session (lazy, reused) ────────────────────────────────────────
+/** The single protocol revision the Worker serves. */
+const WORKER_PROTOCOL_VERSION = "2026-07-28";
 
-let _sessionId: string | null = null;
+let _remoteClient: Client | null = null;
+let _connecting: Promise<Client> | null = null;
 
-async function getSessionIdWithToken(token: string): Promise<string> {
-  if (_sessionId) return _sessionId;
+async function getRemoteClient(): Promise<Client> {
+  if (_remoteClient) return _remoteClient;
 
-  const res = await fetch(`${WORKER_URL}/mcp`, {
-    method: "POST",
-    headers: await buildAuthHeaders(token, {
-      "Content-Type": "application/json",
-      "Accept": "application/json, text/event-stream",
-    }),
-    body: JSON.stringify({
-      jsonrpc: "2.0",
-      method: "initialize",
-      params: {
-        protocolVersion: "2024-11-05",
-        capabilities: {},
-        clientInfo: { name: "local-bridge", version: "1.0.0" },
+  // Concurrent tool calls must share one connect attempt, not race two.
+  _connecting ??= (async () => {
+    const next = new Client(
+      { name: "github-webhook-mcp-local-bridge", version: "1.0.0" },
+      { versionNegotiation: { mode: { pin: WORKER_PROTOCOL_VERSION } } },
+    );
+    const transport = new StreamableHTTPClientTransport(new URL(`${WORKER_URL}/mcp`), {
+      authProvider: {
+        token: () => getAccessTokenForToolCall(),
+        onUnauthorized: async () => {
+          _cachedTokens = null;
+          await getAccessTokenForToolCall();
+        },
       },
-      id: "init",
-    }),
-  });
+    });
+    await next.connect(transport);
+    _remoteClient = next;
+    return next;
+  })();
 
-  _sessionId = res.headers.get("mcp-session-id") || "";
-  return _sessionId;
+  try {
+    return await _connecting;
+  } catch (err) {
+    // Let the next call retry from scratch rather than inherit the failure.
+    _connecting = null;
+    throw err;
+  }
 }
 
-async function callRemoteToolWithToken(
+/** Forget the cached client. The next call reconnects. */
+async function resetRemoteClient(): Promise<void> {
+  const stale = _remoteClient;
+  _remoteClient = null;
+  _connecting = null;
+  if (stale) await stale.close().catch(() => {});
+}
+
+async function callRemoteTool(
   name: string,
   args: Record<string, unknown>,
-  token: string,
-  _retried = false,
 ): Promise<{ content: Array<{ type: string; text: string }> }> {
-  const sessionId = await getSessionIdWithToken(token);
+  // Resolve credentials first so an authorization requirement surfaces as
+  // AuthRequiredError from here, where the caller already handles it, rather
+  // than from inside the transport wrapped as a network failure.
+  await getAccessTokenForToolCall();
 
-  const res = await fetch(`${WORKER_URL}/mcp`, {
-    method: "POST",
-    headers: await buildAuthHeaders(token, {
-      "Content-Type": "application/json",
-      "Accept": "application/json, text/event-stream",
-      "mcp-session-id": sessionId,
-    }),
-    body: JSON.stringify({
-      jsonrpc: "2.0",
-      method: "tools/call",
-      params: { name, arguments: args },
-      id: crypto.randomUUID(),
-    }),
-  });
-
-  // 401 = token expired or revoked. Clear session + token cache and retry
-  // once with a freshly acquired token (refresh or full flow).
-  if (res.status === 401) {
-    if (_retried) {
-      return { content: [{ type: "text", text: "Authentication failed after retry. Please re-authenticate." }] };
-    }
-    _cachedTokens = null;
-    _sessionId = null;
-    const freshToken = await getAccessTokenForToolCall();
-    return callRemoteToolWithToken(name, args, freshToken, true);
+  const client = await getRemoteClient();
+  try {
+    return (await client.callTool({ name, arguments: args })) as {
+      content: Array<{ type: string; text: string }>;
+    };
+  } catch (err) {
+    // A dead transport would otherwise be cached forever. Dropping it costs
+    // one reconnect on the next call; keeping it costs every later call.
+    await resetRemoteClient();
+    throw err;
   }
-
-  const text = await res.text();
-
-  // Streamable HTTP may return SSE format
-  const dataLine = text.split("\n").find(l => l.startsWith("data: "));
-  const json = dataLine ? JSON.parse(dataLine.slice(6)) : JSON.parse(text);
-
-  if (json.error) {
-    // Session expired — retry once with a fresh session
-    if ((json.error.code === -32600 || json.error.code === -32001) && !_retried) {
-      _sessionId = null;
-      return callRemoteToolWithToken(name, args, token, true);
-    }
-    return { content: [{ type: "text", text: JSON.stringify(json.error) }] };
-  }
-
-  return json.result;
 }
 
 // ── MCP Server Setup ─────────────────────────────────────────────────────────
@@ -842,8 +845,7 @@ function formatAuthRequiredResponse(pending: PendingWebAuth): string {
 mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
   try {
-    const token = await getAccessTokenForToolCall();
-    const result = await callRemoteToolWithToken(name, args ?? {}, token);
+    const result = await callRemoteTool(name, args ?? {});
     // First successful tool call confirms OAuth is working
     markOAuthEstablished();
     return result;

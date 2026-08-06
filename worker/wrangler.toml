@@ -17,6 +17,13 @@ PURGE_AFTER_DAYS = "3"
 UNPROCESSED_PURGE_AFTER_DAYS = "90"
 
 [durable_objects]
+# MCP_OBJECT still names WebhookMcpAgent, but that class is a retired stub since
+# the 2026-07-28 stateless flip (#249): /mcp is served per request by
+# createMcpHandler and no session ID resolves to a DO any more. Both the binding
+# and the class stay because the v2 migration below declares the class, and
+# Cloudflare requires every class named by a past migration to exist in the
+# script. Removing them needs a deleted_classes migration — a separate,
+# destructive change. See worker/src/retired-do.ts.
 bindings = [
   { name = "MCP_OBJECT", class_name = "WebhookMcpAgent" },
   { name = "WEBHOOK_STORE", class_name = "WebhookStore" },

@@ -15,10 +15,17 @@ jobs:
         with:
           node-version: "22"
       - run: node --check mcp-server/server/index.js
+      - run: node --check mcp-server/server/remote-client.js
+      # The bridge's deps are installed here, not only in CD: the worker's
+      # protocol contract test imports mcp-server/server/remote-client.js, which
+      # resolves @modelcontextprotocol/client out of mcp-server/node_modules.
+      - name: mcp-server install
+        run: npm ci
+        working-directory: mcp-server
       - name: mcp-server client migration tests
         run: node --test test/*.test.mjs
         working-directory: mcp-server
-      - name: worker install + typecheck + dry-run deploy + OAuth device-flow tests
+      - name: worker install + typecheck + dry-run deploy + unit and contract tests
         run: |
           npm ci
           npm run typecheck

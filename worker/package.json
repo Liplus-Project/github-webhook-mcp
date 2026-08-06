@@ -10,8 +10,8 @@
     "test": "tsx --test test/*.test.ts && vitest run --config vitest.workers.config.ts"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "1.29.0",
-    "agents": "^0.19.0",
+    "@modelcontextprotocol/server": "2.0.0",
+    "agents": "^0.20.1",
     "zod": "^4.0.0"
   },
   "devDependencies": {
@@ -23,10 +23,11 @@
     "wrangler": "^4.0.0"
   },
   "comments": {
-    "overrides": "Pin @cloudflare/workers-types across the tree to the version the worker code is written against; the vitest-pool-workers toolchain otherwise pulls a newer one whose stricter binding types can break existing src types (types-only; runtime unaffected). Pin @modelcontextprotocol/sdk to exactly 1.29.0 so the tree holds a single copy: agents@0.19.x declares exactly 1.29.0 as well, and a second copy beside it makes McpServer's private _serverInfo incompatible at the type level (types-only). Keep the exact version rather than a ^ range: 1.30.0 is already published (2026-07-27), and since this overrides entry propagates the direct spec across the tree, ^1.29.0 would carry every copy onto a version never checked against agents@0.19.x."
+    "overrides": "Pin @cloudflare/workers-types across the tree to the version the worker code is written against; the vitest-pool-workers toolchain otherwise pulls a newer one whose stricter binding types can break existing src types (types-only; runtime unaffected). The pin is load-bearing, not decorative: agents nests partyserver, whose own peer range this version does not satisfy, so npm arranges the tree around it rather than hoisting a newer copy (issue #252 tracks that state).",
+    "@modelcontextprotocol/server": "Exact, not a range: agents@0.20.x declares this package as a non-optional peer at exactly 2.0.0, so a caret here would let npm resolve a newer copy, nest 2.0.0 under agents/, and reproduce the two-copies type mismatch #239 was opened about. Exact makes the coupling loud — an agents bump that moves the peer fails at install time instead of at tsc.",
+    "@modelcontextprotocol/sdk": "Deliberately absent. The worker no longer imports SDK v1 anywhere after the 2026-07-28 flip (#249); agents still needs it as a required peer, so npm installs it, but this package declares no range of its own to drift against agents' exact pin. The two bridges keep their own SDK v1 dependency for the Claude Desktop face (mcp-server/package.json, local-mcp/package.json)."
   },
   "overrides": {
-    "@cloudflare/workers-types": "$@cloudflare/workers-types",
-    "@modelcontextprotocol/sdk": "$@modelcontextprotocol/sdk"
+    "@cloudflare/workers-types": "$@cloudflare/workers-types"
   }
 }
