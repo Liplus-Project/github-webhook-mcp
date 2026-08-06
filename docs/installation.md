@@ -131,10 +131,11 @@ Cloudflare ダッシュボードから Worker を作成し、GitHub リポジト
 接続後は、リポジトリへの push で自動デプロイが行われます。
 
 デプロイにより以下が自動的に作成されます:
-- **WebhookMcpAgent** Durable Object — MCP ツール提供（テナント別）
 - **WebhookStore** Durable Object — イベント永続化（テナント別）
 - **TenantRegistry** Durable Object — テナント管理（単一インスタンス）
 - SQLite マイグレーションが自動適用
+
+MCP ツールは Durable Object ではなくリクエストごとに提供されます（プロトコル版 2026-07-28 のステートレスコア）。`WebhookMcpAgent` クラスは過去の migration 制約のためだけに残っており、トラフィックは受けません。
 
 ### 3. KV Namespace の作成
 

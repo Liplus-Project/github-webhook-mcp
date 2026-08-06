@@ -15,10 +15,18 @@
  *   POST /oauth/token                              Web-auth polling + refresh_token (oauth.ts)
  *
  *   POST /webhooks/github                          Webhook ingest (no auth)
- *   POST /mcp                                      MCP protocol (Bearer token)
+ *   POST /mcp                                      MCP protocol (Bearer token, revision 2026-07-28, stateless)
  *   GET  /events                                   SSE/WebSocket stream (Bearer token)
+ *
+ * Durable Objects:
+ *   WebhookStore     Per-tenant webhook event store (SQLite-backed)
+ *   TenantRegistry   installation_id -> account mapping
+ *   WebhookMcpAgent  retired MCP-serving class, exported only to satisfy the
+ *                    past-migration constraint (see retired-do.ts)
  */
-import { WebhookMcpAgent } from "./agent.js";
+import { createMcpHandler, type StatelessMcpHandler } from "agents/mcp/server";
+import { createWebhookMcpServer } from "./mcp.js";
+import { WebhookMcpAgent } from "./retired-do.js";
 import { WebhookStore } from "./store.js";
 import { TenantRegistry } from "./tenant.js";
 import {
@@ -104,10 +112,37 @@ async function resolveInstallationTenant(
   return info;
 }
 
-// McpAgent.serve() returns a fetch handler for MCP protocol.
-// It reads ctx.props (set below from the authenticated grant) and passes them
-// to the DO via getAgentByName.
-const mcpHandler = WebhookMcpAgent.serve("/mcp");
+/**
+ * MCP handler for the 2026-07-28 stateless core (issue #249).
+ *
+ * `legacy: "reject"` is the single-lane decision made literal: 2025-era
+ * traffic (`initialize` + `mcp-session-id`) is answered with the
+ * unsupported-protocol-version error naming the one revision this endpoint
+ * serves, rather than being routed to a compatibility lane. There is no
+ * fallback path to go stale.
+ *
+ * The handler is memoized per `env` rather than built at module scope, because
+ * the server factory needs the bindings and `env` only exists inside `fetch`.
+ * A Worker isolate sees one `env`, so this resolves to a single handler in
+ * practice; the WeakMap states that rather than assuming it.
+ *
+ * Per-request tenant identity does NOT come through here. The handler reads
+ * `ctx.props` (rewritten below) and republishes it per request, which `mcp.ts`
+ * reads back via `getMcpAuthContext()`.
+ */
+const mcpHandlers = new WeakMap<Env, StatelessMcpHandler>();
+
+function getMcpHandler(env: Env): StatelessMcpHandler {
+  let handler = mcpHandlers.get(env);
+  if (!handler) {
+    handler = createMcpHandler(() => createWebhookMcpServer(env), {
+      route: "/mcp",
+      legacy: "reject",
+    });
+    mcpHandlers.set(env, handler);
+  }
+  return handler;
+}
 
 /**
  * Top-level fetch handler. Routes OAuth endpoints to oauth.ts, authenticates
@@ -235,13 +270,15 @@ export default {
       }
 
       if (isMcpRoute) {
-        // Rewrite ctx.props to TenantProps shape expected by WebhookMcpAgent.
+        // Rewrite ctx.props to the TenantProps shape the tool handlers read.
         (ctx as unknown as { props: { account_id: number; account_login: string; accessible_account_ids: number[] } }).props = {
           account_id: props.githubUserId,
           account_login: props.githubLogin,
           accessible_account_ids: props.accessibleAccountIds ?? [props.githubUserId],
         };
-        return mcpHandler.fetch(request, env, ctx);
+        // Callable form (not `.fetch`): only this one reads `ctx.props` and
+        // republishes it as the per-request auth context.
+        return getMcpHandler(env)(request, env, ctx);
       }
     }
 

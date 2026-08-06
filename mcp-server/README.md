@@ -4,6 +4,17 @@ Stdio MCP proxy that bridges local MCP clients (Claude Desktop, Claude Code, Cod
 
 This package is the **client-side proxy only**. Webhook ingestion, tenant routing, persistence, and the MCP server itself run on the Worker. See the [main repository](https://github.com/Liplus-Project/github-webhook-mcp) for architecture and self-hosting instructions.
 
+## Breaking change: MCP protocol revision 2026-07-28
+
+From this release the Worker serves **MCP protocol revision 2026-07-28 only**, with no compatibility lane for the previous revision.
+
+- **Proxy versions older than this release stop working.** They open a session with `initialize`, which the Worker no longer answers. The failure is quiet: the proxy does not crash, it returns the protocol error as tool output text.
+- **Real-time channel notifications keep arriving, which hides the breakage.** The `/events` WebSocket stream is not MCP and is unaffected, so a stale proxy still pushes event summaries while every tool call — including `mark_processed` — fails. The pending queue stops being cleared even though notifications look healthy.
+- **Restart the MCP client to pick up the new proxy.** `npx` resolves `@latest` at process start, so an already-running Claude Desktop, Claude Code, or Codex keeps the copy it launched with however new the published version is. Quit it fully and reopen.
+- **Pinning the proxy version leaves you stuck.** If your MCP client config pins a version older than this release, restarting does not help; remove the pin (or move it forward) first.
+
+The proxy's two protocol faces are independent: it still speaks the 2025-era MCP revision to your client over stdio. Only the face toward the Worker moved.
+
 ## What this proxy does
 
 - Speaks stdio MCP locally to your client.
@@ -200,6 +211,7 @@ No localhost port is listened on at any point. The flow works the same way on he
 - **`OAuth state expired before approval. Re-run the client to retry.`** The state token expires after ~10 minutes. Trigger any tool call again to restart the flow.
 - **Browser lands on "Authorization failed" (Worker 502).** The Worker rejected the GitHub code exchange. On self-hosts this usually means the GitHub App's **Callback URL** does not include `https://<your-worker>/oauth/callback`, or `GITHUB_CLIENT_SECRET` is missing / wrong.
 - **`Failed to reach worker`.** Check that `WEBHOOK_WORKER_URL` is correct and reachable from your machine.
+- **Every tool call returns a protocol error, but channel notifications still arrive.** The running proxy predates the 2026-07-28 revision the Worker now serves. Restart the MCP client so `npx` fetches the current version; if your config pins an older version, move the pin forward first. See the breaking-change note at the top of this page.
 - **`Authentication failed after retry`.** Cached tokens were rejected and re-authentication did not succeed. Remove `~/.github-webhook-mcp/oauth-tokens.json` and retry.
 - **Upgrading from v0.10.x / v0.11.0.** Existing tokens files are ignored (flow marker mismatch) and a fresh web-flow authorize URL is emitted on the next tool call. No manual cleanup is required.
 - **No events arriving.** Confirm that the GitHub App is installed on the target account/organization and that webhook deliveries are succeeding on the GitHub App's *Advanced* → *Recent Deliveries* page. The Worker only sees events for installations linked to your authenticated account.
