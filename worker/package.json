@@ -10,8 +10,8 @@
     "test": "tsx --test test/*.test.ts && vitest run --config vitest.workers.config.ts"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "1.26.0",
-    "agents": "^0.8.0",
+    "@modelcontextprotocol/sdk": "1.29.0",
+    "agents": "^0.19.0",
     "zod": "^4.0.0"
   },
   "devDependencies": {
@@ -23,7 +23,7 @@
     "wrangler": "^4.0.0"
   },
   "comments": {
-    "overrides": "Pin @cloudflare/workers-types across the tree to the version the worker code is written against; the vitest-pool-workers toolchain otherwise pulls a newer one whose stricter binding types can break existing src types (types-only; runtime unaffected). Pin @modelcontextprotocol/sdk to 1.26.0 so the tree holds a single copy: agents@0.8.2 nests its own 1.26.0, and a separate worker-direct copy made McpServer's private _serverInfo incompatible at the type level (types-only; 1.26/1.27 are runtime-compatible)."
+    "overrides": "Pin @cloudflare/workers-types across the tree to the version the worker code is written against; the vitest-pool-workers toolchain otherwise pulls a newer one whose stricter binding types can break existing src types (types-only; runtime unaffected). Pin @modelcontextprotocol/sdk to exactly 1.29.0 so the tree holds a single copy: agents@0.19.x declares exactly 1.29.0 as well, and a second copy beside it makes McpServer's private _serverInfo incompatible at the type level (types-only). Keep the exact version rather than a ^ range: 1.30.0 is already published (2026-07-27), and since this overrides entry propagates the direct spec across the tree, ^1.29.0 would carry every copy onto a version never checked against agents@0.19.x."
   },
   "overrides": {
     "@cloudflare/workers-types": "$@cloudflare/workers-types",
