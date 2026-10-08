@@ -197,7 +197,7 @@ Worker は GitHub の web OAuth flow をホストする独自実装を備える�
 | F7.8 | KV schema は自前設計: `client:{client_id}` / `web_auth_state:{state}` / `token:{access_token}` / `refresh:{refresh_token}` / `grant:{grant_id}`。device flow 時代の `device:` / `user_code:` キーは撤去 |
 | F7.9 | ローカルブリッジは authorize URL を platform 既定のブラウザで自動オープンする。Windows は `cmd /c start`、macOS は `open`、Linux は `xdg-open` を使う。オープン失敗は fatal にしない（stderr に警告を残し、URL は応答と stderr で伝える） |
 | F7.10 | ローカルブリッジは初回ツール呼び出しで web flow が完了していない場合、polling をバックグラウンドに維持したまま、authorize URL と残り有効秒数を本文に含む `isError: true` の構造化ツール応答を即座に返す。2 回目以降の同一ツール呼び出しは、承認完了なら通常処理、未完了なら同じ auth-required 応答を返す（ポーリングは 1 本に serialize） |
-| F7.11 | ローカルブリッジは refresh 時に `invalid_grant` を受けた場合、直ちに全面 re-auth に遷移せず tokens file を再読み込みする。別プロセスが既に rotation を完了していれば、その最新 refresh_token を採用して再試行する（RC1: refresh desync の最小 fix。file lock は導入しない） |
+| F7.11 | ローカルブリッジは refresh の `invalid_grant` 後、共有 tokens file を直ちに再読込し、最大 1 秒の待機予算内で 50 ms 間隔に再読込する。この予算はファイル更新待ちの期限であり、既存の refresh 通信の所要時間上限は変更しない。新しい refresh_token の世代を見つけたら、有効な access token（期限なし、または期限まで 5 分超）があれば採用し、それ以外は refresh を最大 2 回試す。同じ世代は再試行しない。最初の refresh と回復処理は両 access-token 取得経路で単一のプロセス内 promise を共有し、成功・失敗の双方で解放する。更新なし・欠損・不正なファイル・本物の失効は有界に既存の全面認証／背景認証へ戻り、別種の refresh エラーでは再読込待機をしない。正常 refresh と有効なキャッシュには待機を追加しない。プロセス間 file lock とブラウザ認証共有化は対象外（#258。#242 の過去原因の確定を意味しない） |
 
 **Dynamic Client Registration の位置づけ（#249 で確認、撤去は本 issue の範囲外）:**
 

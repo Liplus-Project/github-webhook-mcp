@@ -503,30 +503,65 @@ function isInvalidGrantError(err: unknown): boolean {
   return body.includes("invalid_grant");
 }
 
-/**
- * RC1 fix: before giving up on a stale refresh_token, re-read the tokens file
- * to see whether a concurrent process already rotated it. If the on-disk
- * refresh_token differs from the one that just failed, adopt it and retry.
- */
+// Only invalid_grant recovery pays this bounded disk-publication wait.
+const REFRESH_RECOVERY_WAIT_MS = 1_000;
+const REFRESH_RECOVERY_INTERVAL_MS = 50;
+const REFRESH_RECOVERY_MAX_ATTEMPTS = 2;
+
 async function tryRefreshViaDiskReread(previousRefreshToken: string): Promise<TokenData | null> {
-  const fresh = await loadTokens();
-  if (!fresh || !fresh.refresh_token) return null;
-  if (fresh.refresh_token === previousRefreshToken) return null;
-  try {
-    const tokens = await refreshAccessToken(fresh.refresh_token);
-    return tokens;
-  } catch (err) {
-    console.error(
-      "[oauth] disk-reread refresh also failed:",
-      err instanceof Error ? err.message : err,
-    );
-    return null;
+  const deadline = Date.now() + REFRESH_RECOVERY_WAIT_MS;
+  const attempted = new Set([previousRefreshToken]);
+  let attempts = 0;
+  while (true) {
+    const fresh = await loadTokens();
+    if (fresh && fresh.refresh_token && !attempted.has(fresh.refresh_token)) {
+      attempted.add(fresh.refresh_token);
+      if (fresh.access_token &&
+          (!fresh.expires_at || fresh.expires_at > Date.now() + 5 * 60_000)) {
+        return fresh;
+      }
+      attempts++;
+      try {
+        return await refreshAccessToken(fresh.refresh_token);
+      } catch (err) {
+        console.error("[oauth] disk-reread refresh also failed:",
+          err instanceof Error ? err.message : err);
+        if (!isInvalidGrantError(err) || attempts >= REFRESH_RECOVERY_MAX_ATTEMPTS) {
+          return null;
+        }
+      }
+    }
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return null;
+    await sleep(Math.min(REFRESH_RECOVERY_INTERVAL_MS, remaining));
   }
 }
 
-/**
- * Get a valid access token, refreshing or re-authenticating as needed.
- */
+function refreshWithRecovery(refreshToken: string): Promise<TokenData> {
+  if (!_refreshLock) {
+    // Capture the failed generation before any caller can replace the cache.
+    _refreshLock = (async () => {
+      try {
+        return await refreshAccessToken(refreshToken);
+      } catch (err) {
+        if (isInvalidGrantError(err)) {
+          const recovered = await tryRefreshViaDiskReread(refreshToken);
+          if (recovered) return recovered;
+        }
+        throw err;
+      }
+    })().then((tokens) => {
+      _cachedTokens = tokens;
+      return tokens;
+    }).finally(() => {
+      // Only the shared operation owns lock release, not its individual waiters.
+      _refreshLock = null;
+    });
+  }
+  return _refreshLock;
+}
+
+/** Get a valid access token, refreshing or re-authenticating as needed. */
 async function getAccessToken(): Promise<string> {
   if (!_cachedTokens) {
     _cachedTokens = await loadTokens();
@@ -540,24 +575,11 @@ async function getAccessToken(): Promise<string> {
     }
 
     if (_cachedTokens.refresh_token) {
-      const previousRefresh = _cachedTokens.refresh_token;
-      if (!_refreshLock) {
-        _refreshLock = refreshAccessToken(previousRefresh);
-      }
       try {
-        _cachedTokens = await _refreshLock;
+        _cachedTokens = await refreshWithRecovery(_cachedTokens.refresh_token);
         return _cachedTokens.access_token;
       } catch (err) {
-        if (isInvalidGrantError(err)) {
-          const reread = await tryRefreshViaDiskReread(previousRefresh);
-          if (reread) {
-            _cachedTokens = reread;
-            return _cachedTokens.access_token;
-          }
-        }
         console.error("[oauth] refresh failed, falling back to full OAuth flow:", (err as Error).message || err);
-      } finally {
-        _refreshLock = null;
       }
     } else {
       console.error("[oauth] no refresh_token available, requiring full OAuth flow");
@@ -601,27 +623,14 @@ async function getAccessTokenForToolCall(): Promise<string> {
     }
 
     if (_cachedTokens.refresh_token) {
-      const previousRefresh = _cachedTokens.refresh_token;
-      if (!_refreshLock) {
-        _refreshLock = refreshAccessToken(previousRefresh);
-      }
       try {
-        _cachedTokens = await _refreshLock;
+        _cachedTokens = await refreshWithRecovery(_cachedTokens.refresh_token);
         return _cachedTokens.access_token;
       } catch (err) {
-        if (isInvalidGrantError(err)) {
-          const reread = await tryRefreshViaDiskReread(previousRefresh);
-          if (reread) {
-            _cachedTokens = reread;
-            return _cachedTokens.access_token;
-          }
-        }
         console.error(
           "[oauth] refresh failed, starting web flow in background:",
           (err as Error).message || err,
         );
-      } finally {
-        _refreshLock = null;
       }
     }
   }

@@ -23,7 +23,8 @@
     "ws": "^8.18.0"
   },
   "devDependencies": {
-    "@anthropic-ai/mcpb": "^2.1.2"
+    "@anthropic-ai/mcpb": "^2.1.2",
+    "typescript": "^5.9.3"
   },
   "engines": {
     "node": ">=18.0.0"
