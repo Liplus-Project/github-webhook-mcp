@@ -124,6 +124,10 @@ Worker のプロトコル版は、本 repo の 2 成果物（Worker と npx ブ�
 
 **F3.1 空状態の silent (empty silent, #221):** `pending_count == 0` の場合はラップせずリモート戻り値をそのまま返す。Claude Code 側で decision schema に一致しない JSON は silent discard されるため、hook 経由の呼び出しで `additionalContext` に何も注入されず、毎ターン空 reminder のノイズが消える。手動 tool 呼び出しではリモートの raw payload (`{pending_count: 0, types: {}, latest_received_at: null}`) が返り、AI は内容を直接判定できる。
 
+**F3.1 Observer mode (#260):** `WEBHOOK_OBSERVER=1` を明示したプロセスは、`get_pending_status` の戻り値を hook decision JSON に変換せず、Worker の raw MCP result（text JSON と存在する structuredContent、`pending_count` / `types` / `latest_received_at`）をそのまま返す。`latest_received_at` は未処理イベント内の最新受信時刻であり、全履歴の最終受信時刻ではない。`tools/list` の当該 tool のみ `_meta: {"io.github.Liplus-Project/github-webhook-mcp/pending-status-observer": 1}` を公開する。通常 mode はこの保証を広告せず、既存の hook 整形と empty-silent を維持する。
+
+Observer mode は既存の有効な保存 access token のみ使用する。token が欠落・不正・期限切れ・HTTP 401 または WebSocket 認証拒否なら、UI/登録/refresh/browser/OAuth polling を開始せず `isError: true` と `auth_required` を返す。tool error の text JSON と structuredContent は `{error: "auth_required", message: "Observer mode requires an existing valid token. Authenticate using a separate CLI process, then retry."}` を持つ。各 token 取得で保存ファイルを一度だけ再読し、外部 CLI の login 後に次の呼出しから回復できる。保存期限が省略された既存 token は拒否されるまで利用可能と扱う。認証拒否された同一 token は再利用しない。背景 WebSocket も同じ token gate を通り、認証失敗時は再接続を停止し、次の成功 tool 呼出しで再開する。通知と `get_event` は維持する。status 呼出しは消費/mark_processed を実行せず、認証・通信失敗をゼロ件に変換しない。token はログやエラーへ出さない。Worker API/DB は変更しない。
+
 **F3.5 バッチ形 (#245):** `mark_processed` が 1 呼び出しにつき 1 イベントしか受けなかったため、自己操作 1 回で 6〜10 件生じる到達確認イベントの消費が呼び出し回数に比例していた。`event_ids: string[]` を追加し、id を明示列挙したまま往復だけ畳む（filter 一括消費は外部イベントを誤って消しうるため採らない）。
 
 - **後方互換:** 既存の単数 `event_id` 呼び出しは戻り値の形も含めて不変。存在しない id でも `success: true` を返す旧挙動を維持する。
