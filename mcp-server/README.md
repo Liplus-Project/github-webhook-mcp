@@ -147,6 +147,7 @@ Notifications are one-way: they include event type, repo, action, title, sender,
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `WEBHOOK_WORKER_URL` | No | `https://github-webhook.smgjp.com` | Base URL of the Cloudflare Worker that exposes the MCP endpoint, the WebSocket stream, and OAuth metadata. |
+| `WEBHOOK_OBSERVER` | No | `0` (disabled) | Set exactly to `1` for raw pending status and noninteractive authentication using an existing saved access token. |
 | `WEBHOOK_CHANNEL` | No | `1` (enabled) | Set to `0` to disable the WebSocket connection and `claude/channel` notifications. |
 
 OAuth client registration and tokens are stored in:
@@ -157,6 +158,24 @@ OAuth client registration and tokens are stored in:
 Delete these files to force a fresh authorization flow.
 
 > **Note on the default Worker URL.** `https://github-webhook.smgjp.com` is a preview instance offered for evaluation. It has no SLA and may change or stop without notice. For production use, deploy your own Worker (see the main repository's [installation guide](https://github.com/Liplus-Project/github-webhook-mcp/blob/main/docs/installation.md)) and set `WEBHOOK_WORKER_URL` accordingly.
+
+### Passive observer connections
+
+Set `WEBHOOK_OBSERVER=1` on a dedicated bridge process to observe pending status without starting authentication UI. Authenticate using a separate normal CLI process first. Observer calls read the saved token file once per credential acquisition, so an external login can recover the connection on the next call. Missing, malformed, expired, or rejected credentials return a tool error with `isError: true` and matching JSON text / `structuredContent`:
+
+```json
+{"error":"auth_required","message":"Observer mode requires an existing valid token. Authenticate using a separate CLI process, then retry."}
+```
+
+Observer mode does not register a client, refresh tokens, open a browser, or start OAuth polling. A saved token with no expiry is accepted until rejected by the server. Authentication failures stop background WebSocket reconnection; after external login, the next successful tool call restarts it. `WEBHOOK_CHANNEL` still controls channel notifications, and `get_event` remains available.
+
+Detect the contract using `tools/list`: only the observer `get_pending_status` entry advertises `_meta: {"io.github.Liplus-Project/github-webhook-mcp/pending-status-observer": 1}`. Its result preserves the Worker's raw JSON text and any `structuredContent`, including nonzero counts:
+
+```json
+{"pending_count":3,"types":{"issues":3},"latest_received_at":"2026-10-19T00:00:00Z"}
+```
+
+`types` maps event names to counts. `latest_received_at` is a timestamp string or `null`, and covers the latest **pending** event, not the full history. Status reads do not consume events or call `mark_processed`. Authentication and network failures are errors, not zero counts. Normal mode does not advertise this metadata; its existing nonzero status hook decision JSON and zero-count raw response remain unchanged. Use a separate process for hook callers that need that normal behavior.
 
 ## Tools exposed
 

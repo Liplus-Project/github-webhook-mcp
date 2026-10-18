@@ -1,4 +1,4 @@
-/** Executes the shipped authentication functions in isolation (docs F7.11).
+/** Executes the shipped authentication functions in isolation (docs F7.11 / F3.1).
  * File reads, refresh transport, clock and OAuth entry are synthetic dependencies;
  * the bridge's top-level stdio startup is deliberately excluded.
  */
@@ -7,6 +7,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import ts from 'typescript';
 import vm from 'node:vm';
+import { AsyncLocalStorage } from 'node:async_hooks';
 
 const sources = [
   ['JS', new URL('../server/index.js', import.meta.url)],
@@ -22,7 +23,7 @@ const usable = (refresh_token = 'rotated') => ({
   flow: 'web', access_token: 'recovered', refresh_token, expires_at: 10_000_000,
 });
 
-async function harness(url, { disk, refresh } = {}) {
+async function harness(url, { disk, refresh, observer = false } = {}) {
   let now = 10_000;
   let reads = 0;
   let fallbacks = 0;
@@ -40,6 +41,7 @@ async function harness(url, { disk, refresh } = {}) {
     }).outputText;
   }
   const context = vm.createContext({
+    OBSERVER_ENABLED: observer, AsyncLocalStorage,
     console: { error() {} },
     Date: { now: () => now },
     setImmediate,
@@ -75,6 +77,34 @@ async function harness(url, { disk, refresh } = {}) {
 }
 
 for (const [language, url] of sources) {
+  for (const entry of ['getAccessToken', 'getAccessTokenForToolCall']) {
+    test(`${language} ${entry}: observer rejects invalid disk credentials with one read and no authentication work`, async () => {
+      for (const value of [null, '{', {}, { ...usable(), flow: 'device' }, { ...usable(), access_token: '' }, { ...usable(), access_token: 42 }, expired(), { ...usable(), expires_at: 'invalid' }, { ...usable(), expires_at: null }]) {
+        const h = await harness(url, { observer: true, disk: () => value });
+        await assert.rejects(h.get(entry), { name: 'ObserverAuthRequiredError' });
+        assert.equal(h.reads(), 1);
+        assert.deepEqual(h.calls, []);
+        assert.equal(h.fallbacks(), 0);
+        assert.deepEqual(h.waits, []);
+      }
+    });
+  }
+  test(`${language}: observer OAuth and refresh entrypoints fail before side effects`, async () => {
+    const source = await readFile(url, 'utf8');
+    const ast = ts.createSourceFile(url.pathname, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+    const names = new Set(['performOAuthFlow', 'refreshAccessToken', 'ObserverAuthRequiredError']);
+    const declarations = ast.statements.filter((node) => names.has(node.name?.getText(ast))).map((node) => node.getText(ast)).join('\n');
+    assert.equal(declarations.includes('async function performOAuthFlow'), true);
+    assert.equal(declarations.includes('async function refreshAccessToken'), true);
+    const compiled = ts.transpileModule(declarations, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
+    const context = vm.createContext({ OBSERVER_ENABLED: true });
+    vm.runInContext(compiled, context);
+    // OAuth dependencies are deliberately absent: reaching them would fail
+    // with ReferenceError instead of the observer auth-required sentinel.
+    for (const call of ['performOAuthFlow()', 'refreshAccessToken("synthetic")']) {
+      await assert.rejects(vm.runInContext(call, context), { name: 'ObserverAuthRequiredError' });
+    }
+  });
   for (const entry of ['getAccessToken', 'getAccessTokenForToolCall']) {
     test(`${language} ${entry}: delayed disk generation and concurrent callers share recovery`, async () => {
       const h = await harness(url, {

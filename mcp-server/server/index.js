@@ -46,6 +46,7 @@ import { join } from "node:path";
 import { createRequire } from "node:module";
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
 import WebSocketClient from "ws";
 import { createRemoteClient } from "./remote-client.js";
 
@@ -56,6 +57,7 @@ const WORKER_URL =
   process.env.WEBHOOK_WORKER_URL ||
   "https://github-webhook.smgjp.com";
 const CHANNEL_ENABLED = process.env.WEBHOOK_CHANNEL !== "0";
+const OBSERVER_ENABLED = process.env.WEBHOOK_OBSERVER === "1";
 
 // ── OAuth Token Storage ──────────────────────────────────────────────────────
 
@@ -302,6 +304,7 @@ async function pollForWebAuthToken(metadata, client, state, expiresInSec) {
  * than each launching their own browser window.
  */
 async function performOAuthFlow() {
+  if (OBSERVER_ENABLED) throw new ObserverAuthRequiredError();
   if (_webAuthLock) {
     return await _webAuthLock;
   }
@@ -395,6 +398,7 @@ async function performOAuthFlow() {
 }
 
 async function refreshAccessToken(refreshToken) {
+  if (OBSERVER_ENABLED) throw new ObserverAuthRequiredError();
   const metadata = await discoverOAuthMetadata();
   const client = await loadClientRegistration();
   if (!client) throw new Error("No client registration found");
@@ -512,7 +516,44 @@ function refreshWithRecovery(refreshToken) {
   return _refreshLock;
 }
 
+// Observer credentials are read once per acquisition; no refresh or polling.
+class ObserverAuthRequiredError extends Error {
+  constructor() {
+    super("Observer mode requires an existing valid token. Authenticate using a separate CLI process, then retry.");
+    this.name = "ObserverAuthRequiredError";
+  }
+}
+
+// Keep the sent credential per request: a sibling call may adopt an external
+// rotation before this request receives its 401.
+const _observerRequest = new AsyncLocalStorage();
+
+let _observerRejectedToken = null;
+
+async function getObserverAccessToken() {
+  const tokens = await loadTokens();
+  if (!tokens || typeof tokens.access_token !== "string" || !tokens.access_token.trim() ||
+      tokens.access_token === _observerRejectedToken ||
+      (tokens.expires_at !== undefined &&
+       (typeof tokens.expires_at !== "number" || !Number.isFinite(tokens.expires_at) || tokens.expires_at <= Date.now()))) {
+    throw new ObserverAuthRequiredError();
+  }
+  _cachedTokens = tokens;
+  return tokens.access_token;
+}
+
+function rejectObserverToken(token = _cachedTokens?.access_token) {
+  if (token) _observerRejectedToken = token;
+  throw new ObserverAuthRequiredError();
+}
+
+function observerAuthRequiredResult() {
+  const error = { error: "auth_required", message: new ObserverAuthRequiredError().message };
+  return { isError: true, structuredContent: error, content: [{ type: "text", text: JSON.stringify(error) }] };
+}
+
 async function getAccessToken() {
+  if (OBSERVER_ENABLED) return getObserverAccessToken();
   if (!_cachedTokens) {
     _cachedTokens = await loadTokens();
   }
@@ -560,6 +601,7 @@ class AuthRequiredError extends Error {
  * surface it in the tool response immediately.
  */
 async function getAccessTokenForToolCall() {
+  if (OBSERVER_ENABLED) return getObserverAccessToken();
   if (!_cachedTokens) {
     _cachedTokens = await loadTokens();
   }
@@ -636,8 +678,14 @@ const remote = createRemoteClient({
   // current one over, and clears the cache when the Worker says it is stale so
   // the next `token()` re-mints.
   authProvider: {
-    token: () => getAccessTokenForToolCall(),
+    token: async () => {
+      const token = await getAccessTokenForToolCall();
+      const request = _observerRequest.getStore();
+      if (request) request.token = token;
+      return token;
+    },
     onUnauthorized: async () => {
+      if (OBSERVER_ENABLED) rejectObserverToken(_observerRequest.getStore()?.token);
       _cachedTokens = null;
       await getAccessTokenForToolCall();
     },
@@ -645,6 +693,9 @@ const remote = createRemoteClient({
 });
 
 async function callRemoteTool(name, args) {
+  if (OBSERVER_ENABLED && !_observerRequest.getStore()) {
+    return _observerRequest.run({}, () => callRemoteTool(name, args));
+  }
   // Resolve credentials first so an authorization requirement surfaces as
   // AuthRequiredError from here, where the caller already handles it, rather
   // than from inside the transport wrapped as a network failure.
@@ -675,6 +726,7 @@ const server = new Server(
 const TOOLS = [
   {
     name: "get_pending_status",
+    ...(OBSERVER_ENABLED ? { _meta: { "io.github.Liplus-Project/github-webhook-mcp/pending-status-observer": 1 } } : {}),
     title: "Get Pending Status",
     description:
       "Get a lightweight snapshot of pending GitHub webhook events. Use this for periodic polling before requesting details.",
@@ -878,11 +930,12 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     const result = await callRemoteTool(name, args ?? {});
     // First successful tool call confirms OAuth is working
     markOAuthEstablished();
-    if (name === "get_pending_status") {
+    if (name === "get_pending_status" && !OBSERVER_ENABLED) {
       return wrapGetPendingStatusAsDecisionJson(result);
     }
     return result;
   } catch (err) {
+    if (err instanceof ObserverAuthRequiredError) return observerAuthRequiredResult();
     if (err instanceof AuthRequiredError) {
       return {
         content: [{ type: "text", text: formatAuthRequiredResponse(err.pending) }],
@@ -890,7 +943,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       };
     }
     return {
-      content: [{ type: "text", text: `Failed to reach worker: ${err}` }],
+      content: [{ type: "text", text: OBSERVER_ENABLED ? "Failed to reach worker." : `Failed to reach worker: ${err}` }],
       isError: true,
     };
   }
@@ -902,7 +955,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
 let _oauthEstablished = false;
 
 function markOAuthEstablished() {
-  if (!_oauthEstablished) {
+  if (!_oauthEstablished || (OBSERVER_ENABLED && !_wsConnected)) {
     _oauthEstablished = true;
     if (CHANNEL_ENABLED && !_wsConnected) {
       process.stderr.write("[github-webhook-mcp] OAuth established, starting WebSocket connection\n");
@@ -926,6 +979,12 @@ async function connectWebSocket() {
     try {
       token = await getAccessToken();
     } catch (err) {
+      if (OBSERVER_ENABLED && err instanceof ObserverAuthRequiredError) {
+        _wsConnected = false;
+        _oauthEstablished = false;
+        process.stderr.write("[github-webhook-mcp] WebSocket: auth_required\n");
+        return;
+      }
       process.stderr.write(`[github-webhook-mcp] WebSocket: failed to get access token: ${err}\n`);
       scheduleRetry();
       return;
@@ -943,10 +1002,20 @@ async function connectWebSocket() {
     try {
       ws = new WebSocketClient(wsUrl, { headers: { Authorization: `Bearer ${token}` } });
     } catch (err) {
-      process.stderr.write(`[github-webhook-mcp] WebSocket: failed to create connection: ${err}\n`);
+      process.stderr.write(OBSERVER_ENABLED ? "[github-webhook-mcp] WebSocket: failed to create connection\n" : `[github-webhook-mcp] WebSocket: failed to create connection: ${err}\n`);
       scheduleRetry();
       return;
     }
+
+    let observerAuthRejected = false;
+    if (OBSERVER_ENABLED) ws.on("unexpected-response", (_request, response) => {
+      if (OBSERVER_ENABLED && response.statusCode === 401) {
+        observerAuthRejected = true;
+        _observerRejectedToken = token;
+      }
+      response.resume();
+      ws.terminate();
+    });
 
     ws.on("open", () => {
       retryCount = 0; // Reset backoff on successful connection
@@ -996,6 +1065,13 @@ async function connectWebSocket() {
     ws.on("close", (code) => {
       if (pingTimer) clearInterval(pingTimer);
       pingTimer = null;
+      if (OBSERVER_ENABLED && (observerAuthRejected || code === 1008 || code === 4401)) {
+        _observerRejectedToken = token;
+        _wsConnected = false;
+        _oauthEstablished = false;
+        process.stderr.write("[github-webhook-mcp] WebSocket: auth_required\n");
+        return;
+      }
       if (code === 1008 || code === 4401) {
         // Policy violation or unauthorized — refresh token
         process.stderr.write(`[github-webhook-mcp] WebSocket: closed with code ${code}, refreshing token\n`);
@@ -1007,7 +1083,7 @@ async function connectWebSocket() {
     });
 
     ws.on("error", (err) => {
-      process.stderr.write(`[github-webhook-mcp] WebSocket: error: ${err.message}\n`);
+      process.stderr.write(OBSERVER_ENABLED ? "[github-webhook-mcp] WebSocket: connection error\n" : `[github-webhook-mcp] WebSocket: error: ${err.message}\n`);
       // Will trigger close event, which handles reconnect
     });
   }
@@ -1031,7 +1107,7 @@ if (CHANNEL_ENABLED) {
   // Check if tokens already exist from a previous session.
   // If so, start WebSocket immediately. Otherwise, defer until after the first
   // successful tool call establishes OAuth.
-  loadTokens().then((tokens) => {
+  (OBSERVER_ENABLED ? getObserverAccessToken().then(() => _cachedTokens) : loadTokens()).then((tokens) => {
     if (tokens && tokens.access_token) {
       _cachedTokens = tokens;
       markOAuthEstablished();
