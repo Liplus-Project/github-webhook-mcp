@@ -5,6 +5,7 @@ import { mkdtemp, mkdir, writeFile, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
+import { randomUUID } from "node:crypto";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { WebSocketServer } from "ws";
@@ -32,17 +33,37 @@ async function fixture(t, { twin = false, observer = true, channel = false, toke
   const save = async (value) => writeFile(tokenFile, typeof value === "string" ? value : JSON.stringify(value));
   if (tokens !== undefined) await save(tokens);
   const forbidden = join(home, "forbidden.log");
+  const auditFile = join(home, "audit.jsonl");
+  const fixtureId = randomUUID();
   // Sandbox the real entrypoint's home before any token read; forbid browser spawn.
   const preload = join(home, "sandbox.cjs");
   await writeFile(preload, `const os = require('node:os'); const cp = require('node:child_process'); const spawn = cp.spawn;
+const fs = require('node:fs'); const fsp = require('node:fs/promises'); const readFile = fsp.readFile;
+const audit = (data) => fs.appendFileSync(${JSON.stringify(auditFile)}, JSON.stringify(data) + '\\n');
+fsp.readFile = async (file, ...args) => {
+  let data;
+  try { data = await readFile(file, ...args); } catch (err) { if (file === ${JSON.stringify(tokenFile)}) audit({op:'token-read', present:false}); throw err; }
+  if (file === ${JSON.stringify(tokenFile)}) { let p; try { p = JSON.parse(data); } catch {}
+    audit({op:'token-read', flow:p?.flow, tokenType:typeof p?.access_token, expiryType:typeof p?.expires_at, expiry:p?.expires_at, at:Date.now()}); }
+  return data;
+};
+const fetch = globalThis.fetch;
+globalThis.fetch = (input, init) => { const req = new Request(input, init); req.headers.set('x-observer-test-fixture', ${JSON.stringify(fixtureId)}); audit({op:'fetch', path:new URL(req.url).pathname, method:req.method, hasAuthorization:req.headers.has('authorization')}); return fetch(req); };
 os.homedir = () => ${JSON.stringify(home)};
 cp.spawn = (command, ...args) => { if (['esbuild', 'esbuild.exe'].includes(require('node:path').basename(command))) return spawn(command, ...args); require('node:fs').appendFileSync(${JSON.stringify(forbidden)}, 'spawn\\n'); throw new Error('browser disabled by test'); };
 require('node:module').syncBuiltinESMExports();`);
-  const state = { reject, wsReject, failure: false, holdUnauthorized: false, releaseUnauthorized: null, count: 3, calls: [], upgrades: [], sockets: [], notifications: [] };
+  const state = { reject, wsReject, failure: false, holdUnauthorized: false, releaseUnauthorized: null, count: 3, calls: [], foreignCalls: [], upgrades: [], sockets: [], notifications: [] };
   const http = createServer(async (req, res) => {
     let body = "";
     for await (const chunk of req) body += chunk;
     const rpc = body ? JSON.parse(body) : null;
+    // Ephemeral ports can be reused while another client is still retrying.
+    // Attribute HTTP traffic to the exact child, not just its destination port.
+    if (req.headers["x-observer-test-fixture"] !== fixtureId) {
+      state.foreignCalls.push({ url: req.url, method: rpc?.method, hasAuthorization: !!req.headers.authorization });
+      res.writeHead(409).end("foreign test fixture");
+      return;
+    }
     state.calls.push({ url: req.url, method: rpc?.method, tool: rpc?.params?.name, authorization: req.headers.authorization });
     if (state.holdUnauthorized && rpc?.method === "tools/call" && req.headers.authorization === `Bearer ${SECRET}`) {
       await new Promise((resolve) => { state.releaseUnauthorized = resolve; });
@@ -66,11 +87,12 @@ require('node:module').syncBuiltinESMExports();`);
   });
   await new Promise((r) => http.listen(0, "127.0.0.1", r));
   const root = resolve(import.meta.dirname, "../..");
+  const workerUrl = `http://127.0.0.1:${http.address().port}`;
   const args = ["--require", preload];
   if (twin) args.push("--import", pathToFileURL(join(root, "local-mcp/node_modules/tsx/dist/loader.mjs")).href);
   args.push(join(root, twin ? "local-mcp/src/index.ts" : "mcp-server/server/index.js"));
   const transport = new StdioClientTransport({ command: process.execPath, args, stderr: "pipe", env: {
-    WEBHOOK_WORKER_URL: `http://127.0.0.1:${http.address().port}`, WEBHOOK_CHANNEL: channel ? "1" : "0", WEBHOOK_OBSERVER: observer ? "1" : "0",
+    WEBHOOK_WORKER_URL: workerUrl, WEBHOOK_CHANNEL: channel ? "1" : "0", WEBHOOK_OBSERVER: observer ? "1" : "0",
   } });
   let stderr = "";
   transport.stderr.on("data", (chunk) => { stderr += chunk; });
@@ -84,13 +106,18 @@ require('node:module').syncBuiltinESMExports();`);
     wss.close();
     await new Promise((r) => http.close(r));
     const spawned = await readFile(forbidden, "utf8").catch(() => "");
+    const audit = (await readFile(auditFile, "utf8").catch(() => "")).trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
+    const outgoing = audit.filter((entry) => entry.op === "fetch");
+    if (state.foreignCalls.length) t.diagnostic(`foreign fixture traffic: ${JSON.stringify(state.foreignCalls)}`);
     await rm(home, { recursive: true, force: true });
     assert.equal(spawned, "", "bridge attempted to spawn a browser");
     assert.ok(!stderr.includes(SECRET) && !stderr.includes(REFRESH), "token leaked to stderr");
+    assert.equal(outgoing.length, state.calls.length, "every originating bridge fetch must be tagged and captured");
+    assert.ok(outgoing.every((entry) => entry.path === "/mcp"), "bridge fetch attempted an OAuth endpoint");
     assert.ok(state.calls.every((c) => c.url === "/mcp"), "bridge attempted an OAuth endpoint");
   });
   try { await client.connect(transport); } catch (err) { throw new Error(`${err.message}: ${stderr}`); }
-  return { client, state, save, stderr: () => stderr, call: (name = "get_pending_status", args = {}) => client.callTool({ name, arguments: args }) };
+  return { client, state, save, workerUrl, audit: () => readFile(auditFile, "utf8").catch(() => ""), stderr: () => stderr, call: (name = "get_pending_status", args = {}) => client.callTool({ name, arguments: args }) };
 }
 
 const valid = (access = SECRET) => ({ flow: "web", access_token: access, refresh_token: REFRESH, expires_at: Date.now() + 3600_000 });
@@ -124,6 +151,7 @@ for (const twin of process.env.WEBHOOK_TEST_TWIN === "1" ? [false, true] : [fals
     for (const tokens of [undefined, { ...valid(), expires_at: Date.now() - 1 }, "{bad-json", { ...valid(), access_token: 42 }, { ...valid(), expires_at: "invalid" }, { ...valid(), flow: "device" }]) {
       if (tokens !== undefined) await f.save(tokens);
       authRequired(await f.call());
+      assert.equal(f.state.calls.length, 0, await f.audit());
     }
     assert.equal(f.state.calls.length, 0, JSON.stringify(f.state.calls.map(({ url, method, tool }) => ({ url, method, tool }))));
     assert.equal(f.state.upgrades.length, 0);
@@ -138,6 +166,18 @@ for (const twin of process.env.WEBHOOK_TEST_TWIN === "1" ? [false, true] : [fals
     await wait(150);
     assert.equal(f.state.calls.length, 0);
     assert.equal(f.state.upgrades.length, 0);
+  });
+
+  test(`${label}: foreign client traffic cannot be mistaken for missing-token bridge traffic`, async (t) => {
+    const f = await fixture(t, { twin, channel: true });
+    const foreign = await fetch(`${f.workerUrl}/mcp`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "server/discover" }) });
+    assert.equal(foreign.status, 409);
+    await foreign.text();
+    authRequired(await f.call());
+    assert.equal(f.state.foreignCalls.length, 1);
+    assert.equal(f.state.calls.length, 0);
+    assert.equal(f.state.upgrades.length, 0);
+    assert.ok(!(await f.audit()).includes('"op":"fetch"'));
   });
 
   test(`${label}: rejected HTTP token is blocked until an external replacement`, async (t) => {
