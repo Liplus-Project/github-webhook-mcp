@@ -7,6 +7,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import ts from 'typescript';
 import vm from 'node:vm';
+import { AsyncLocalStorage } from 'node:async_hooks';
 
 const sources = [
   ['JS', new URL('../server/index.js', import.meta.url)],
@@ -40,6 +41,7 @@ async function harness(url, { disk, refresh } = {}) {
     }).outputText;
   }
   const context = vm.createContext({
+    OBSERVER_ENABLED: false, AsyncLocalStorage,
     console: { error() {} },
     Date: { now: () => now },
     setImmediate,

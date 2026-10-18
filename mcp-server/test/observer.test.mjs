@@ -34,23 +34,29 @@ async function fixture(t, { twin = false, observer = true, channel = false, toke
   const forbidden = join(home, "forbidden.log");
   // Sandbox the real entrypoint's home before any token read; forbid browser spawn.
   const preload = join(home, "sandbox.cjs");
-  await writeFile(preload, `const os = require('node:os'); const cp = require('node:child_process');
+  await writeFile(preload, `const os = require('node:os'); const cp = require('node:child_process'); const spawn = cp.spawn;
 os.homedir = () => ${JSON.stringify(home)};
-cp.spawn = () => { require('node:fs').appendFileSync(${JSON.stringify(forbidden)}, 'spawn\\n'); throw new Error('browser disabled by test'); };
+cp.spawn = (command, ...args) => { if (['esbuild', 'esbuild.exe'].includes(require('node:path').basename(command))) return spawn(command, ...args); require('node:fs').appendFileSync(${JSON.stringify(forbidden)}, 'spawn\\n'); throw new Error('browser disabled by test'); };
 require('node:module').syncBuiltinESMExports();`);
-  const state = { reject, wsReject, count: 3, calls: [], upgrades: [], sockets: [], notifications: [] };
+  const state = { reject, wsReject, failure: false, holdUnauthorized: false, releaseUnauthorized: null, count: 3, calls: [], upgrades: [], sockets: [], notifications: [] };
   const http = createServer(async (req, res) => {
     let body = "";
     for await (const chunk of req) body += chunk;
     const rpc = body ? JSON.parse(body) : null;
     state.calls.push({ url: req.url, method: rpc?.method, tool: rpc?.params?.name, authorization: req.headers.authorization });
+    if (state.holdUnauthorized && rpc?.method === "tools/call" && req.headers.authorization === `Bearer ${SECRET}`) {
+      await new Promise((resolve) => { state.releaseUnauthorized = resolve; });
+      res.writeHead(401).end(SECRET);
+      return;
+    }
     if (state.reject) { res.writeHead(401).end(SECRET); return; }
+    if (state.failure) { res.writeHead(500).end(`${SECRET} ${REFRESH}`); return; }
     if (req.url !== "/mcp") { res.writeHead(500).end("unexpected OAuth request"); return; }
     const result = rpc.method === "server/discover"
       ? { supportedVersions: ["2026-07-28"], capabilities: { tools: {} } }
       : toolResult(rpc.params.name === "get_pending_status" ? raw(state.count) : { event_id: "event-1", payload: { action: "opened" } });
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ jsonrpc: "2.0", id: rpc.id, result }));
+    res.end(JSON.stringify({ jsonrpc: "2.0", id: rpc.id, result: rpc.method === "tools/call" ? { ...result, resultType: "complete" } : result }));
   });
   const wss = new WebSocketServer({ noServer: true });
   http.on("upgrade", (req, socket, head) => {
@@ -71,7 +77,9 @@ require('node:module').syncBuiltinESMExports();`);
   const client = new Client({ name: "observer-contract-test", version: "1.0.0" });
   client.fallbackNotificationHandler = async (notification) => state.notifications.push(notification);
   t.after(async () => {
+    state.releaseUnauthorized?.();
     await client.close();
+    await transport.close();
     for (const ws of state.sockets) ws.terminate();
     wss.close();
     await new Promise((r) => http.close(r));
@@ -81,7 +89,7 @@ require('node:module').syncBuiltinESMExports();`);
     assert.ok(!stderr.includes(SECRET) && !stderr.includes(REFRESH), "token leaked to stderr");
     assert.ok(state.calls.every((c) => c.url === "/mcp"), "bridge attempted an OAuth endpoint");
   });
-  await client.connect(transport);
+  try { await client.connect(transport); } catch (err) { throw new Error(`${err.message}: ${stderr}`); }
   return { client, state, save, stderr: () => stderr, call: (name = "get_pending_status", args = {}) => client.callTool({ name, arguments: args }) };
 }
 
@@ -95,7 +103,9 @@ function authRequired(result) {
   assert.ok(!JSON.stringify(result).includes("authorize_url"));
 }
 
-for (const twin of [false, true]) {
+// CI exercises the distributed entrypoint. Opt in to repeat against the TS
+// twin after `npm ci` in local-mcp; this does not add a CI runtime dependency.
+for (const twin of process.env.WEBHOOK_TEST_TWIN === "1" ? [false, true] : [false]) {
   const label = twin ? "development twin" : "published bridge";
   test(`${label}: observer metadata and raw nonzero/zero result; get_event remains available`, async (t) => {
     const f = await fixture(t, { twin, tokens: valid() });
@@ -115,7 +125,7 @@ for (const twin of [false, true]) {
       if (tokens !== undefined) await f.save(tokens);
       authRequired(await f.call());
     }
-    assert.equal(f.state.calls.length, 0);
+    assert.equal(f.state.calls.length, 0, JSON.stringify(f.state.calls.map(({ url, method, tool }) => ({ url, method, tool }))));
     assert.equal(f.state.upgrades.length, 0);
     await f.save(valid());
     assert.deepEqual(await f.call(), toolResult(raw(3)));
@@ -146,6 +156,50 @@ for (const twin of [false, true]) {
     await f.call();
     f.state.reject = true;
     authRequired(await f.call());
+  });
+
+  test(`${label}: a late 401 rejects its sent token without rejecting a concurrent external rotation`, async (t) => {
+    const f = await fixture(t, { twin, tokens: valid() });
+    await f.call();
+    f.state.holdUnauthorized = true;
+    const oldRequest = f.call();
+    await until(() => f.state.releaseUnauthorized);
+    await f.save(valid("replacement-token"));
+    assert.deepEqual(await f.call(), toolResult(raw(3)));
+    f.state.releaseUnauthorized();
+    authRequired(await oldRequest);
+    assert.deepEqual(await f.call(), toolResult(raw(3)));
+  });
+
+  test(`${label}: communication errors do not become zero or leak response secrets`, async (t) => {
+    const f = await fixture(t, { twin, tokens: valid() });
+    await f.call();
+    f.state.failure = true;
+    const result = await f.call();
+    assert.equal(result.isError, true);
+    assert.equal(result.content[0].text, "Failed to reach worker.");
+    assert.equal(result.structuredContent, undefined);
+    assert.ok(!JSON.stringify(result).includes(SECRET));
+    assert.ok(!JSON.stringify(result).includes(REFRESH));
+  });
+
+  test(`${label}: observer accepts unexpired tokens inside normal refresh window and tokens without expiry`, async (t) => {
+    const f = await fixture(t, { twin, tokens: { ...valid(), expires_at: Date.now() + 60_000 } });
+    assert.deepEqual(await f.call(), toolResult(raw(3)));
+    const tokens = valid();
+    delete tokens.expires_at;
+    await f.save(tokens);
+    assert.deepEqual(await f.call(), toolResult(raw(3)));
+  });
+
+  test(`${label}: simultaneous status calls share one in-flight WebSocket`, async (t) => {
+    const f = await fixture(t, { twin, channel: true });
+    await f.save(valid());
+    const results = await Promise.all(Array.from({ length: 8 }, () => f.call()));
+    for (const result of results) assert.deepEqual(result, toolResult(raw(3)));
+    await until(() => f.state.sockets.length === 1);
+    await wait(150);
+    assert.equal(f.state.upgrades.length, 1);
   });
 
   for (const rejection of [401, 1008, 4401]) {
@@ -184,6 +238,7 @@ test("normal published bridge retains hook wrapping and does not advertise obser
   const f = await fixture(t, { observer: false, tokens: valid() });
   assert.equal((await f.client.listTools()).tools.find((x) => x.name === "get_pending_status")._meta?.[META], undefined);
   const result = await f.call();
+  assert.ok(!result.isError, JSON.stringify(result));
   assert.equal(JSON.parse(result.content[0].text).hookSpecificOutput.hookEventName, "UserPromptSubmit");
   assert.match(JSON.parse(result.content[0].text).hookSpecificOutput.additionalContext, /3 pending/);
   f.state.count = 0;

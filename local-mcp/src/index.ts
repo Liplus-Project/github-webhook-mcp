@@ -41,6 +41,7 @@ import { homedir, platform as osPlatform } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
 
 const WORKER_URL = process.env.WEBHOOK_WORKER_URL || "https://github-webhook.smgjp.com";
 const CHANNEL_ENABLED = process.env.WEBHOOK_CHANNEL !== "0";
@@ -336,6 +337,7 @@ async function pollForWebAuthToken(
  * than each launching their own browser window.
  */
 async function performOAuthFlow(): Promise<TokenData> {
+  if (OBSERVER_ENABLED) throw new ObserverAuthRequiredError();
   if (_webAuthLock) {
     return await _webAuthLock;
   }
@@ -440,6 +442,7 @@ interface RefreshError extends Error {
 }
 
 async function refreshAccessToken(refreshToken: string): Promise<TokenData> {
+  if (OBSERVER_ENABLED) throw new ObserverAuthRequiredError();
   const metadata = await discoverOAuthMetadata();
   const client = await loadClientRegistration();
   if (!client) throw new Error("No client registration found");
@@ -570,6 +573,10 @@ class ObserverAuthRequiredError extends Error {
     this.name = "ObserverAuthRequiredError";
   }
 }
+
+// Keep the sent credential per request: a sibling call may adopt an external
+// rotation before this request receives its 401.
+const _observerRequest = new AsyncLocalStorage<{ token?: string }>();
 
 let _observerRejectedToken: string | null = null;
 
@@ -732,9 +739,14 @@ async function getRemoteClient(): Promise<Client> {
     );
     const transport = new StreamableHTTPClientTransport(new URL(`${WORKER_URL}/mcp`), {
       authProvider: {
-        token: () => getAccessTokenForToolCall(),
+        token: async () => {
+          const token = await getAccessTokenForToolCall();
+          const request = _observerRequest.getStore();
+          if (request) request.token = token;
+          return token;
+        },
         onUnauthorized: async () => {
-          if (OBSERVER_ENABLED) rejectObserverToken();
+          if (OBSERVER_ENABLED) rejectObserverToken(_observerRequest.getStore()?.token);
           _cachedTokens = null;
           await getAccessTokenForToolCall();
         },
@@ -766,6 +778,9 @@ async function callRemoteTool(
   name: string,
   args: Record<string, unknown>,
 ): Promise<{ content: Array<{ type: string; text: string }> }> {
+  if (OBSERVER_ENABLED && !_observerRequest.getStore()) {
+    return _observerRequest.run({}, () => callRemoteTool(name, args));
+  }
   // Resolve credentials first so an authorization requirement surfaces as
   // AuthRequiredError from here, where the caller already handles it, rather
   // than from inside the transport wrapped as a network failure.

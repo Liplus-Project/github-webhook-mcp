@@ -120,7 +120,7 @@ Worker のプロトコル版は、本 repo の 2 成果物（Worker と npx ブ�
 | F3.4 | `get_webhook_events` | limit (1-100, default 20) | 未処理イベント配列 | 未処理イベントをフルペイロード付きで返す |
 | F3.5 | `mark_processed` | event_id **または** event_ids (1-100) | 単数形: success, event_id, purged／バッチ形: success, marked, failed, results (id 単位の判定), purged | イベントを処理済みにマークし、保持期間超過の処理済みイベントを自動削除する。`purged` は今回削除された件数 |
 
-**F3.1 ローカルブリッジ整形:** ローカルブリッジは `get_pending_status` の戻り値を Claude Code UserPromptSubmit hook の decision JSON shape (`hookSpecificOutput.hookEventName="UserPromptSubmit"` + `additionalContext` に pending_count / types / latest_received_at の自然文要約) にラップして返す。これは `type: "mcp_tool"` UserPromptSubmit hook 経由の呼び出しで戻り値が AI 文脈に注入されるための要件であり、手動 tool 呼び出し時も同 shape で返る。リモート (Worker + DO) 側の戻り値構造は変更しない。
+**F3.1 ローカルブリッジ整形:** 通常 mode のローカルブリッジは `get_pending_status` の戻り値を Claude Code UserPromptSubmit hook の decision JSON shape (`hookSpecificOutput.hookEventName="UserPromptSubmit"` + `additionalContext` に pending_count / types / latest_received_at の自然文要約) にラップして返す。これは `type: "mcp_tool"` UserPromptSubmit hook 経由の呼び出しで戻り値が AI 文脈に注入されるための要件であり、手動 tool 呼び出し時も同 shape で返る。リモート (Worker + DO) 側の戻り値構造は変更しない。
 
 **F3.1 空状態の silent (empty silent, #221):** `pending_count == 0` の場合はラップせずリモート戻り値をそのまま返す。Claude Code 側で decision schema に一致しない JSON は silent discard されるため、hook 経由の呼び出しで `additionalContext` に何も注入されず、毎ターン空 reminder のノイズが消える。手動 tool 呼び出しではリモートの raw payload (`{pending_count: 0, types: {}, latest_received_at: null}`) が返り、AI は内容を直接判定できる。
 

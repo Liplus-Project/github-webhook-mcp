@@ -46,6 +46,7 @@ import { join } from "node:path";
 import { createRequire } from "node:module";
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
 import WebSocketClient from "ws";
 import { createRemoteClient } from "./remote-client.js";
 
@@ -303,6 +304,7 @@ async function pollForWebAuthToken(metadata, client, state, expiresInSec) {
  * than each launching their own browser window.
  */
 async function performOAuthFlow() {
+  if (OBSERVER_ENABLED) throw new ObserverAuthRequiredError();
   if (_webAuthLock) {
     return await _webAuthLock;
   }
@@ -396,6 +398,7 @@ async function performOAuthFlow() {
 }
 
 async function refreshAccessToken(refreshToken) {
+  if (OBSERVER_ENABLED) throw new ObserverAuthRequiredError();
   const metadata = await discoverOAuthMetadata();
   const client = await loadClientRegistration();
   if (!client) throw new Error("No client registration found");
@@ -520,6 +523,10 @@ class ObserverAuthRequiredError extends Error {
     this.name = "ObserverAuthRequiredError";
   }
 }
+
+// Keep the sent credential per request: a sibling call may adopt an external
+// rotation before this request receives its 401.
+const _observerRequest = new AsyncLocalStorage();
 
 let _observerRejectedToken = null;
 
@@ -671,9 +678,14 @@ const remote = createRemoteClient({
   // current one over, and clears the cache when the Worker says it is stale so
   // the next `token()` re-mints.
   authProvider: {
-    token: () => getAccessTokenForToolCall(),
+    token: async () => {
+      const token = await getAccessTokenForToolCall();
+      const request = _observerRequest.getStore();
+      if (request) request.token = token;
+      return token;
+    },
     onUnauthorized: async () => {
-      if (OBSERVER_ENABLED) rejectObserverToken();
+      if (OBSERVER_ENABLED) rejectObserverToken(_observerRequest.getStore()?.token);
       _cachedTokens = null;
       await getAccessTokenForToolCall();
     },
@@ -681,6 +693,9 @@ const remote = createRemoteClient({
 });
 
 async function callRemoteTool(name, args) {
+  if (OBSERVER_ENABLED && !_observerRequest.getStore()) {
+    return _observerRequest.run({}, () => callRemoteTool(name, args));
+  }
   // Resolve credentials first so an authorization requirement surfaces as
   // AuthRequiredError from here, where the caller already handles it, rather
   // than from inside the transport wrapped as a network failure.
@@ -987,7 +1002,7 @@ async function connectWebSocket() {
     try {
       ws = new WebSocketClient(wsUrl, { headers: { Authorization: `Bearer ${token}` } });
     } catch (err) {
-      process.stderr.write(`[github-webhook-mcp] WebSocket: failed to create connection: ${err}\n`);
+      process.stderr.write(OBSERVER_ENABLED ? "[github-webhook-mcp] WebSocket: failed to create connection\n" : `[github-webhook-mcp] WebSocket: failed to create connection: ${err}\n`);
       scheduleRetry();
       return;
     }
