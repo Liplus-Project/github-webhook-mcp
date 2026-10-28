@@ -305,9 +305,8 @@ async function pollForWebAuthToken(metadata, client, state, expiresInSec, signal
  * `_pendingWebAuth` as soon as phase 1 resolves; see
  * `getAccessTokenForToolCall()`.
  *
- * Serialization: _webAuthLock ensures that concurrent callers (WebSocket
- * bootstrap racing the first tool call) share a single authorize URL rather
- * than each launching their own browser window.
+ * _webAuthLock joins callers within this process; coordinateWebAuth owns the
+ * cross-process election, pending status, bounded lifetime and fenced save.
  */
 async function performOAuthFlow() {
   if (OBSERVER_ENABLED) throw new ObserverAuthRequiredError();
@@ -607,7 +606,7 @@ async function getAccessTokenForToolCall() {
     await sleep(100);
   }
 
-  if (!_webAuthLock && !_pendingWebAuthError && _cachedTokens?.access_token) return _cachedTokens.access_token;
+  if (!_webAuthLock && !_pendingWebAuth && !_pendingWebAuthError && _cachedTokens?.access_token) return _cachedTokens.access_token;
 
   if (_pendingWebAuthError && !_pendingWebAuth) {
     throw new Error(`OAuth web flow failed: ${_pendingWebAuthError}`);

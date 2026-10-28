@@ -105,7 +105,7 @@ export async function coordinateWebAuth({ workerUrl, tokenDir, runOwner, onPendi
     const server = createServer((req, res) => {
       const supplied = req.headers["x-web-auth-capability"];
       if (req.method !== "POST" || req.url !== "/status" || typeof supplied !== "string" ||
-          supplied.length !== record.capability.length ||
+          !/^[a-f0-9]{64}$/.test(supplied) ||
           !timingSafeEqual(Buffer.from(supplied), Buffer.from(record.capability))) {
         res.writeHead(403).end();
         return;

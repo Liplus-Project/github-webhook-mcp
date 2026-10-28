@@ -26,6 +26,8 @@ v0.11.1 以降、MCP クライアントは **Worker-hosted web OAuth flow** で�
 
 Claude Code / Claude Desktop のチャット上には、おおよそ次のような応答が表示されます:
 
+同じ OS アカウント・Worker URL・認証保存領域の複数 bridge は、1 つのブラウザ認証と pending URL を共有します。tool は URL の生成を最大 15 秒待ち、承認 poll は背景で最大 600 秒続けます。内部調停は `127.0.0.1` のみに listen し、制限された `~/.github-webhook-mcp/web-auth-<scope>.json` 内のランダム capability で全要求を認証します。この listener では OAuth 資格情報を送受信しません。owner の終了/期限切れ後は回復できます。loopback が禁止された環境や scope 由来 port の衝突時は、別 flow を起動せず再試行可能な調停エラーになります。既存 global token/client cache を Worker 別の保存へ移行する変更ではありません。
+
 ```
 OAuth authorization required.
 

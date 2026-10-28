@@ -222,10 +222,15 @@ The Worker purges stored events automatically so Durable Object storage stays bo
 6. The Worker resolves your accessible GitHub installations (your user account plus any organizations where the GitHub App is installed) and binds them to the OAuth session, so events from any of those tenants surface through the same MCP session.
 7. Subsequent calls reuse the access token and silently refresh it five minutes before expiry. On `401` from the Worker or `invalid_grant` during refresh, the proxy first re-reads its tokens file (in case a sibling process has already rotated) and only falls back to a fresh web flow when no newer refresh token is on disk.
 
-No localhost port is listened on at any point. The flow works the same way on headless hosts and across concurrent MCP client instances.
+Concurrent bridges for the same OS user, normalized Worker URL and real authentication directory share one web flow. Only its owner registers, opens a browser, polls and saves tokens; other bridges return the same pending URL and expiry, then validate the saved scope/generation before continuing. Tool calls keep the 15-second startup limit and do not wait for the 600-second approval window. Observer mode remains read-only; refresh recovery is unchanged.
+
+The owner holds an exclusive listener on `127.0.0.1`, on one port derived from that scope's hash. This is private coordination, while the OAuth callback remains on the Worker. Every IPC request requires a random capability from a restrictive `~/.github-webhook-mcp/web-auth-<scope>.json` record. Neither OAuth credentials nor unauthorized URL/state metadata are returned over IPC. Owner exit releases the listener; expiry aborts and fences its writes. A healthy owner repairs a damaged record; a replacement cannot be deleted or overwritten by its predecessor. Unknown listeners, blocked loopback listening and hash-port collisions fail closed with a retryable coordination error, rather than opening another flow on a different port.
+
+Existing global token/client files still lack issuer metadata; this change does not provide general cross-Worker cache isolation or change DCR/refresh semantics.
 
 ## Troubleshooting
 
+- **`OAuth coordination unavailable; retry the tool call.`** Another local service may occupy the scope-derived port, or local policy may block loopback listening. Retry after the conflicting service/flow ends. Do not delete credential files or expose the listener on another interface.
 - **Authorize URL never appears in the log.** Check the stderr stream of the MCP process (Claude Code surfaces it as the server's log). Look for the `[github-webhook-mcp] OAuth authorization required.` block.
 - **`OAuth state expired before approval. Re-run the client to retry.`** The state token expires after ~10 minutes. Trigger any tool call again to restart the flow.
 - **Browser lands on "Authorization failed" (Worker 502).** The Worker rejected the GitHub code exchange. On self-hosts this usually means the GitHub App's **Callback URL** does not include `https://<your-worker>/oauth/callback`, or `GITHUB_CLIENT_SECRET` is missing / wrong.
