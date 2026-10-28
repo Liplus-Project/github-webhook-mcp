@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
-import { mkdtemp, mkdir, writeFile, readFile, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, writeFile, readFile, rm, readdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -109,6 +109,7 @@ require('node:module').syncBuiltinESMExports();`);
     const audit = (await readFile(auditFile, "utf8").catch(() => "")).trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
     const outgoing = audit.filter((entry) => entry.op === "fetch");
     if (state.foreignCalls.length) t.diagnostic(`foreign fixture traffic: ${JSON.stringify(state.foreignCalls)}`);
+    assert.ok(!(await readdir(tokenDir)).some((name) => name.startsWith("web-auth-")), "observer unexpectedly started coordination");
     await rm(home, { recursive: true, force: true });
     assert.equal(spawned, "", "bridge attempted to spawn a browser");
     assert.ok(!stderr.includes(SECRET) && !stderr.includes(REFRESH), "token leaked to stderr");

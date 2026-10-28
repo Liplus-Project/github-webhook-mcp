@@ -46,6 +46,8 @@ import { join } from "node:path";
 import { createRequire } from "node:module";
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
+import { writeFileSync } from "node:fs";
+import { coordinateWebAuth } from "./web-auth-coordinator.js";
 import { AsyncLocalStorage } from "node:async_hooks";
 import WebSocketClient from "ws";
 import { createRemoteClient } from "./remote-client.js";
@@ -107,8 +109,8 @@ let _pendingWebAuthError = null;
 
 const WEB_AUTH_POLL_GRANT = "urn:ietf:params:oauth:grant-type:web_authorization_poll";
 
-async function discoverOAuthMetadata() {
-  const res = await fetch(`${WORKER_URL}/.well-known/oauth-authorization-server`);
+async function discoverOAuthMetadata(signal) {
+  const res = await fetch(`${WORKER_URL}/.well-known/oauth-authorization-server`, { signal });
   if (!res.ok) {
     throw new Error(`OAuth discovery failed: ${res.status}`);
   }
@@ -124,12 +126,13 @@ async function loadClientRegistration() {
   }
 }
 
-async function saveClientRegistration(reg) {
+async function saveClientRegistration(reg, assertOwner) {
   await mkdir(TOKEN_DIR, { recursive: true });
-  await writeFile(CLIENT_REG_FILE, JSON.stringify(reg, null, 2), { mode: 0o600 });
+  assertOwner();
+  writeFileSync(CLIENT_REG_FILE, JSON.stringify(reg, null, 2), { mode: 0o600 });
 }
 
-async function ensureClientRegistration(metadata) {
+async function ensureClientRegistration(metadata, signal, assertOwner) {
   const existing = await loadClientRegistration();
   // Accept any client registration that already lists our web-auth poll grant.
   // Legacy device-flow or authorization-code clients get re-registered so the
@@ -144,6 +147,7 @@ async function ensureClientRegistration(metadata) {
   }
 
   const res = await fetch(metadata.registration_endpoint, {
+    signal,
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -159,7 +163,7 @@ async function ensureClientRegistration(metadata) {
   }
 
   const reg = await res.json();
-  await saveClientRegistration(reg);
+  await saveClientRegistration(reg, assertOwner);
   return reg;
 }
 
@@ -230,7 +234,7 @@ function openBrowser(url) {
  * the state expires. The Worker mirrors RFC 8628's polling error shape so we
  * can surface `authorization_pending` without exposing the poll to the user.
  */
-async function pollForWebAuthToken(metadata, client, state, expiresInSec) {
+async function pollForWebAuthToken(metadata, client, state, expiresInSec, signal) {
   const endpoint = metadata.token_endpoint || `${WORKER_URL}/oauth/token`;
   const interval = 2; // Worker issues Bearer tokens quickly; 2s poll is plenty.
   const deadline = Date.now() + (expiresInSec || 600) * 1000;
@@ -241,6 +245,7 @@ async function pollForWebAuthToken(metadata, client, state, expiresInSec) {
     let res;
     try {
       res = await fetch(endpoint, {
+        signal,
         method: "POST",
         headers: { "Content-Type": "application/x-www-form-urlencoded" },
         body: new URLSearchParams({
@@ -250,6 +255,7 @@ async function pollForWebAuthToken(metadata, client, state, expiresInSec) {
         }),
       });
     } catch (err) {
+      if (signal.aborted) throw signal.reason;
       // Transient network error — keep polling.
       console.error("[oauth] token poll network error:", err.message || err);
       continue;
@@ -299,102 +305,56 @@ async function pollForWebAuthToken(metadata, client, state, expiresInSec) {
  * `_pendingWebAuth` as soon as phase 1 resolves; see
  * `getAccessTokenForToolCall()`.
  *
- * Serialization: _webAuthLock ensures that concurrent callers (WebSocket
- * bootstrap racing the first tool call) share a single authorize URL rather
- * than each launching their own browser window.
+ * _webAuthLock joins callers within this process; coordinateWebAuth owns the
+ * cross-process election, pending status, bounded lifetime and fenced save.
  */
 async function performOAuthFlow() {
   if (OBSERVER_ENABLED) throw new ObserverAuthRequiredError();
-  if (_webAuthLock) {
-    return await _webAuthLock;
-  }
-
-  // Phase 1: mint state + open the authorize URL. This is local-only (no HTTP
-  // round-trip) so it returns almost immediately.
-  const startPromise = (async () => {
-    const metadata = await discoverOAuthMetadata();
-    const client = await ensureClientRegistration(metadata);
-
-    const state = generateState();
-    const authorizeEndpoint = metadata.authorization_endpoint || `${WORKER_URL}/oauth/authorize`;
-    const authorizeUrl =
-      `${authorizeEndpoint}?client_id=${encodeURIComponent(client.client_id)}` +
-      `&state=${encodeURIComponent(state)}`;
-
-    // Client-side state validity window — keep aligned with Worker's WEB_AUTH_STATE_TTL.
-    const expiresInSec = 600;
-    const expiresAt = Date.now() + expiresInSec * 1000;
-
-    const lines = [
-      "",
-      "[github-webhook-mcp] OAuth authorization required.",
-      `[github-webhook-mcp] Opening: ${authorizeUrl}`,
-      `[github-webhook-mcp] Approve in the browser window; the tab can be closed when done.`,
-      `[github-webhook-mcp] Waiting for approval (state expires in ${expiresInSec}s)...`,
-      "",
-    ];
-    process.stderr.write(lines.join("\n"));
-
-    // Best-effort browser auto-open. Failures are logged to stderr but do
-    // not abort the flow — the URL is still available in the tool response.
-    openBrowser(authorizeUrl);
-
-    _pendingWebAuth = {
-      authorize_url: authorizeUrl,
-      expires_at: expiresAt,
-    };
-    _pendingWebAuthError = null;
-
-    return { metadata, client, state, expiresInSec };
-  })();
-
-  // Phase 2: poll in the background (still inside the same lock promise so
-  // that simultaneous callers await one shared flow). Errors are recorded
-  // and re-thrown so awaiting callers see them.
-  _webAuthLock = (async () => {
-    try {
-      const { metadata, client, state, expiresInSec } = await startPromise;
-      const tokenData = await pollForWebAuthToken(metadata, client, state, expiresInSec);
-
-      if (!tokenData.access_token) {
-        throw new Error(
-          `Token response missing access_token: ${JSON.stringify(tokenData).slice(0, 200)}`,
-        );
-      }
-
-      const tokens = {
-        flow: TOKENS_FLOW_MARKER,
-        access_token: tokenData.access_token,
-        refresh_token: tokenData.refresh_token,
-        expires_at: tokenData.expires_in
-          ? Date.now() + tokenData.expires_in * 1000
-          : undefined,
-      };
-
-      await saveTokens(tokens);
-      _cachedTokens = tokens;
-      _pendingWebAuth = null;
+  if (_webAuthLock) return await _webAuthLock;
+  _pendingWebAuthError = null;
+  const promise = coordinateWebAuth({
+    workerUrl: WORKER_URL, tokenDir: TOKEN_DIR,
+    onPending(pending) {
+      _pendingWebAuth = pending;
       _pendingWebAuthError = null;
-      process.stderr.write("[github-webhook-mcp] OAuth authorization complete.\n");
-      return tokens;
-    } catch (err) {
-      _pendingWebAuth = null;
-      _pendingWebAuthError = err && err.message ? err.message : String(err);
-      throw err;
-    }
-  })();
-
-  const lockPromise = _webAuthLock;
-  lockPromise.finally(() => {
-    if (_webAuthLock === lockPromise) {
-      _webAuthLock = null;
-    }
+    },
+    async runOwner({ signal, assertOwner, pending }) {
+      const metadata = await discoverOAuthMetadata(signal);
+      const client = await ensureClientRegistration(metadata, signal, assertOwner);
+      assertOwner();
+      const state = generateState();
+      const endpoint = metadata.authorization_endpoint || `${WORKER_URL}/oauth/authorize`;
+      const authorizeUrl = `${endpoint}?client_id=${encodeURIComponent(client.client_id)}&state=${encodeURIComponent(state)}`;
+      pending({ authorize_url: authorizeUrl });
+      process.stderr.write([
+        "", "[github-webhook-mcp] OAuth authorization required.",
+        `[github-webhook-mcp] Opening: ${authorizeUrl}`,
+        "[github-webhook-mcp] Approve in the browser window; the tab can be closed when done.",
+        "[github-webhook-mcp] Waiting for approval (state expires in 600s)...", "",
+      ].join("\n"));
+      openBrowser(authorizeUrl);
+      const data = await pollForWebAuthToken(metadata, client, state, 600, signal);
+      if (!data.access_token) throw new Error("Token response missing access_token");
+      return { flow: TOKENS_FLOW_MARKER, access_token: data.access_token,
+        refresh_token: data.refresh_token,
+        expires_at: data.expires_in ? Date.now() + data.expires_in * 1000 : undefined };
+    },
+  }).then((tokens) => {
+    _cachedTokens = tokens;
+    _pendingWebAuth = null;
+    _pendingWebAuthError = null;
+    process.stderr.write("[github-webhook-mcp] OAuth authorization complete.\n");
+    return tokens;
+  }, (err) => {
+    _pendingWebAuth = null;
+    _pendingWebAuthError = err instanceof Error ? err.message : String(err);
+    throw err;
   });
-
-  // Wait for phase 1 so the caller sees _pendingWebAuth populated (or the
-  // startPromise's error) before we return the outer promise.
-  await startPromise;
-  return lockPromise;
+  _webAuthLock = promise;
+  // A rejected finally() child would otherwise be an unhandled rejection.
+  const clear = () => { if (_webAuthLock === promise) _webAuthLock = null; };
+  promise.then(clear, clear);
+  return await promise;
 }
 
 async function refreshAccessToken(refreshToken) {
@@ -647,9 +607,11 @@ async function getAccessTokenForToolCall() {
   // Give phase 1 a little more time to finish. Phase 1 now includes a discovery
   // fetch + (possibly) a register fetch, so allow up to 15s before giving up.
   const phase1Deadline = Date.now() + 15_000;
-  while (!_pendingWebAuth && !_pendingWebAuthError && Date.now() < phase1Deadline) {
+  while (!_pendingWebAuth && !_pendingWebAuthError && _webAuthLock && Date.now() < phase1Deadline) {
     await sleep(100);
   }
+
+  if (!_webAuthLock && !_pendingWebAuth && !_pendingWebAuthError && _cachedTokens?.access_token) return _cachedTokens.access_token;
 
   if (_pendingWebAuthError && !_pendingWebAuth) {
     throw new Error(`OAuth web flow failed: ${_pendingWebAuthError}`);

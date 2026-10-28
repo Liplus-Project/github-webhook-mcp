@@ -24,6 +24,8 @@ Since v0.11.1, MCP clients authenticate through a **Worker-hosted web OAuth flow
 1. **A browser opens automatically** (`https://<worker>/oauth/authorize?client_id=...&state=...` → 302 redirect to the GitHub login page)
 2. **The authorize URL is returned immediately as the tool call response** (it does not wait for polling to finish, so you can retry right away)
 
+Concurrent bridges using the same OS account, Worker URL and authentication directory share one browser flow and pending URL. Tool calls wait at most 15 seconds for that URL, while approval polling continues for up to 600 seconds. Private coordination listens only on `127.0.0.1` and authenticates every request using a random capability in a restrictive `~/.github-webhook-mcp/web-auth-<scope>.json` record; OAuth credentials never cross that listener. Owner exit/expiry permits recovery. If loopback listening is blocked or the scope-derived port conflicts, the bridge fails closed with a retryable coordination error. Existing global token/client caches are not migrated to per-Worker storage.
+
 In the Claude Code / Claude Desktop chat, you will see a response roughly like this:
 
 ```
