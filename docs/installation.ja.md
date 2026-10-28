@@ -1,4 +1,6 @@
-# インストール
+# github-webhook-mcp インストールガイド
+
+言語: [English](installation.md) | 日本語
 
 ## クイックスタート
 
@@ -271,7 +273,9 @@ Webhook エンドポイントへのアクセスを GitHub の IP 範囲に制限
 
 ### 8. チャンネル通知（オプション）
 
-ローカル MCP ブリッジは Claude Code の `claude/channel` 機能をサポートしています。有効にすると、新しい Webhook イベントが SSE 経由でリアルタイムにセッションにプッシュされます。Claude Code CLI でのみ利用可能です。
+ローカル MCP ブリッジは Claude Code の `claude/channel` 機能をサポートしています。有効にすると、ブリッジが Worker の `/events` エンドポイントに WebSocket で接続し、新しい Webhook イベントをリアルタイムにセッションへプッシュします。Claude Code CLI でのみ利用可能です。
+
+Worker の `/events` は通常の GET リクエストに対して SSE ストリームも返します（疎通確認用。ブリッジ自身は WebSocket を使用します）。
 
 MCP クライアント設定で `WEBHOOK_CHANNEL=1` を設定し（上記 [Claude Code CLI](#claude-code-cli--npx) 参照）、チャンネルをロード:
 
@@ -285,7 +289,11 @@ claude --dangerously-load-development-channels server:github-webhook-mcp
 
 1. **Webhook 受信テスト:** GitHub App の設定ページ → **Advanced** → **Recent Deliveries** で配信状況を確認
 2. **MCP 接続テスト:** MCP クライアントから `get_pending_status` ツールを呼び出して応答を確認
-3. **SSE テスト:** `curl -N https://<your-worker>/events` でストリーム接続を確認
+3. **ストリームテスト:** `/events` は Bearer トークンが必須です（トークン無しのリクエストは 401 を返します）。MCP クライアントで一度認証した後、`~/.github-webhook-mcp/oauth-tokens.json` の `access_token` を使います:
+   ```bash
+   curl -N -H "Authorization: Bearer <access_token>" https://<your-worker>/events
+   ```
+   成功すると最初のフレームとして `data: {"status":"connected", ...}` が返ります。ブリッジが使う WebSocket 経路を確認する場合: `wscat -c wss://<your-worker>/events -H "Authorization: Bearer <access_token>"`
 
 ### トラブルシューティング
 
@@ -298,4 +306,5 @@ claude --dangerously-load-development-channels server:github-webhook-mcp
 | Claude Code のログに authorize URL が表示されない | stderr の出力を確認。`[github-webhook-mcp] OAuth authorization required.` のセクションに `Opening: https://<worker>/oauth/authorize?...` が出力されているはず |
 | `~/.github-webhook-mcp/oauth-tokens.json` が無視される | v0.11.1 に更新した際、flow marker が `web` でない旧ファイル（localhost flow / device flow）は自動で無視されます。ブラウザで authorize URL を開いて再認証してください |
 | KV エラーが出る | `wrangler.toml` の KV ID が `wrangler kv namespace create` の出力と一致しているか確認 |
+| `/events` が 401 を返す | Bearer トークンが無い、または無効。`~/.github-webhook-mcp/oauth-tokens.json` の有効な `access_token` を使用（期限切れのトークンは拒否されます） |
 | MCP ツールが応答しない | Worker がデプロイされているか `wrangler tail` でログを確認 |

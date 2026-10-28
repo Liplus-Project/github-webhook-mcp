@@ -1,28 +1,30 @@
-# インストール
+# github-webhook-mcp Installation Guide
 
-## クイックスタート
+Language: English | [Japanese](installation.ja.md)
 
-プレビューインスタンスを使えばすぐに試せます:
+## Quick Start
 
-1. [GitHub Webhook MCP](https://github.com/apps/liplus-webhook-mcp) アプリを GitHub アカウントまたは Organization にインストール
-2. MCP クライアントを設定（下記 [MCP クライアント設定](#mcp-クライアント設定) 参照）:
+You can try it right away with the preview instance:
+
+1. Install the [GitHub Webhook MCP](https://github.com/apps/liplus-webhook-mcp) app on your GitHub account or organization
+2. Configure your MCP client (see [MCP Client Setup](#mcp-client-setup) below):
    - Worker URL: `https://github-webhook.smgjp.com`
-3. Webhook 通知の受信を開始
+3. Start receiving webhook notifications
 
-> **注意:** `github-webhook.smgjp.com` のプレビューインスタンスは評価目的で提供されています。SLA はなく、予告なく変更・停止される場合があります。本番利用の場合は [セルフホスティングガイド](#セルフホスティングガイド) をご覧ください。
+> **Note:** The preview instance at `github-webhook.smgjp.com` is provided for evaluation. It has no SLA and may change or stop without notice. For production use, see the [Self-Hosting Guide](#self-hosting-guide).
 
-## MCP クライアント設定
+## MCP Client Setup
 
-> **前提:** Node.js 18+ が必要です（ローカル MCP ブリッジの実行に使用）。
+> **Prerequisite:** Node.js 18+ is required (used to run the local MCP bridge).
 
-### 初回認証（Web OAuth）
+### First-time authentication (web OAuth)
 
-v0.11.1 以降、MCP クライアントは **Worker-hosted web OAuth flow** で認証します。GitHub 標準のログイン + 2FA（Google Authenticator など見慣れた UX）がそのまま使えます。初回のツール呼び出し時に以下が同時に起きます:
+Since v0.11.1, MCP clients authenticate through a **Worker-hosted web OAuth flow**. The standard GitHub login + 2FA (the familiar UX, e.g. Google Authenticator) works as is. On the first tool call, two things happen at once:
 
-1. **ブラウザが自動で開きます**（`https://<worker>/oauth/authorize?client_id=...&state=...` → GitHub のログイン画面に 302 リダイレクト）
-2. **ツール呼び出しの応答として authorize URL が即座に返ります**（ポーリングの完了を待たず、すぐ retry できる）
+1. **A browser opens automatically** (`https://<worker>/oauth/authorize?client_id=...&state=...` → 302 redirect to the GitHub login page)
+2. **The authorize URL is returned immediately as the tool call response** (it does not wait for polling to finish, so you can retry right away)
 
-Claude Code / Claude Desktop のチャット上には、おおよそ次のような応答が表示されます:
+In the Claude Code / Claude Desktop chat, you will see a response roughly like this:
 
 ```
 OAuth authorization required.
@@ -33,9 +35,9 @@ This link is valid for about 10 minutes.
 A browser window should have opened automatically. Sign in on GitHub, then retry the same tool call — subsequent calls will succeed once authorization completes.
 ```
 
-ブラウザで GitHub にサインインして承認すると、Worker が `/oauth/callback` を受けて「Authorization complete」ページを返します（タブは閉じて構いません）。ローカルブリッジのバックグラウンドポーリングがトークンを受け取り、`~/.github-webhook-mcp/oauth-tokens.json` に保存します。その後同じツールを呼び直すと通常どおり結果が返ります。以降の起動では保存済みトークンが再利用され、期限切れ前に自動でリフレッシュされます。
+After you sign in to GitHub in the browser and approve, the Worker receives `/oauth/callback` and returns an "Authorization complete" page (you can close the tab). The local bridge's background polling receives the token and saves it to `~/.github-webhook-mcp/oauth-tokens.json`. Calling the same tool again then returns results normally. Later launches reuse the saved token, which is refreshed automatically before it expires.
 
-並行して、stderr ログにも同じ情報が出力されます（ログを見たい場合のフォールバック）:
+In parallel, the same information is written to the stderr log (a fallback if you want to look at the logs):
 
 ```
 [github-webhook-mcp] OAuth authorization required.
@@ -44,19 +46,19 @@ A browser window should have opened automatically. Sign in on GitHub, then retry
 [github-webhook-mcp] Waiting for approval (state expires in 600s)...
 ```
 
-> **ブラウザ自動オープンが失敗した場合:** 応答と stderr ログに URL がそのまま残るので、手動でコピーしてブラウザに貼り付けてください。Windows では `start`、macOS では `open`、Linux では `xdg-open` を使用します。
+> **If the browser does not open automatically:** The URL remains in the response and in the stderr log, so copy it and paste it into your browser manually. The bridge uses `start` on Windows, `open` on macOS and `xdg-open` on Linux.
 
-> **v0.11.2 Windows hotfix:** v0.11.1 の Windows 版はブラウザ自動オープン時に authorize URL を cmd.exe にクォート無しで渡していたため、URL に含まれる `&` が command separator として解釈され、`state` パラメータが欠落して `/oauth/authorize` が 400 を返していました。v0.11.2 では URL を `"..."` で囲んで shell 経由で起動するようにしたので、`&` がリテラル扱いされ state が正しくブラウザに届きます。v0.11.1 で自動オープンが機能しなかった Windows ユーザーは v0.11.2 に更新してください（手動 URL コピーは引き続きフォールバックとして動作します）。
+> **v0.11.2 Windows hotfix:** On Windows, v0.11.1 passed the authorize URL to cmd.exe unquoted when auto-opening the browser, so the `&` in the URL was interpreted as a command separator, the `state` parameter was dropped, and `/oauth/authorize` returned 400. v0.11.2 wraps the URL in `"..."` and launches it through the shell, so `&` is treated literally and `state` reaches the browser correctly. Windows users whose auto-open did not work on v0.11.1 should update to v0.11.2 (manual URL copy keeps working as a fallback).
 
-> **旧バージョンからの移行:** v0.11.0 以前（localhost callback flow / device flow どちらも）の `~/.github-webhook-mcp/oauth-tokens.json` は flow marker が一致しないため自動で無視され、初回ツール呼び出し時に新しい web OAuth flow で再認証が走ります。特別な手作業は不要です。
+> **Migrating from older versions:** A `~/.github-webhook-mcp/oauth-tokens.json` from v0.11.0 or earlier (either the localhost callback flow or the device flow) has a non-matching flow marker, so it is ignored automatically and the new web OAuth flow re-authenticates on the first tool call. No manual steps are needed.
 
-### Claude Desktop — デスクトップ拡張 (.mcpb)
+### Claude Desktop — Desktop Extension (.mcpb)
 
-[Releases](https://github.com/Liplus-Project/github-webhook-mcp/releases) から `mcp-server.mcpb` をダウンロード:
+Download `github-webhook-mcp.mcpb` from [Releases](https://github.com/Liplus-Project/github-webhook-mcp/releases):
 
-1. Claude Desktop → **設定** → **拡張機能** → **拡張機能をインストール...**
-2. `.mcpb` ファイルを選択
-3. Worker URL を入力（例: `https://github-webhook-mcp.example.workers.dev`）
+1. Claude Desktop → **Settings** → **Extensions** → **Install Extension...**
+2. Select the `.mcpb` file
+3. Enter the Worker URL (e.g. `https://github-webhook-mcp.example.workers.dev`)
 
 ### Claude Code CLI — npx
 
@@ -76,9 +78,9 @@ A browser window should have opened automatically. Sign in on GitHub, then retry
 }
 ```
 
-`alwaysLoad: true` requires Claude Code v2.1.121 or later. It exempts this server's tools from tool-search deferral so they remain immediately callable every turn (recommended because the server is invoked every turn via the UserPromptSubmit hook).
+`WEBHOOK_CHANNEL=1` enables real-time channel notifications (Claude Code CLI only).
 
-`WEBHOOK_CHANNEL=1` でリアルタイムチャンネル通知を有効化（Claude Code CLI のみ）。
+`alwaysLoad: true` requires Claude Code v2.1.121 or later. It exempts this server's tools from tool-search deferral so they remain immediately callable every turn (recommended because the server is invoked every turn via the UserPromptSubmit hook).
 
 ### Codex — config.toml
 
@@ -92,210 +94,217 @@ WEBHOOK_WORKER_URL = "https://github-webhook-mcp.example.workers.dev"
 WEBHOOK_CHANNEL = "0"
 ```
 
-## セルフホスティングガイド
+## Self-Hosting Guide
 
-独自の Cloudflare Worker インスタンスをデプロイして、Webhook 処理とデータを完全に管理できます。
+Deploy your own Cloudflare Worker instance to keep full control over webhook processing and data.
 
-### 前提条件
+### Prerequisites
 
-| 要件 | 用途 |
+| Requirement | Purpose |
 |------|------|
-| **Cloudflare アカウント** | Worker、Durable Object、KV のホスティング |
-| **GitHub アカウント** | リポジトリの Fork と GitHub App の作成 |
+| **Cloudflare account** | Hosting the Worker, Durable Objects and KV |
+| **GitHub account** | Forking the repository and creating the GitHub App |
 
-### 1. リポジトリの Fork
+### 1. Fork the repository
 
-[github-webhook-mcp](https://github.com/Liplus-Project/github-webhook-mcp) リポジトリを自分の GitHub アカウントに Fork してください。
+Fork the [github-webhook-mcp](https://github.com/Liplus-Project/github-webhook-mcp) repository to your GitHub account.
 
-### 2. Cloudflare Workers & Pages でプロジェクト作成
+### 2. Create a project in Cloudflare Workers & Pages
 
-Cloudflare ダッシュボードから Worker を作成し、GitHub リポジトリと接続します:
+Create a Worker from the Cloudflare dashboard and connect it to your GitHub repository:
 
-1. [Cloudflare ダッシュボード](https://dash.cloudflare.com/) にログイン
-2. **Workers & Pages** → **Create** → **Import a repository** を選択
-3. GitHub アカウントを接続し、Fork したリポジトリを選択
-4. ビルド設定を構成:
+1. Log in to the [Cloudflare dashboard](https://dash.cloudflare.com/)
+2. Select **Workers & Pages** → **Create** → **Import a repository**
+3. Connect your GitHub account and select your fork
+4. Configure the build settings:
 
-| 項目 | 値 |
+| Field | Value |
 |------|-----|
-| **Worker name** | `github-webhook-mcp`（`wrangler.toml` の `name` と一致させること） |
-| **Root directory** | `worker`（モノレポのため、Worker ソースのあるディレクトリを指定） |
+| **Worker name** | `github-webhook-mcp` (must match `name` in `wrangler.toml`) |
+| **Root directory** | `worker` (this is a monorepo; point at the directory holding the Worker source) |
 | **Build command** | `npm install && npx wrangler deploy` |
 
-5. **Save and Deploy** を選択
+5. Select **Save and Deploy**
 
-> **重要:** Worker 名は `wrangler.toml` の `name` フィールドと一致させる必要があります。不一致の場合ビルドが失敗します。
+> **Important:** The Worker name must match the `name` field in `wrangler.toml`. The build fails if they differ.
 
-デプロイが成功すると Worker URL が表示されます（例: `https://github-webhook-mcp.example.workers.dev`）。この URL を以降の手順で使用します。
+When the deploy succeeds, the Worker URL is shown (e.g. `https://github-webhook-mcp.example.workers.dev`). Use this URL in the following steps.
 
-接続後は、リポジトリへの push で自動デプロイが行われます。
+Once connected, pushes to the repository deploy automatically.
 
-デプロイにより以下が自動的に作成されます:
-- **WebhookStore** Durable Object — イベント永続化（テナント別）
-- **TenantRegistry** Durable Object — テナント管理（単一インスタンス）
-- SQLite マイグレーションが自動適用
+The deploy creates the following automatically:
+- **WebhookStore** Durable Object — event persistence (per tenant)
+- **TenantRegistry** Durable Object — tenant management (single instance)
+- SQLite migrations are applied automatically
 
-MCP ツールは Durable Object ではなくリクエストごとに提供されます（プロトコル版 2026-07-28 のステートレスコア）。`WebhookMcpAgent` クラスは過去の migration 制約のためだけに残っており、トラフィックは受けません。
+MCP tools are served per request, not from a Durable Object (the stateless core of protocol version 2026-07-28). The `WebhookMcpAgent` class remains only because of past migration constraints and receives no traffic.
 
-### 3. KV Namespace の作成
+### 3. Create the KV namespace
 
-OAuth トークンの保存に使用する KV Namespace を作成します。
-Cloudflare ダッシュボードから作成する方法と、wrangler CLI で作成する方法があります。
+Create the KV namespace used to store OAuth tokens.
+You can create it from the Cloudflare dashboard or with the wrangler CLI.
 
-**ダッシュボードの場合:**
+**Dashboard:**
 
 1. **Workers & Pages** → **KV** → **Create a namespace**
-2. Namespace 名に `OAUTH_KV` と入力して作成
-3. 作成後に表示される Namespace ID をメモ
+2. Enter `OAUTH_KV` as the namespace name and create it
+3. Note the namespace ID shown after creation
 
-**wrangler CLI の場合:**
+**wrangler CLI:**
 
 ```bash
 cd worker
 npx wrangler kv namespace create OAUTH_KV
 ```
 
-いずれの方法でも、出力される KV Namespace ID を `wrangler.toml` の `PLACEHOLDER_KV_ID` に設定します:
+Either way, set the resulting KV namespace ID in place of `PLACEHOLDER_KV_ID` in `wrangler.toml`:
 
 ```toml
 [[kv_namespaces]]
 binding = "OAUTH_KV"
-id = "<ここに KV Namespace ID を貼り付け>"
+id = "<paste the KV namespace ID here>"
 ```
 
-変更をコミット・push すると、自動デプロイで KV バインディングが反映されます。
+Commit and push the change; the automatic deploy picks up the KV binding.
 
-### 4. GitHub App の作成と設定
+### 4. Create and configure the GitHub App
 
-**GitHub Settings** → **Developer settings** → **GitHub Apps** → **New GitHub App** で新規作成:
+Create a new app under **GitHub Settings** → **Developer settings** → **GitHub Apps** → **New GitHub App**:
 
-#### 基本設定
+#### Basic settings
 
-| 項目 | 値 |
+| Field | Value |
 |------|-----|
-| **App name** | 任意（例: `My Webhook MCP`） |
-| **Homepage URL** | Worker URL または リポジトリ URL |
+| **App name** | Anything (e.g. `My Webhook MCP`) |
+| **Homepage URL** | The Worker URL or the repository URL |
 | **Webhook URL** | `https://<your-worker>/webhooks/github` |
-| **Webhook secret** | 強力なランダム文字列（ステップ 5 で同じ値を設定） |
-| **Content type** | `application/json`（必須） |
+| **Webhook secret** | A strong random string (set the same value in step 5) |
+| **Content type** | `application/json` (required) |
 
-#### OAuth 設定（MCP リモート接続に必要）
+#### OAuth settings (required for MCP remote connections)
 
-v0.11.1 以降、OAuth は **Worker-hosted web flow** で動作します。ローカル MCP クライアントは localhost callback ポートに依存せず、GitHub の redirect_uri は Worker 自身に固定されます。
+Since v0.11.1, OAuth runs as a **Worker-hosted web flow**. Local MCP clients do not depend on a localhost callback port, and GitHub's redirect_uri is fixed to the Worker itself.
 
-1. **Callback URL** に `https://<your-worker>/oauth/callback` を登録してください（必須）
-   - 例: `https://github-webhook-mcp.example.workers.dev/oauth/callback`
-   - カスタムドメインを使う場合はそのドメインの `/oauth/callback` を登録
-   - 複数 URL に対応している GitHub App 設定（Multiple callback URLs 等）を利用する場合は、利用者が実際にアクセスする Worker URL をすべて列挙
-2. **"Enable Device Flow"** は **OFF のままで構いません**（v0.11.1 では使用しません）
-3. Client ID と Client Secret を生成・メモしてください（ステップ 5 で使用）
-4. **Client secret は必須です**（Worker が confidential client として GitHub に code→token 交換を行うため）
+1. Register `https://<your-worker>/oauth/callback` as the **Callback URL** (required)
+   - Example: `https://github-webhook-mcp.example.workers.dev/oauth/callback`
+   - If you use a custom domain, register `/oauth/callback` on that domain
+   - If you use a GitHub App setting that accepts multiple URLs (e.g. Multiple callback URLs), list every Worker URL your users actually access
+2. **"Enable Device Flow"** can **stay OFF** (v0.11.1 does not use it)
+3. Generate and note the Client ID and Client Secret (used in step 5)
+4. **The client secret is required** (the Worker performs the code→token exchange with GitHub as a confidential client)
 
-> **重要:** v0.10.x 以前（localhost callback flow）や v0.11.0（device flow）から移行するユーザーは、初回接続時に自動的に web flow で再認証が要求されます（`~/.github-webhook-mcp/oauth-tokens.json` の旧ファイルは flow marker が一致しないため無視されます）。Claude Code のチャット応答または stderr に表示される authorize URL を開いて GitHub にサインインしてください。
+> **Important:** Users migrating from v0.10.x or earlier (localhost callback flow) or v0.11.0 (device flow) are asked to re-authenticate through the web flow automatically on first connect (an old `~/.github-webhook-mcp/oauth-tokens.json` is ignored because its flow marker does not match). Open the authorize URL shown in the Claude Code chat response or in stderr and sign in to GitHub.
 
-#### パーミッション
+#### Permissions
 
-受信したいイベントに応じて設定:
+Set according to the events you want to receive:
 
-| カテゴリ | パーミッション | 用途 |
+| Category | Permission | Purpose |
 |---------|-------------|------|
-| **Issues** | Read | Issue イベント |
-| **Pull requests** | Read | PR イベント |
-| **Contents** | Read | Push イベント |
-| **Checks** | Read | Check run イベント |
-| **Actions** | Read | Workflow run イベント |
-| **Discussions** | Read | Discussion イベント |
+| **Issues** | Read | Issue events |
+| **Pull requests** | Read | PR events |
+| **Contents** | Read | Push events |
+| **Checks** | Read | Check run events |
+| **Actions** | Read | Workflow run events |
+| **Discussions** | Read | Discussion events |
 
-#### イベント購読
+#### Event subscriptions
 
-監視したいイベントにチェック:
+Check the events you want to monitor:
 - Issues / Issue comment
 - Pull request / Pull request review / Pull request review comment / Pull request review thread
 - Push
 - Check run / Workflow run
 - Discussion / Discussion comment
 
-#### インストール
+#### Installation
 
-作成後、アプリをアカウントまたは Organization にインストールし、監視するリポジトリを選択してください。
+After creating the app, install it on your account or organization and select the repositories to monitor.
 
-> **重要:** 同じエンドポイントに別途リポジトリ Webhook を作成しないでください。GitHub App がすべての Webhook 配信を処理します。リポジトリ Webhook を追加すると重複や不正なリクエストが発生します。
+> **Important:** Do not create a separate repository webhook pointing at the same endpoint. The GitHub App handles all webhook deliveries; adding a repository webhook causes duplicates and invalid requests.
 
-### 5. シークレットの設定
+### 5. Configure secrets
 
-必要なシークレットを Cloudflare に登録。ダッシュボードの **Workers & Pages** → Worker → **Settings** → **Variables and Secrets** から設定するか、wrangler CLI で設定します:
+Register the required secrets with Cloudflare, either from the dashboard (**Workers & Pages** → Worker → **Settings** → **Variables and Secrets**) or with the wrangler CLI:
 
 ```bash
-# GitHub App の Webhook secret（必須）
+# GitHub App webhook secret (required)
 npx wrangler secret put GITHUB_WEBHOOK_SECRET
 
-# GitHub App の Client ID（web OAuth で必須）
+# GitHub App Client ID (required for web OAuth)
 npx wrangler secret put GITHUB_CLIENT_ID
 
-# GitHub App の Client Secret（web OAuth で必須 — Worker が confidential client として code→token 交換を行う）
+# GitHub App Client Secret (required for web OAuth — the Worker performs the code→token exchange as a confidential client)
 npx wrangler secret put GITHUB_CLIENT_SECRET
 ```
 
-各コマンドでプロンプトが表示されるので、対応する値を入力してください。
+Each command prompts for the value; enter the corresponding one.
 
-> **注意:** `GITHUB_CLIENT_SECRET` は Worker の `/oauth/callback` が GitHub に authorization code を提示する際に使用されます。空欄・未登録だと callback 交換が失敗するので必ず設定してください。
+> **Note:** `GITHUB_CLIENT_SECRET` is used when the Worker's `/oauth/callback` presents the authorization code to GitHub. If it is empty or unset, the callback exchange fails, so always set it.
 
-### 6. カスタムドメイン（オプション）
+### 6. Custom domain (optional)
 
-デフォルトの `*.workers.dev` URL の代わりにカスタムドメインを使用するには:
+To use a custom domain instead of the default `*.workers.dev` URL:
 
-1. Cloudflare ダッシュボード → **Workers & Pages** → Worker → **Settings** → **Domains & Routes**
-2. カスタムドメインを追加（例: `github-webhook.example.com`）
-3. GitHub App の Webhook URL をカスタムドメインに更新
-4. GitHub App の Callback URL をカスタムドメインの `/oauth/callback` に更新（例: `https://github-webhook.example.com/oauth/callback`）
-5. MCP クライアント設定の `WEBHOOK_WORKER_URL` を更新
+1. Cloudflare dashboard → **Workers & Pages** → Worker → **Settings** → **Domains & Routes**
+2. Add the custom domain (e.g. `github-webhook.example.com`)
+3. Update the GitHub App's Webhook URL to the custom domain
+4. Update the GitHub App's Callback URL to `/oauth/callback` on the custom domain (e.g. `https://github-webhook.example.com/oauth/callback`)
+5. Update `WEBHOOK_WORKER_URL` in your MCP client configuration
 
-### 7. WAF ルール（推奨）
+### 7. WAF rules (recommended)
 
-Cloudflare WAF でセキュリティルールを設定すると、Worker 到達前に不正リクエストをブロックでき、CPU 課金を削減できます。
+Security rules in Cloudflare WAF block invalid requests before they reach the Worker and reduce CPU billing.
 
-#### GitHub IP 制限
+#### GitHub IP restriction
 
-Webhook エンドポイントへのアクセスを GitHub の IP 範囲に制限:
+Restrict access to the webhook endpoint to GitHub's IP ranges:
 
-- **対象パス:** `/webhooks/github`
-- **条件:** `(http.request.uri.path eq "/webhooks/github") and not (ip.src in { 140.82.112.0/20 185.199.108.0/22 192.30.252.0/22 143.55.64.0/20 })`
-- **アクション:** Block
+- **Target path:** `/webhooks/github`
+- **Expression:** `(http.request.uri.path eq "/webhooks/github") and not (ip.src in { 140.82.112.0/20 185.199.108.0/22 192.30.252.0/22 143.55.64.0/20 })`
+- **Action:** Block
 
-> **注意:** GitHub の IP 範囲は変更される場合があります。最新の情報は `https://api.github.com/meta` の `hooks` フィールドで確認してください。
+> **Note:** GitHub's IP ranges may change. Check the `hooks` field of `https://api.github.com/meta` for the current values.
 
-#### レートリミット
+#### Rate limits
 
-- **Webhook:** 300 req/min per IP（`/webhooks/github`）
-- **API:** 120 req/min per IP（`/mcp`, `/events`）
+- **Webhook:** 300 req/min per IP (`/webhooks/github`)
+- **API:** 120 req/min per IP (`/mcp`, `/events`)
 
-### 8. チャンネル通知（オプション）
+### 8. Channel notifications (optional)
 
-ローカル MCP ブリッジは Claude Code の `claude/channel` 機能をサポートしています。有効にすると、新しい Webhook イベントが WebSocket 経由でリアルタイムにセッションにプッシュされます。Claude Code CLI でのみ利用可能です。
+The local MCP bridge supports Claude Code's `claude/channel` feature. When enabled, the bridge holds a WebSocket connection to the Worker's `/events` endpoint and pushes new webhook events into the session in real time. Available in the Claude Code CLI only.
 
-MCP クライアント設定で `WEBHOOK_CHANNEL=1` を設定し（上記 [Claude Code CLI](#claude-code-cli--npx) 参照）、チャンネルをロード:
+The Worker's `/events` endpoint also serves an SSE stream to plain GET requests (used for connectivity checks; the bridge itself uses WebSocket).
+
+Set `WEBHOOK_CHANNEL=1` in your MCP client configuration (see [Claude Code CLI](#claude-code-cli--npx) above) and load the channel:
 
 ```bash
 claude --dangerously-load-development-channels server:github-webhook-mcp
 ```
 
-### デプロイの確認
+### Verifying the deployment
 
-デプロイ後、以下で動作確認できます:
+After deploying, you can check that it works:
 
-1. **Webhook 受信テスト:** GitHub App の設定ページ → **Advanced** → **Recent Deliveries** で配信状況を確認
-2. **MCP 接続テスト:** MCP クライアントから `get_pending_status` ツールを呼び出して応答を確認
-3. **WebSocket テスト:** `wscat -c wss://<your-worker>/events` でストリーム接続を確認（SSE: `curl -N https://<your-worker>/events`）
+1. **Webhook delivery test:** On the GitHub App settings page → **Advanced** → **Recent Deliveries**, check the delivery status
+2. **MCP connection test:** Call the `get_pending_status` tool from your MCP client and check the response
+3. **Stream test:** `/events` requires a Bearer token (a request without one returns 401). After authenticating once through the MCP client, use the `access_token` from `~/.github-webhook-mcp/oauth-tokens.json`:
+   ```bash
+   curl -N -H "Authorization: Bearer <access_token>" https://<your-worker>/events
+   ```
+   On success the first frame is `data: {"status":"connected", ...}`. To check the WebSocket path the bridge uses: `wscat -c wss://<your-worker>/events -H "Authorization: Bearer <access_token>"`
 
-### トラブルシューティング
+### Troubleshooting
 
-| 症状 | 原因と対処 |
+| Symptom | Cause and fix |
 |------|-----------|
-| Webhook が 403 を返す | `GITHUB_WEBHOOK_SECRET` が GitHub App の設定と一致していない。両方の値を確認 |
-| Webhook が 429 を返す | テナントクォータ（デフォルト 10,000 イベント）を超過。古いイベントを `mark_processed` で処理 |
-| `/oauth/callback` で「Authorization failed」が出る | GitHub App の Callback URL に `https://<your-worker>/oauth/callback` が登録されていない、または `GITHUB_CLIENT_SECRET` が未設定 / 不一致。ステップ 4 と 5 を確認 |
-| ブラウザで GitHub のログイン画面が表示されない | Worker の `/oauth/authorize` にアクセスできているか確認（`https://<your-worker>/oauth/authorize?client_id=...&state=...` を直接開くと 302 redirect で `github.com/login/oauth/authorize` に飛ぶはず） |
-| Claude Code のログに authorize URL が表示されない | stderr の出力を確認。`[github-webhook-mcp] OAuth authorization required.` のセクションに `Opening: https://<worker>/oauth/authorize?...` が出力されているはず |
-| `~/.github-webhook-mcp/oauth-tokens.json` が無視される | v0.11.1 に更新した際、flow marker が `web` でない旧ファイル（localhost flow / device flow）は自動で無視されます。ブラウザで authorize URL を開いて再認証してください |
-| KV エラーが出る | `wrangler.toml` の KV ID が `wrangler kv namespace create` の出力と一致しているか確認 |
-| MCP ツールが応答しない | Worker がデプロイされているか `wrangler tail` でログを確認 |
+| Webhook returns 403 | `GITHUB_WEBHOOK_SECRET` does not match the GitHub App setting. Check both values |
+| Webhook returns 429 | Tenant quota (default 10,000 events) exceeded. Process old events with `mark_processed` |
+| `/oauth/callback` shows "Authorization failed" | `https://<your-worker>/oauth/callback` is not registered as the GitHub App Callback URL, or `GITHUB_CLIENT_SECRET` is unset / mismatched. Check steps 4 and 5 |
+| The GitHub login page does not appear in the browser | Check that the Worker's `/oauth/authorize` is reachable (opening `https://<your-worker>/oauth/authorize?client_id=...&state=...` directly should 302-redirect to `github.com/login/oauth/authorize`) |
+| The authorize URL does not appear in the Claude Code log | Check the stderr output. The `[github-webhook-mcp] OAuth authorization required.` section should contain `Opening: https://<worker>/oauth/authorize?...` |
+| `~/.github-webhook-mcp/oauth-tokens.json` is ignored | When updating to v0.11.1, an old file whose flow marker is not `web` (localhost flow / device flow) is ignored automatically. Open the authorize URL in a browser and re-authenticate |
+| KV errors | Check that the KV ID in `wrangler.toml` matches the output of `wrangler kv namespace create` |
+| `/events` returns 401 | No or invalid Bearer token. Use a current `access_token` from `~/.github-webhook-mcp/oauth-tokens.json` (expired tokens are rejected) |
+| MCP tools do not respond | Check that the Worker is deployed, and read its logs with `wrangler tail` |
