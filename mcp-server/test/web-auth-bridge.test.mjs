@@ -26,7 +26,7 @@ async function fixture(t, twin, { slow = false } = {}) {
 const spawn=cp.spawn;
 os.homedir=()=>${JSON.stringify(home)};
 cp.spawn=(command,args)=>{ if(['esbuild','esbuild.exe'].includes(require('node:path').basename(command))) return spawn(command,args);
-fs.appendFileSync(${JSON.stringify(browserFile)}, JSON.stringify({command,args})+'\\n');
+fs.appendFileSync(${JSON.stringify(browserFile)}, JSON.stringify({pid:process.pid,command,args})+'\\n');
 const child=new(require('node:events').EventEmitter)(); child.unref=()=>{}; return child; };
 const fetch=globalThis.fetch;
 globalThis.fetch=(input,init)=>{ if(new URL(new Request(input,init).url).hostname!=='127.0.0.1') throw new Error('non-fixture network forbidden'); return fetch(input,init); };

@@ -2,7 +2,7 @@
 import { createServer } from "node:http";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { mkdir, realpath } from "node:fs/promises";
-import { readFileSync, writeFileSync, renameSync, unlinkSync } from "node:fs";
+import { readFileSync, writeFileSync, chmodSync } from "node:fs";
 import { join } from "node:path";
 
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -19,7 +19,9 @@ export async function webAuthScope(workerUrl, tokenDir) {
   if (process.platform === "win32") storage = storage.toLowerCase();
   const target = new URL(workerUrl).href.replace(/\/$/, "");
   const scope = createHash("sha256").update(JSON.stringify([target, storage])).digest("hex");
-  return { scope, port: 49152 + (parseInt(scope.slice(0, 8), 16) % 16384),
+  // Avoid the default Windows dynamic client-port range (49152-65535).
+  // A conflicting listener still fails closed; there is no fallback port.
+  return { scope, port: 20000 + (parseInt(scope.slice(0, 8), 16) % 10000),
     recordFile: join(storage, `web-auth-${scope}.json`), tokenFile: join(storage, "oauth-tokens.json") };
 }
 
@@ -27,16 +29,17 @@ function readJson(file) {
   try { return JSON.parse(readFileSync(file, "utf8")); } catch { return null; }
 }
 
-// Synchronous publication is intentional: release of the kernel-held listener
-// cannot interleave a guarded write. Never delete/rename a successor's record.
+// The kernel-held listener fences synchronous writes. Readers may observe a
+// partial record and retry its validation. Replacing a file with rename can
+// fail with EPERM during concurrent Windows reads; no replacement is needed
+// for ownership, and no cleanup deletes a successor's record.
 function publish(file, value) {
-  const temp = `${file}.${process.pid}.${random()}.tmp`;
   try {
-    writeFileSync(temp, JSON.stringify(value), { mode: 0o600, flag: "wx" });
-    renameSync(temp, file);
-  } finally {
-    try { unlinkSync(temp); } catch {}
+    chmodSync(file, 0o600);
+  } catch (err) {
+    if (err.code !== "ENOENT") throw err;
   }
+  writeFileSync(file, JSON.stringify(value), { mode: 0o600 });
 }
 
 function validRecord(record, identity) {
@@ -77,8 +80,8 @@ async function status(identity, record) {
  */
 export async function coordinateWebAuth({ workerUrl, tokenDir, runOwner, onPending,
   startMs = WEB_AUTH_START_MS, lifetimeMs = WEB_AUTH_LIFETIME_MS, settleMs = 1500 }) {
-  const identity = await webAuthScope(workerUrl, tokenDir);
   const startedAt = Date.now();
+  const identity = await webAuthScope(workerUrl, tokenDir);
   const startDeadline = Date.now() + startMs;
   let followedGeneration = null;
   let followDeadline = 0;
@@ -136,14 +139,25 @@ export async function coordinateWebAuth({ workerUrl, tokenDir, runOwner, onPendi
         if (released || finished || Date.now() >= record.expires_at) throw failure();
       };
       try {
+        // The previous owner may finish/release while this process is paused
+        // between its pre-bind read and the asynchronous listen callback.
+        // Recheck under exclusive ownership before overwriting that evidence.
+        const completed = readJson(identity.recordFile);
+        if (validRecord(completed, identity) && completed.status === "complete" &&
+            (completed.generation === followedGeneration || completed.completed_at >= startedAt)) {
+          try { return completedTokens(identity, completed.generation); } finally { release(); }
+        }
         publish(identity.recordFile, record);
         repair = setInterval(() => {
           if (!released) {
             try { publish(identity.recordFile, record); } catch { release(); }
           }
         }, 500);
-        const expired = new Promise((_, reject) => {
-          expiry = setTimeout(() => { release(); reject(failure()); }, lifetimeMs);
+        const interrupted = new Promise((_, reject) => {
+          // Storage failure also releases ownership. Even an uncooperative
+          // outstanding callback must not leave this promise pending forever.
+          abort.signal.addEventListener("abort", () => reject(failure()), { once: true });
+          expiry = setTimeout(release, lifetimeMs);
         });
         const tokens = await Promise.race([runOwner({ signal: abort.signal, assertOwner,
           pending(value) {
@@ -154,13 +168,16 @@ export async function coordinateWebAuth({ workerUrl, tokenDir, runOwner, onPendi
               authorize_url: url.href, expires_at: record.expires_at } };
             onPending(snapshot.pending);
           },
-        }), expired]);
+        }), interrupted]);
         assertOwner();
         if (typeof tokens?.access_token !== "string" || !tokens.access_token.trim()) {
           throw new Error("Token response missing access_token");
         }
         const saved = { ...tokens, web_auth: { scope: identity.scope, generation: record.generation } };
-        publish(identity.tokenFile, saved);
+        // Retain the existing credential file's ACL/protection, as saveTokens
+        // did before coordination. Completion is published only after this
+        // synchronous write; followers never treat a partial file as success.
+        writeFileSync(identity.tokenFile, JSON.stringify(saved, null, 2), { mode: 0o600 });
         finished = true;
         record.status = "complete";
         record.completed_at = Date.now();

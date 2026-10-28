@@ -326,7 +326,12 @@ async function performOAuthFlow() {
       const endpoint = metadata.authorization_endpoint || `${WORKER_URL}/oauth/authorize`;
       const authorizeUrl = `${endpoint}?client_id=${encodeURIComponent(client.client_id)}&state=${encodeURIComponent(state)}`;
       pending({ authorize_url: authorizeUrl });
-      process.stderr.write(`[github-webhook-mcp] OAuth authorization required.\n[github-webhook-mcp] Opening: ${authorizeUrl}\n`);
+      process.stderr.write([
+        "", "[github-webhook-mcp] OAuth authorization required.",
+        `[github-webhook-mcp] Opening: ${authorizeUrl}`,
+        "[github-webhook-mcp] Approve in the browser window; the tab can be closed when done.",
+        "[github-webhook-mcp] Waiting for approval (state expires in 600s)...", "",
+      ].join("\n"));
       openBrowser(authorizeUrl);
       const data = await pollForWebAuthToken(metadata, client, state, 600, signal);
       if (!data.access_token) throw new Error("Token response missing access_token");

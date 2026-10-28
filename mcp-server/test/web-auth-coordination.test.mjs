@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { fork } from "node:child_process";
 import { createServer } from "node:http";
-import { mkdtemp, readFile, writeFile, rm, stat } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, writeFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { coordinateWebAuth, webAuthScope, WEB_AUTH_START_MS, WEB_AUTH_LIFETIME_MS } from "../server/web-auth-coordinator.js";
@@ -50,6 +50,8 @@ async function fixture(t) {
     return result;
   }
   t.after(async () => {
+    const errors = children.flatMap((child) => child.messages.filter((message) => message.type === "filesystem-error"));
+    if (errors.length) t.diagnostic(JSON.stringify(errors));
     for (const child of children) child.process.kill();
     await Promise.all(children.map(({ process }) => process.exitCode !== null || process.signalCode !== null ? null :
       new Promise((resolve) => process.once("exit", resolve))));
@@ -122,6 +124,33 @@ test("owner death releases kernel ownership and two waiters elect one replacemen
   assert.equal(new Set(followers.map((child) => child.get("complete").generation)).size, 1);
 });
 
+test("completion between a follower's record read and listener acquisition does not start another browser", async (t) => {
+  const f = await fixture(t);
+  const owner = f.child({ settleMs: 100 });
+  await until(() => owner.has("pending"));
+  const follower = f.child({ delayListenMs: 600 });
+  await until(() => follower.has("before-listen"));
+  f.state.release.add(1);
+  await until(() => owner.has("complete") && follower.has("complete"));
+  assert.equal(f.state.starts, 1);
+  assert.equal(f.state.browsers, 1);
+  assert.equal(follower.has("owner"), false);
+  assert.equal(follower.get("complete").generation, owner.get("complete").generation);
+});
+
+test("completion during scope path resolution remains fresh to the authorization attempt", async (t) => {
+  const f = await fixture(t);
+  const owner = f.child({ settleMs: 100 });
+  await until(() => owner.has("pending"));
+  const follower = f.child({ delayScopeMs: 600 });
+  await until(() => follower.has("before-scope"));
+  f.state.release.add(1);
+  await until(() => owner.has("complete") && follower.has("complete"));
+  assert.equal(f.state.starts, 1);
+  assert.equal(follower.has("owner"), false);
+  assert.equal(follower.get("complete").generation, owner.get("complete").generation);
+});
+
 test("expiry fences an old callback and cannot overwrite or clean a successor generation", async (t) => {
   const f = await fixture(t);
   const old = f.child({ lifetimeMs: 350, ignoreAbort: true });
@@ -153,6 +182,19 @@ test("partial/corrupt records recover without another owner while a healthy list
   await until(() => [a, b, c].every((child) => child.has("complete")));
 });
 
+test("record publication and repair avoid Windows rename-sharing failures", async (t) => {
+  const f = await fixture(t);
+  const children = [f.child({ forbidRename: true }), f.child({ forbidRename: true }), f.child({ forbidRename: true })];
+  await until(() => children.every((child) => child.has("pending")));
+  await writeFile(f.identity.recordFile, "partial");
+  await wait(650);
+  assert.equal(f.state.starts, 1);
+  f.state.release.add(1);
+  await until(() => children.every((child) => child.has("complete")));
+  assert.ok(children.every((child) => !child.has("rename-attempt")));
+  assert.equal(f.state.browsers, 1);
+});
+
 test("unknown listener fails closed boundedly without discovery/browser or fallback port", async (t) => {
   const f = await fixture(t);
   const unknown = createServer((_req, res) => res.writeHead(403).end());
@@ -162,6 +204,23 @@ test("unknown listener fails closed boundedly without discovery/browser or fallb
   await until(() => c.has("error"));
   assert.equal(c.has("owner"), false);
   assert.equal(f.state.starts, 0);
+});
+
+test("record publication failure rejects boundedly even when the owner callback ignores abort", async (t) => {
+  const f = await fixture(t);
+  const owner = f.child({ ignoreAbort: true });
+  await until(() => owner.has("pending"));
+  await rm(f.identity.recordFile);
+  await mkdir(f.identity.recordFile);
+  await until(() => owner.has("error"), 2000);
+  await rm(f.identity.recordFile, { recursive: true });
+  const next = f.child();
+  await until(() => next.has("pending"));
+  f.state.release.add(2);
+  await until(() => next.has("complete"));
+  f.state.release.add(1);
+  await until(() => owner.has("stale-rejected"));
+  assert.equal(owner.has("complete"), false);
 });
 
 test("acquisition failure releases ownership for a later call", async (t) => {
