@@ -272,13 +272,18 @@ export class WebhookStore extends DurableObject<StoreEnv> {
       return Response.json({ stored: true });
     }
 
+    // NULL/missing actions must remain visible; NOT IN alone would drop them.
+    const pendingWhere = url.searchParams.get("include_intermediate") === "true"
+      ? "processed = 0"
+      : "processed = 0 AND NOT (type = 'workflow_run' AND COALESCE(json_extract(payload, '$.action'), '') IN ('requested', 'in_progress'))";
+
     // ── get_pending_status ──
     if (url.pathname === "/pending-status") {
       const rows = this.ctx.storage.sql.exec(
-        `SELECT type, COUNT(*) as cnt FROM events WHERE processed = 0 GROUP BY type`,
+        `SELECT type, COUNT(*) as cnt FROM events WHERE ${pendingWhere} GROUP BY type`,
       ).toArray();
       const latestRow = this.ctx.storage.sql.exec(
-        `SELECT received_at FROM events WHERE processed = 0 ORDER BY received_at DESC LIMIT 1`,
+        `SELECT received_at FROM events WHERE ${pendingWhere} ORDER BY received_at DESC LIMIT 1`,
       ).toArray();
 
       const types: Record<string, number> = {};
@@ -300,7 +305,7 @@ export class WebhookStore extends DurableObject<StoreEnv> {
     if (url.pathname === "/pending-events") {
       const limit = Number(url.searchParams.get("limit") || "20");
       const rows = this.ctx.storage.sql.exec(
-        `SELECT * FROM events WHERE processed = 0 ORDER BY received_at DESC LIMIT ?`,
+        `SELECT * FROM events WHERE ${pendingWhere} ORDER BY received_at DESC LIMIT ?`,
         limit,
       ).toArray();
 

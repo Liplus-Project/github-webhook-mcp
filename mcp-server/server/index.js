@@ -730,7 +730,7 @@ const TOOLS = [
     title: "Get Pending Status",
     description:
       "Get a lightweight snapshot of pending GitHub webhook events. Use this for periodic polling before requesting details.",
-    inputSchema: { type: "object", properties: {} },
+    inputSchema: { type: "object", properties: { include_intermediate: { type: "boolean", default: false, description: "Include workflow_run requested/in_progress events (default false)" } } },
     annotations: {
       title: "Get Pending Status",
       readOnlyHint: true,
@@ -744,6 +744,7 @@ const TOOLS = [
     inputSchema: {
       type: "object",
       properties: {
+        include_intermediate: { type: "boolean", default: false, description: "Include workflow_run requested/in_progress events (default false)" },
         limit: {
           type: "number",
           description:

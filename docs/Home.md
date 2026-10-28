@@ -67,6 +67,8 @@ npm view github-webhook-mcp version --prefer-online
 | `get_webhook_events` | 全未処理イベントのフルペイロード取得 |
 | `mark_processed` | イベントを処理済みにマーク（`event_ids` で複数件を 1 呼び出しにまとめられる） |
 
+**Foreground pending filter (#256):** `get_pending_status` と `list_pending_events` は optional boolean `include_intermediate`（既定 `false`）を受け取る。省略/false は `workflow_run` の action が `requested` / `in_progress` と完全一致するイベントだけを除外し、true は従来の全 pending を返す。count・types・latest_received_at・一覧は同じ母集合を使い、各 store で LIMIT より前に絞る。missing/unknown action、completed、check_run、他 type は維持する。保存、ID/raw 取得、mark_processed、WebSocket/SSE 配送、retention は変更しない。通常 hook 整形と observer JSON shape も維持する。
+
 ## モノレポ構成
 
 ```

@@ -226,3 +226,48 @@ test("rejects the pre-flip bridge instead of serving it a compatibility lane", a
   // The endpoint names the one revision it serves — a single lane, stated.
   assert.deepEqual(body.error.data?.supported, ["2026-07-28"]);
 });
+
+
+test("foreground options reach every store and preserve the merged count/list population", async () => {
+  const requests: Array<{ store: string; url: URL }> = [];
+  const namespace = {
+    idFromName: (name: string) => ({ name }),
+    get: (id: { name: string }) => ({ async fetch(req: Request) {
+      const url = new URL(req.url);
+      requests.push({ store: id.name, url });
+      const all = url.searchParams.get("include_intermediate") === "true";
+      const entries = id.name === "store-4242"
+        ? [{ id: "a", type: "issues", received_at: "2026-01-01" }, ...(all ? [{ id: "intermediate", type: "workflow_run", received_at: "2026-01-03" }] : [])]
+        : [{ id: "b", type: "issues", received_at: "2026-01-02" }];
+      const data = url.pathname === "/pending-events" ? entries : {
+        pending_count: entries.length,
+        types: all && id.name === "store-4242" ? { issues: 1, workflow_run: 1 } : { issues: 1 },
+        latest_received_at: entries.at(-1)!.received_at,
+      };
+      return Response.json(data);
+    } }),
+  };
+  const remote = createRemoteClient({ workerUrl: ENDPOINT, clientVersion: "0.0.0-test", fetch: fetchInto(workerHandler({ WEBHOOK_STORE: namespace } as never)) });
+  try {
+    const client = await remote.getClient();
+    const tools = await client.listTools();
+    for (const name of ["get_pending_status", "list_pending_events"]) {
+      assert.equal((tools.tools.find((t: any) => t.name === name)!.inputSchema.properties as any).include_intermediate.type, "boolean");
+    }
+    for (const option of [undefined, false, true]) {
+      requests.length = 0;
+      const args = option === undefined ? {} : { include_intermediate: option };
+      const status = await client.callTool({ name: "get_pending_status", arguments: args }) as any;
+      const list = await client.callTool({ name: "list_pending_events", arguments: { ...args, limit: 2 } }) as any;
+      assert.deepEqual(JSON.parse(status.content[0].text), option === true
+        ? { pending_count: 3, types: { issues: 2, workflow_run: 1 }, latest_received_at: "2026-01-03" }
+        : { pending_count: 2, types: { issues: 2 }, latest_received_at: "2026-01-02" });
+      assert.deepEqual(JSON.parse(list.content[0].text).map((e: any) => e.id), option === true ? ["intermediate", "b"] : ["b", "a"]);
+      assert.equal(requests.length, 4);
+      assert.ok(requests.every(({ url }) => url.searchParams.get("include_intermediate") === String(option === true)));
+      assert.deepEqual(requests.map(({ store }) => store).sort(), ["store-4242", "store-4242", "store-99", "store-99"]);
+    }
+    const invalid = await client.callTool({ name: "get_pending_status", arguments: { include_intermediate: "true" } }) as any;
+    assert.equal(invalid.isError, true);
+  } finally { await remote.reset(); }
+});
