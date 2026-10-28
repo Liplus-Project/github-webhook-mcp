@@ -823,7 +823,7 @@ const TOOLS = [
     name: "get_pending_status",
     ...(OBSERVER_ENABLED ? { _meta: { "io.github.Liplus-Project/github-webhook-mcp/pending-status-observer": 1 } } : {}),
     description: "Get a lightweight snapshot of pending GitHub webhook events",
-    inputSchema: { type: "object" as const, properties: {} },
+    inputSchema: { type: "object" as const, properties: { include_intermediate: { type: "boolean", default: false, description: "Include workflow_run requested/in_progress events (default false)" } } },
   },
   {
     name: "list_pending_events",
@@ -831,6 +831,7 @@ const TOOLS = [
     inputSchema: {
       type: "object" as const,
       properties: {
+        include_intermediate: { type: "boolean", default: false, description: "Include workflow_run requested/in_progress events (default false)" },
         limit: { type: "number", description: "Max events to return (1-100, default 20)" },
       },
     },

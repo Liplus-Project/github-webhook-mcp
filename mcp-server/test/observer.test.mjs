@@ -64,7 +64,7 @@ require('node:module').syncBuiltinESMExports();`);
       res.writeHead(409).end("foreign test fixture");
       return;
     }
-    state.calls.push({ url: req.url, method: rpc?.method, tool: rpc?.params?.name, authorization: req.headers.authorization });
+    state.calls.push({ url: req.url, method: rpc?.method, tool: rpc?.params?.name, args: rpc?.params?.arguments, authorization: req.headers.authorization });
     if (state.holdUnauthorized && rpc?.method === "tools/call" && req.headers.authorization === `Bearer ${SECRET}`) {
       await new Promise((resolve) => { state.releaseUnauthorized = resolve; });
       res.writeHead(401).end(SECRET);
@@ -145,6 +145,24 @@ for (const twin of process.env.WEBHOOK_TEST_TWIN === "1" ? [false, true] : [fals
     assert.deepEqual((await f.call("get_event", { event_id: "event-1" })).structuredContent.payload, { action: "opened" });
     assert.ok(f.state.calls.filter((c) => c.tool).every((c) => ["get_pending_status", "get_event"].includes(c.tool)));
   });
+
+  for (const observer of [false, true]) {
+    test(`${label}: foreground option schema and forwarding preserve ${observer ? "observer" : twin ? "normal raw" : "hook"} shape`, async (t) => {
+      const f = await fixture(t, { twin, observer, tokens: valid() });
+      const tools = (await f.client.listTools()).tools;
+      for (const name of ["get_pending_status", "list_pending_events"]) {
+        assert.deepEqual(tools.find((tool) => tool.name === name).inputSchema.properties.include_intermediate, {
+          type: "boolean", default: false, description: "Include workflow_run requested/in_progress events (default false)",
+        });
+        await f.call(name, { include_intermediate: true });
+        assert.deepEqual(f.state.calls.at(-1).args, { include_intermediate: true });
+      }
+      const result = await f.call("get_pending_status", { include_intermediate: false });
+      assert.deepEqual(f.state.calls.at(-1).args, { include_intermediate: false });
+      if (observer || twin) assert.deepEqual(result, toolResult(raw(3)));
+      else assert.equal(JSON.parse(result.content[0].text).hookSpecificOutput.hookEventName, "UserPromptSubmit");
+    });
+  }
 
   test(`${label}: missing/expired/malformed credentials are noninteractive and external login recovers`, async (t) => {
     const f = await fixture(t, { twin, channel: true });

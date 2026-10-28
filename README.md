@@ -152,6 +152,8 @@ All checks passed.
 | `get_webhook_events` | Full payloads for all pending events |
 | `mark_processed` | Mark events as processed (`event_id` for one, `event_ids` for a batch) |
 
+**Foreground pending filter (#256):** `get_pending_status` and `list_pending_events` accept optional boolean `include_intermediate` (default `false`). Omitted/false excludes only events whose type is exactly `workflow_run` and action is exactly `requested` or `in_progress`; true restores all pending events. Counts, types, latest_received_at, and lists use the same population, filtered before each store applies LIMIT. Missing/unknown actions, completed, check_run, and other types remain visible. Storage, ID/raw retrieval, mark_processed, WebSocket/SSE delivery, retention, normal hook formatting, and observer JSON shape are unchanged.
+
 ## Event Retention
 
 Stored events are purged automatically to bound Durable Object storage. The Worker

@@ -527,3 +527,72 @@ describe("WebhookStore: unknown route", () => {
     expect(res.status).toBe(404);
   });
 });
+
+
+describe("WebhookStore: foreground workflow filter", () => {
+  it("filters before LIMIT, keeps NULL/unknown actions, and preserves raw access and processing", async () => {
+    const stub = storeFor("foreground-workflow");
+    const specs = [
+      ["completed", "workflow_run", { action: "completed" }],
+      ["missing", "workflow_run", {}],
+      ["null", "workflow_run", { action: null }],
+      ["unknown", "workflow_run", { action: "new_action" }],
+      ["check", "check_run", { action: "in_progress" }],
+      ["other", "issues", { action: "requested" }],
+      ["requested", "workflow_run", { action: "requested" }],
+      ["running", "workflow_run", { action: "in_progress" }],
+    ] as const;
+    for (const [index, [id, type, payload]] of specs.entries()) {
+      await ingest(stub, makeEvent({ id, type, payload, received_at: `2099-01-0${index + 1}T00:00:00Z` }));
+    }
+    const read = async (path: string) => (await stub.fetch(new Request(`${BASE}${path}`))).json() as Promise<any>;
+    const expected = { pending_count: 6, types: { workflow_run: 4, check_run: 1, issues: 1 }, latest_received_at: "2099-01-06T00:00:00Z" };
+    expect(await read("/pending-status")).toEqual(expected);
+    expect(await read("/pending-status?include_intermediate=false")).toEqual(expected);
+    expect((await read("/pending-events?limit=2")).map((e: EventSummary) => e.id)).toEqual(["other", "check"]);
+    expect((await read("/pending-events")).map((e: EventSummary) => e.id)).toEqual(["other", "check", "unknown", "null", "missing", "completed"]);
+    expect(await read("/pending-status?include_intermediate=true")).toEqual({ pending_count: 8, types: { workflow_run: 6, check_run: 1, issues: 1 }, latest_received_at: "2099-01-08T00:00:00Z" });
+    expect((await read("/pending-events?limit=2&include_intermediate=true")).map((e: EventSummary) => e.id)).toEqual(["running", "requested"]);
+    expect((await read("/webhook-events")).map((e: WebhookEvent) => e.id)).toContain("requested");
+    expect((await read("/event?id=requested")).payload).toEqual({ action: "requested" });
+    const marked = await stub.fetch(new Request(`${BASE}/mark-processed`, { method: "POST", body: JSON.stringify({ event_id: "requested" }) }));
+    expect(marked.status).toBe(200);
+    expect((await read("/event?id=requested")).processed).toBe(true);
+    expect((await read("/pending-status?include_intermediate=true")).pending_count).toBe(7);
+    expect(await read("/pending-status")).toEqual(expected);
+  });
+
+  it("returns an empty foreground for an intermediate-only store", async () => {
+    const stub = storeFor("foreground-only-intermediate");
+    await ingest(stub, makeEvent({ id: "only", type: "workflow_run", payload: { action: "requested" } }));
+    expect(await (await stub.fetch(new Request(`${BASE}/pending-status`))).json()).toEqual({ pending_count: 0, types: {}, latest_received_at: null });
+    expect(await (await stub.fetch(new Request(`${BASE}/pending-events`))).json()).toEqual([]);
+  });
+});
+
+
+it("broadcasts workflow intermediate actions even when the foreground hides them", async () => {
+  const stub = storeFor("foreground-websocket-delivery");
+  const response = await stub.fetch(new Request(`${BASE}/events`, { headers: { Upgrade: "websocket" } }));
+  const socket = response.webSocket!;
+  const messages: any[] = [];
+  socket.addEventListener("message", (event) => { messages.push(JSON.parse(event.data as string)); });
+  socket.accept();
+  try {
+    for (const action of ["requested", "in_progress"]) {
+      const delivered = new Promise<void>((resolve) => {
+        const listener = (event: MessageEvent) => {
+          if (JSON.parse(event.data as string).event_id === action) {
+            socket.removeEventListener("message", listener);
+            resolve();
+          }
+        };
+        socket.addEventListener("message", listener);
+      });
+      await ingest(stub, makeEvent({ id: action, type: "workflow_run", payload: { action } }));
+      await delivered;
+    }
+    expect(messages.filter((message) => message.event_id).map((message) => message.summary.action)).toEqual(["requested", "in_progress"]);
+    expect(await (await stub.fetch(new Request(`${BASE}/pending-events`))).json()).toEqual([]);
+  } finally { socket.close(); }
+});

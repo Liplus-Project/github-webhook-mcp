@@ -117,15 +117,17 @@ export function createWebhookMcpServer(env: Env): McpServer {
   server.registerTool(
     "get_pending_status",
     {
-      description: "Get a lightweight snapshot of pending GitHub webhook events",
-      inputSchema: z.object({}),
+      description: "Get a lightweight snapshot of pending GitHub webhook events. workflow_run requested/in_progress are hidden unless include_intermediate is true.",
+      inputSchema: z.object({
+        include_intermediate: z.boolean().default(false),
+      }),
     },
-    async () => {
+    async ({ include_intermediate }) => {
       const stores = getStores(env);
       const results = await Promise.all(
         stores.map((s) =>
           s
-            .fetch(new Request("https://store/pending-status"))
+            .fetch(new Request(`https://store/pending-status?include_intermediate=${include_intermediate}`))
             .then((r) => r.json() as Promise<PendingStatus>),
         ),
       );
@@ -155,17 +157,18 @@ export function createWebhookMcpServer(env: Env): McpServer {
   server.registerTool(
     "list_pending_events",
     {
-      description: "List lightweight summaries for pending GitHub webhook events",
+      description: "List lightweight summaries for pending GitHub webhook events. workflow_run requested/in_progress are hidden unless include_intermediate is true.",
       inputSchema: z.object({
         limit: z.number().min(1).max(100).default(20),
+        include_intermediate: z.boolean().default(false),
       }),
     },
-    async ({ limit }) => {
+    async ({ limit, include_intermediate }) => {
       const stores = getStores(env);
       const results = await Promise.all(
         stores.map((s) =>
           s
-            .fetch(new Request(`https://store/pending-events?limit=${limit}`))
+            .fetch(new Request(`https://store/pending-events?limit=${limit}&include_intermediate=${include_intermediate}`))
             .then((r) => r.json() as Promise<EventSummary[]>),
         ),
       );

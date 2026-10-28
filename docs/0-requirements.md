@@ -114,11 +114,13 @@ Worker のプロトコル版は、本 repo の 2 成果物（Worker と npx ブ�
 
 | ID | ツール名 | 引数 | 戻り値 | 要件 |
 |----|---------|------|--------|------|
-| F3.1 | `get_pending_status` | なし | pending_count, latest_received_at, types | 未処理イベントの軽量スナップショットを返す |
-| F3.2 | `list_pending_events` | limit (1-100, default 20) | サマリー配列 | 未処理イベントのメタデータ一覧を返す（ペイロード含まず） |
+| F3.1 | `get_pending_status` | include_intermediate (boolean, default false) | pending_count, latest_received_at, types | 未処理イベントの軽量スナップショットを返す |
+| F3.2 | `list_pending_events` | limit (1-100, default 20), include_intermediate (boolean, default false) | サマリー配列 | 未処理イベントのメタデータ一覧を返す（ペイロード含まず） |
 | F3.3 | `get_event` | event_id | 完全イベント or error | UUID 指定で完全なペイロードを返す |
 | F3.4 | `get_webhook_events` | limit (1-100, default 20) | 未処理イベント配列 | 未処理イベントをフルペイロード付きで返す |
 | F3.5 | `mark_processed` | event_id **または** event_ids (1-100) | 単数形: success, event_id, purged／バッチ形: success, marked, failed, results (id 単位の判定), purged | イベントを処理済みにマークし、保持期間超過の処理済みイベントを自動削除する。`purged` は今回削除された件数 |
+
+**Foreground pending filter (#256):** `get_pending_status` と `list_pending_events` は optional boolean `include_intermediate`（既定 `false`）を受け取る。省略/false は `workflow_run` の action が `requested` / `in_progress` と完全一致するイベントだけを除外し、true は従来の全 pending を返す。count・types・latest_received_at・一覧は同じ母集合を使い、各 store で LIMIT より前に絞る。missing/unknown action、completed、check_run、他 type は維持する。保存、ID/raw 取得、mark_processed、WebSocket/SSE 配送、retention は変更しない。通常 hook 整形と observer JSON shape も維持する。
 
 **F3.1 Local bridge shaping:** In normal mode, the local bridge wraps `get_pending_status` results into the Claude Code UserPromptSubmit hook decision JSON shape (`hookSpecificOutput.hookEventName="UserPromptSubmit"` plus a natural-language summary of pending_count / types / latest_received_at in `additionalContext`). This is required so values returned via `type: "mcp_tool"` UserPromptSubmit hooks reach the AI prompt context; manual tool calls receive the same shape. The remote (Worker + DO) return contract is unchanged.
 
