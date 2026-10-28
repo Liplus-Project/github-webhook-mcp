@@ -16,14 +16,14 @@
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "^0.16.18",
-    "@cloudflare/workers-types": "4.20260404.1",
+    "@cloudflare/workers-types": "4.20260424.1",
     "tsx": "^4.21.0",
     "typescript": "^5.5.0",
     "vitest": "^4.1.9",
     "wrangler": "^4.0.0"
   },
   "comments": {
-    "overrides": "Pin @cloudflare/workers-types across the tree to the version the worker code is written against; the vitest-pool-workers toolchain otherwise pulls a newer one whose stricter binding types can break existing src types (types-only; runtime unaffected). The pin is load-bearing, not decorative: agents nests partyserver, whose own peer range this version does not satisfy, so npm arranges the tree around it rather than hoisting a newer copy (issue #252 tracks that state).",
+    "overrides": "Pin @cloudflare/workers-types across the tree to the version the worker code is written against; the vitest-pool-workers toolchain otherwise pulls a newer one whose stricter binding types can break existing src types (types-only; runtime unaffected). The exact pin satisfies the peer range of partyserver nested under agents while preventing unbounded type updates across the tree (issue #252).",
     "@modelcontextprotocol/server": "Exact, not a range: agents@0.20.x declares this package as a non-optional peer at exactly 2.0.0, so a caret here would let npm resolve a newer copy, nest 2.0.0 under agents/, and reproduce the two-copies type mismatch #239 was opened about. Exact makes the coupling loud — an agents bump that moves the peer fails at install time instead of at tsc.",
     "@modelcontextprotocol/sdk": "Deliberately absent. The worker no longer imports SDK v1 anywhere after the 2026-07-28 flip (#249); agents still needs it as a required peer, so npm installs it, but this package declares no range of its own to drift against agents' exact pin. The two bridges keep their own SDK v1 dependency for the Claude Desktop face (mcp-server/package.json, local-mcp/package.json)."
   },
