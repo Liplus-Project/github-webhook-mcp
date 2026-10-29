@@ -58,12 +58,15 @@ import {
   type WebAuthStateRecord,
 } from "./oauth-store.js";
 import {
+  CLIENT_METADATA_ERROR_DESCRIPTION,
   CLIENT_METADATA_PATH,
   ClientMetadataError,
+  ClientMetadataFetchRefusedError,
   firstPartyClientMetadata,
   isUrlClientId,
   resolveClientMetadata,
 } from "./client-metadata.js";
+import { checkClientMetadataFetchRateLimit, rateLimitResponse } from "./rate-limit.js";
 
 /** GitHub web OAuth endpoints. */
 const GITHUB_AUTHORIZE_URL = "https://github.com/login/oauth/authorize";
@@ -199,6 +202,19 @@ function handleClientMetadataDocument(request: Request): Response {
 
 // ── Client resolution (DCR record or CIMD URL) ────────────────────
 
+/** Where a client check was requested from: the Worker origin and the caller IP. */
+interface RequestOrigin {
+  origin: string;
+  ip: string;
+}
+
+function requestOrigin(request: Request): RequestOrigin {
+  return {
+    origin: new URL(request.url).origin,
+    ip: request.headers.get("CF-Connecting-IP") || "unknown",
+  };
+}
+
 /**
  * Check that `clientId` names a known client allowed to use `grantType`.
  * Returns null when the client is acceptable, otherwise the error response.
@@ -212,7 +228,7 @@ function handleClientMetadataDocument(request: Request): Response {
 async function checkClient(
   env: OAuthEnv,
   clientId: string,
-  origin: string,
+  from: RequestOrigin,
   grantType: string,
 ): Promise<Response | null> {
   if (!isUrlClientId(clientId)) {
@@ -221,12 +237,21 @@ async function checkClient(
   }
   let grantTypes: string[];
   try {
-    const doc = await resolveClientMetadata(clientId, origin, kvClientMetadataCache(env.OAUTH_KV));
+    const doc = await resolveClientMetadata(clientId, from.origin, kvClientMetadataCache(env.OAUTH_KV), {
+      // Counted only when outbound DNS + fetch is about to happen (see deps doc).
+      allowFetch: () => checkClientMetadataFetchRateLimit(from.ip),
+    });
     grantTypes = doc.grant_types;
   } catch (err) {
+    if (err instanceof ClientMetadataFetchRefusedError) {
+      console.log(`[oauth] client metadata fetch rate-limited ip=${from.ip}`);
+      return rateLimitResponse();
+    }
     if (err instanceof ClientMetadataError) {
-      console.log(`[oauth] client metadata rejected: ${err.message}`);
-      return oauthError("invalid_client", err.message, 401);
+      // Detailed reason stays in logs; the response is the same for every
+      // failure so it does not report what a chosen host or port did.
+      console.log(`[oauth] client metadata rejected client_id=${clientId.slice(0, 200)}: ${err.message}`);
+      return oauthError("invalid_client", CLIENT_METADATA_ERROR_DESCRIPTION, 401);
     }
     throw err;
   }
@@ -304,7 +329,7 @@ async function handleAuthorize(request: Request, env: OAuthEnv): Promise<Respons
     return oauthError("invalid_request", "state parameter is required (min 8 chars)", 400);
   }
 
-  const rejected = await checkClient(env, clientId, url.origin, WEB_AUTH_POLL_GRANT);
+  const rejected = await checkClient(env, clientId, requestOrigin(request), WEB_AUTH_POLL_GRANT);
   if (rejected) return rejected;
 
   const now = nowSec();
@@ -495,13 +520,13 @@ function escapeHtml(s: string): string {
 async function handleToken(request: Request, env: OAuthEnv): Promise<Response> {
   const form = await readForm(request);
   const grantType = form.get("grant_type");
-  const origin = new URL(request.url).origin;
+  const from = requestOrigin(request);
 
   if (grantType === WEB_AUTH_POLL_GRANT) {
-    return handleTokenWebAuthPoll(form, env, origin);
+    return handleTokenWebAuthPoll(form, env, from);
   }
   if (grantType === "refresh_token") {
-    return handleTokenRefresh(form, env, origin);
+    return handleTokenRefresh(form, env, from);
   }
   return oauthError(
     "unsupported_grant_type",
@@ -521,7 +546,7 @@ async function handleToken(request: Request, env: OAuthEnv): Promise<Response> {
 async function handleTokenWebAuthPoll(
   form: URLSearchParams,
   env: OAuthEnv,
-  origin: string,
+  from: RequestOrigin,
 ): Promise<Response> {
   const state = form.get("state");
   const clientId = form.get("client_id");
@@ -529,7 +554,7 @@ async function handleTokenWebAuthPoll(
     return oauthError("invalid_request", "state and client_id are required", 400);
   }
 
-  const rejected = await checkClient(env, clientId, origin, WEB_AUTH_POLL_GRANT);
+  const rejected = await checkClient(env, clientId, from, WEB_AUTH_POLL_GRANT);
   if (rejected) return rejected;
 
   const record = await getWebAuthState(env.OAUTH_KV, state);
@@ -619,7 +644,7 @@ async function issueTokensForNewGrant(
 async function handleTokenRefresh(
   form: URLSearchParams,
   env: OAuthEnv,
-  origin: string,
+  from: RequestOrigin,
 ): Promise<Response> {
   const refreshTokenIn = form.get("refresh_token");
   const clientId = form.get("client_id");
@@ -627,7 +652,7 @@ async function handleTokenRefresh(
     return oauthError("invalid_request", "refresh_token and client_id are required", 400);
   }
 
-  const rejected = await checkClient(env, clientId, origin, "refresh_token");
+  const rejected = await checkClient(env, clientId, from, "refresh_token");
   if (rejected) return rejected;
 
   const refresh = await getRefreshToken(env.OAUTH_KV, refreshTokenIn);

@@ -661,7 +661,7 @@ test("CIMD client whose host resolves to a private address is refused without fe
   assert.equal(res!.status, 401);
   const body = await res!.json() as { error: string; error_description: string };
   assert.equal(body.error, "invalid_client");
-  assert.match(body.error_description, /special-use/);
+  assert.equal(body.error_description, "Client ID Metadata Document could not be resolved or is invalid", "reason stays in logs");
   assert.ok(!fetchLog.includes(THIRD_PARTY_CLIENT_ID));
 });
 
@@ -677,7 +677,7 @@ test("invalid CIMD documents and malformed client_id URLs are refused with inval
     env,
   );
   assert.equal(mismatch!.status, 401);
-  assert.match((await mismatch!.json() as { error_description: string }).error_description, /does not match/);
+  assert.equal((await mismatch!.json() as { error_description: string }).error_description, "Client ID Metadata Document could not be resolved or is invalid");
   const kv = env.OAUTH_KV as unknown as MockKV;
   assert.ok(!kv.list().some((k) => k.startsWith("cimd:")));
 
@@ -705,4 +705,81 @@ test("DCR clients keep working unchanged next to CIMD", async () => {
     env,
   );
   assert.equal(rotRes!.status, 200);
+});
+
+test("CIMD outbound resolution is rate-limited per IP; own document, DCR and cached documents are not", async () => {
+  const env = makeEnv();
+  const ip = "198.51.100.77";
+  let docFetches = 0;
+  extraFetch = (req) => {
+    const url = new URL(req.url);
+    if (url.hostname === "cloudflare-dns.com") {
+      const type = url.searchParams.get("type");
+      return new Response(JSON.stringify({ Status: 0, Answer: type === "A" ? [{ type: 1, data: "93.184.215.14" }] : [] }), {
+        status: 200, headers: { "Content-Type": "application/dns-json" },
+      });
+    }
+    if (url.hostname === "client.example.org") {
+      docFetches++;
+      if (req.url === THIRD_PARTY_CLIENT_ID) {
+        return new Response(JSON.stringify(thirdPartyDoc()), {
+          status: 200, headers: { "Content-Type": "application/json" },
+        });
+      }
+      return new Response("not found", { status: 404 });
+    }
+    return null;
+  };
+  const authorize = (clientId: string, state: string) => handleOAuthRequest(
+    new Request(
+      `https://worker.example.com/oauth/authorize?client_id=${encodeURIComponent(clientId)}&state=${state}`,
+      { headers: { "CF-Connecting-IP": ip } },
+    ),
+    env,
+  );
+
+  // Warm the cache for one valid third-party client (1 counted fetch).
+  assert.equal((await authorize(THIRD_PARTY_CLIENT_ID, "state-rl-warm"))!.status, 302);
+  // 9 more distinct bad ids exhaust the 10/min bucket; each is a real fetch.
+  for (let i = 0; i < 9; i++) {
+    const res = await authorize(`https://client.example.org/bad/${i}.json`, `state-rl-bad-${i}`);
+    assert.equal(res!.status, 401);
+    assert.equal((await res!.json() as { error_description: string }).error_description,
+      "Client ID Metadata Document could not be resolved or is invalid");
+  }
+  assert.equal(docFetches, 10);
+
+  const limited = await authorize("https://client.example.org/bad/next.json", "state-rl-limited");
+  assert.equal(limited!.status, 429);
+  assert.equal(limited!.headers.get("Retry-After"), "60");
+  assert.equal(docFetches, 10, "a rate-limited resolution makes no outbound request");
+
+  // Not counted: cached third-party document, the Worker's own document, DCR ids.
+  assert.equal((await authorize(THIRD_PARTY_CLIENT_ID, "state-rl-cached"))!.status, 302);
+  assert.equal((await authorize(FIRST_PARTY_CLIENT_ID, "state-rl-first-party"))!.status, 302);
+  assert.equal((await authorize(await registerClient(env), "state-rl-dcr"))!.status, 302);
+  assert.equal(docFetches, 10);
+
+  // Another IP has its own bucket.
+  const other = await handleOAuthRequest(
+    new Request(
+      `https://worker.example.com/oauth/authorize?client_id=${encodeURIComponent("https://client.example.org/bad/x.json")}&state=state-rl-other`,
+      { headers: { "CF-Connecting-IP": "198.51.100.78" } },
+    ),
+    env,
+  );
+  assert.equal(other!.status, 401);
+});
+
+test("CIMD clients on a non-default port are refused with the same generic error, without any request", async () => {
+  const env = makeEnv();
+  serveThirdParty(thirdPartyDoc());
+  const res = await handleOAuthRequest(
+    new Request(`https://worker.example.com/oauth/authorize?client_id=${encodeURIComponent("https://client.example.org:8443/mcp/client.json")}&state=state-port`),
+    env,
+  );
+  assert.equal(res!.status, 401);
+  const body = await res!.json() as { error: string; error_description: string };
+  assert.deepEqual(body, { error: "invalid_client", error_description: "Client ID Metadata Document could not be resolved or is invalid" });
+  assert.equal(fetchLog.length, 0);
 });

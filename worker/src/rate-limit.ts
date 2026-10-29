@@ -17,6 +17,7 @@ const counters = new Map<string, Counter>();
 const WINDOW_MS = 60_000;      // 1 minute window
 const MAX_WEBHOOK = 300;       // webhook endpoint: 300 req/min per IP
 const MAX_API = 120;           // MCP/events endpoint: 120 req/min per IP
+const MAX_CLIENT_METADATA_FETCH = 10; // CIMD outbound resolutions: 10/min per IP
 
 // Periodic cleanup to prevent unbounded map growth
 let lastCleanup = Date.now();
@@ -63,6 +64,19 @@ export function checkWebhookRateLimit(ip: string): boolean {
  */
 export function checkApiRateLimit(ip: string): boolean {
   return check(`api:${ip}`, MAX_API);
+}
+
+/**
+ * Check rate limit for outbound Client ID Metadata Document resolution (#254).
+ *
+ * Counted only when an unauthenticated /oauth/authorize or /oauth/token call
+ * would make the Worker resolve and fetch an attacker-chosen URL (cache miss,
+ * not the Worker's own document, not a DCR id). Its own bucket, so it neither
+ * spends nor is spent by the /mcp + /events budget. A legitimate CIMD client
+ * needs about one fetch per cache lifetime (60-3600 s).
+ */
+export function checkClientMetadataFetchRateLimit(ip: string): boolean {
+  return check(`cimd:${ip}`, MAX_CLIENT_METADATA_FETCH);
 }
 
 /**

@@ -16,6 +16,7 @@ import {
   CIMD_MAX_BYTES,
   CLIENT_METADATA_PATH,
   ClientMetadataError,
+  ClientMetadataFetchRefusedError,
   cacheTtlFrom,
   dohResolver,
   fetchClientMetadataDocument,
@@ -80,7 +81,8 @@ test("opaque DCR ids are never treated as URL client_ids", () => {
 
 test("client_id URL shape follows draft §3", () => {
   assert.equal(parseClientIdUrl(CLIENT_ID).hostname, "client.example.org");
-  assert.ok(parseClientIdUrl("https://client.example.org:8443/c.json?v=1"));
+  assert.ok(parseClientIdUrl("https://client.example.org/c.json?v=1"));
+  assert.equal(parseClientIdUrl("https://client.example.org:443/c.json").port, "", "explicit default port is accepted");
   const bad: Array<[string, RegExp]> = [
     ["http://client.example.org/c.json", /https scheme/],
     ["https://user:pw@client.example.org/c.json", /userinfo/],
@@ -91,6 +93,8 @@ test("client_id URL shape follows draft §3", () => {
     ["https://client.example.org/a/%2e%2E/c.json", /dot path/],
     ["https://client.example.org/./c.json", /dot path/],
     ["https://client.example.org/a\\b", /backslash/],
+    ["https://client.example.org:8443/c.json", /default https port/],
+    ["https://client.example.org:80/c.json", /default https port/],
     [" https://client.example.org/c.json", /whitespace/],
     [`https://client.example.org/${"a".repeat(2100)}`, /exceeds/],
   ];
@@ -331,4 +335,32 @@ test("the Worker's own document resolves locally without any network access", as
   assert.ok(doc.grant_types.includes(POLL));
   assert.equal(calls.length, 0);
   assert.equal(store.size, 0);
+});
+
+test("outbound resolution asks allowFetch once, and never for cache hits or the Worker's own document", async () => {
+  const { cache } = memoryCache();
+  const { fn, calls } = stubFetch(() => jsonResponse(goodDoc()));
+  let asked = 0;
+  let allow = false;
+  const deps = { fetch: fn, resolve: publicResolver, allowFetch: () => { asked++; return allow; } };
+
+  await assert.rejects(
+    resolveClientMetadata(CLIENT_ID, "https://worker.example.org", cache, deps),
+    ClientMetadataFetchRefusedError,
+  );
+  assert.equal(asked, 1);
+  assert.equal(calls.length, 0, "a refused resolution makes no request at all");
+
+  allow = true;
+  await resolveClientMetadata(CLIENT_ID, "https://worker.example.org", cache, deps);
+  assert.equal(asked, 2);
+  allow = false;
+  await resolveClientMetadata(CLIENT_ID, "https://worker.example.org", cache, deps);
+  assert.equal(asked, 2, "cache hit does not consult the limiter");
+
+  const origin = "https://worker.example.org";
+  await resolveClientMetadata(`${origin}${CLIENT_METADATA_PATH}`, origin, cache, deps);
+  assert.throws(() => parseClientIdUrl("https://127.0.0.1/c.json"));
+  await assert.rejects(resolveClientMetadata("https://127.0.0.1/c.json", origin, cache, deps), ClientMetadataError);
+  assert.equal(asked, 2, "own document and URL-shape rejections do not consult the limiter");
 });

@@ -65,11 +65,27 @@ export interface ClientMetadataDocument {
   token_endpoint_auth_method: "none";
 }
 
-/** Every rejection carries a message safe to return in `error_description`. */
+/**
+ * A rejection. The message is the detailed reason for logs only: callers
+ * answer every rejection with CLIENT_METADATA_ERROR_DESCRIPTION so the
+ * endpoint does not report what an attacker-chosen host or port did.
+ */
 export class ClientMetadataError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "ClientMetadataError";
+  }
+}
+
+/** The only reason ever returned to the requester for a ClientMetadataError. */
+export const CLIENT_METADATA_ERROR_DESCRIPTION =
+  "Client ID Metadata Document could not be resolved or is invalid";
+
+/** Thrown when `allowFetch` refuses an outbound resolution (rate limit). */
+export class ClientMetadataFetchRefusedError extends Error {
+  constructor() {
+    super("Client ID Metadata Document fetch refused by rate limit");
+    this.name = "ClientMetadataFetchRefusedError";
   }
 }
 
@@ -78,7 +94,13 @@ export type HostResolver = (hostname: string, signal: AbortSignal) => Promise<st
 export interface ClientMetadataDeps {
   fetch?: typeof fetch;
   resolve?: HostResolver;
-  now?: () => number;
+  /**
+   * Consulted once per resolution, only when outbound requests (DNS lookup +
+   * document fetch) are about to be made: never for the Worker's own document,
+   * never on a cache hit, never for a client_id rejected by URL checks.
+   * Returning false aborts with ClientMetadataFetchRefusedError.
+   */
+  allowFetch?: () => boolean;
 }
 
 export interface ClientMetadataCache {
@@ -144,6 +166,11 @@ export function parseClientIdUrl(raw: string): URL {
   const rest = authorityEnd === -1 ? "" : afterScheme.slice(authorityEnd);
   if (authority.includes("@") || url.username || url.password) {
     throw new ClientMetadataError("client_id URL must not contain userinfo");
+  }
+  // URL normalises an explicit :443 to "", so only non-default ports remain.
+  // Restricting to 443 keeps the endpoint from probing arbitrary ports.
+  if (url.port !== "") {
+    throw new ClientMetadataError("client_id URL must use the default https port");
   }
   if (raw.includes("#")) {
     throw new ClientMetadataError("client_id URL must not contain a fragment");
@@ -449,7 +476,15 @@ export async function fetchClientMetadataDocument(
 /**
  * Resolve a URL client_id to its validated metadata. The Worker's own document
  * resolves locally; anything else is served from the bounded cache or fetched.
- * Errors and invalid documents are never cached (§5.2).
+ *
+ * Errors and invalid documents are never cached (§5.2: "MUST NOT cache error
+ * responses ... MUST NOT cache documents which are invalid or malformed"). A
+ * short negative cache was considered against repeated bad ids and rejected:
+ * it would cache exactly what §5.2 forbids, it would keep a client that has
+ * just fixed its document locked out for the negative TTL, and it would not
+ * bound abuse anyway, because the attacker chooses the URL and can vary it per
+ * request (path, query) to miss any per-id cache. Outbound work is bounded by
+ * `allowFetch` instead, which the Worker wires to a per-IP rate limit.
  */
 export async function resolveClientMetadata(
   clientId: string,
@@ -464,6 +499,7 @@ export async function resolveClientMetadata(
   parseClientIdUrl(clientId);
   const cached = await cache.get(clientId).catch(() => null);
   if (cached) return cached;
+  if (deps.allowFetch && !deps.allowFetch()) throw new ClientMetadataFetchRefusedError();
   const { document, ttl } = await fetchClientMetadataDocument(clientId, deps);
   try {
     await cache.put(clientId, document, ttl);
