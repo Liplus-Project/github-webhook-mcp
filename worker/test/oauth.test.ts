@@ -16,6 +16,10 @@
  *   - refresh_token rotation invalidates the previous token pair
  *   - access_token validates via the middleware across simulated restarts
  *   - user-denied callback surfaces as access_denied on the next poll
+ *   - Client ID Metadata Documents (#254): metadata advertises support next to
+ *     DCR, the first-party bridge document resolves locally, third-party
+ *     documents are fetched (DoH + document stubbed), cached, and refused when
+ *     invalid, private-addressed or lacking the poll grant; DCR is unchanged
  *
  * GitHub upstream is stubbed by swapping globalThis.fetch. The KV namespace
  * is a Map-backed mock that matches the subset of the KVNamespace API that
@@ -56,11 +60,19 @@ class MockKV {
 
 type FetchHandler = (req: Request) => Promise<Response> | Response;
 let fetchHandler: FetchHandler | null = null;
+/** Consulted before fetchHandler; returns null to fall through (CIMD hosts, DoH). */
+let extraFetch: ((req: Request) => Promise<Response | null> | Response | null) | null = null;
+const fetchLog: string[] = [];
 const realFetch = globalThis.fetch;
 
 before(() => {
   globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const req = input instanceof Request ? input : new Request(input, init);
+    fetchLog.push(req.url);
+    if (extraFetch) {
+      const res = await extraFetch(req);
+      if (res) return res;
+    }
     if (!fetchHandler) {
       throw new Error(`Unhandled fetch in test: ${req.method} ${req.url}`);
     }
@@ -74,6 +86,8 @@ after(() => {
 
 beforeEach(() => {
   fetchHandler = null;
+  extraFetch = null;
+  fetchLog.length = 0;
 });
 
 // ── Helpers ──────────────────────────────────────────────────────────
@@ -509,4 +523,186 @@ test("unsupported grant_type returns 400 unsupported_grant_type", async () => {
   assert.equal(res!.status, 400);
   const body = await res!.json() as { error: string };
   assert.equal(body.error, "unsupported_grant_type");
+});
+
+// ── Client ID Metadata Documents (#254) ─────────────────────────────
+
+const FIRST_PARTY_CLIENT_ID = "https://worker.example.com/oauth/client-metadata.json";
+const THIRD_PARTY_CLIENT_ID = "https://client.example.org/mcp/client.json";
+
+/** Serve DoH answers and the third-party document; the document is a parameter. */
+function serveThirdParty(doc: unknown, addresses: string[] = ["93.184.215.14"]) {
+  extraFetch = (req) => {
+    const url = new URL(req.url);
+    if (url.hostname === "cloudflare-dns.com") {
+      const type = url.searchParams.get("type");
+      const answers = addresses
+        .filter((a) => (type === "A") === !a.includes(":"))
+        .map((data) => ({ type: type === "A" ? 1 : 28, data }));
+      return new Response(JSON.stringify({ Status: 0, Answer: answers }), {
+        status: 200,
+        headers: { "Content-Type": "application/dns-json" },
+      });
+    }
+    if (req.url === THIRD_PARTY_CLIENT_ID) {
+      return new Response(JSON.stringify(doc), {
+        status: 200,
+        headers: { "Content-Type": "application/json", "Cache-Control": "max-age=300" },
+      });
+    }
+    return null;
+  };
+}
+
+function thirdPartyDoc(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    client_id: THIRD_PARTY_CLIENT_ID,
+    client_name: "Third-party poll client",
+    redirect_uris: [],
+    grant_types: [WEB_AUTH_POLL_GRANT, "refresh_token"],
+    token_endpoint_auth_method: "none",
+    ...overrides,
+  };
+}
+
+test("metadata advertises CIMD support and keeps the DCR registration_endpoint", async () => {
+  const env = makeEnv();
+  const res = await handleOAuthRequest(
+    new Request("https://worker.example.com/.well-known/oauth-authorization-server"),
+    env,
+  );
+  const meta = await res!.json() as Record<string, unknown>;
+  assert.equal(meta.client_id_metadata_document_supported, true);
+  assert.equal(meta.registration_endpoint, "https://worker.example.com/oauth/register");
+  assert.equal(meta.issuer, "https://worker.example.com");
+});
+
+test("GET /oauth/client-metadata.json serves the bridge document whose client_id is its own URL", async () => {
+  const env = makeEnv();
+  const res = await handleOAuthRequest(new Request(FIRST_PARTY_CLIENT_ID), env);
+  assert.ok(res);
+  assert.equal(res.status, 200);
+  assert.match(res.headers.get("Content-Type") ?? "", /^application\/json/);
+  const doc = await res.json() as Record<string, unknown>;
+  assert.equal(doc.client_id, FIRST_PARTY_CLIENT_ID);
+  assert.equal(typeof doc.client_name, "string");
+  assert.deepEqual(doc.redirect_uris, []);
+  assert.deepEqual(doc.grant_types, [WEB_AUTH_POLL_GRANT, "refresh_token"]);
+  assert.equal(doc.token_endpoint_auth_method, "none");
+  assert.ok(!("client_secret" in doc));
+});
+
+test("first-party CIMD client completes authorize/poll/refresh without registration or document fetch", async () => {
+  const env = makeEnv();
+  const issued = await onboardUser(env, FIRST_PARTY_CLIENT_ID, "state-cimd-first-party", { id: 501, login: "cimd" }, []);
+  assert.ok(!fetchLog.some((u) => u.includes("client-metadata.json") || u.includes("cloudflare-dns.com")));
+  const kv = env.OAUTH_KV as unknown as MockKV;
+  assert.ok(!kv.list().some((k) => k.startsWith("client:")), "no DCR record is created");
+
+  const rotRes = await handleOAuthRequest(
+    formRequest("https://worker.example.com/oauth/token", {
+      grant_type: "refresh_token",
+      refresh_token: issued.refresh_token,
+      client_id: FIRST_PARTY_CLIENT_ID,
+    }),
+    env,
+  );
+  assert.equal(rotRes!.status, 200);
+
+  // A grant issued to the CIMD client cannot be refreshed under another client.
+  const dcrClient = await registerClient(env);
+  const rotated = await rotRes!.json() as { refresh_token: string };
+  const crossRes = await handleOAuthRequest(
+    formRequest("https://worker.example.com/oauth/token", {
+      grant_type: "refresh_token",
+      refresh_token: rotated.refresh_token,
+      client_id: dcrClient,
+    }),
+    env,
+  );
+  assert.equal(crossRes!.status, 400);
+  assert.equal((await crossRes!.json() as { error: string }).error, "invalid_grant");
+});
+
+test("third-party CIMD client is fetched once, cached, and can complete the poll flow", async () => {
+  const env = makeEnv();
+  serveThirdParty(thirdPartyDoc());
+  await onboardUser(env, THIRD_PARTY_CLIENT_ID, "state-cimd-third-party", { id: 502, login: "third" }, []);
+  const docFetches = fetchLog.filter((u) => u === THIRD_PARTY_CLIENT_ID).length;
+  assert.equal(docFetches, 1, "authorize fetches, poll is served from cache");
+  const kv = env.OAUTH_KV as unknown as MockKV;
+  assert.equal(kv.list().filter((k) => k.startsWith("cimd:")).length, 1);
+});
+
+test("CIMD client that declares only authorization_code is refused at authorize", async () => {
+  const env = makeEnv();
+  const doc = thirdPartyDoc();
+  delete doc.grant_types;
+  serveThirdParty(doc);
+  const res = await handleOAuthRequest(
+    new Request(`https://worker.example.com/oauth/authorize?client_id=${encodeURIComponent(THIRD_PARTY_CLIENT_ID)}&state=state-authcode-only`),
+    env,
+  );
+  assert.equal(res!.status, 400);
+  const body = await res!.json() as { error: string; error_description: string };
+  assert.equal(body.error, "unauthorized_client");
+  assert.match(body.error_description, /web_authorization_poll/);
+  const kv = env.OAUTH_KV as unknown as MockKV;
+  assert.ok(!kv.list().some((k) => k.startsWith("web_auth_state:")), "no state is issued");
+});
+
+test("CIMD client whose host resolves to a private address is refused without fetching the document", async () => {
+  const env = makeEnv();
+  serveThirdParty(thirdPartyDoc(), ["10.0.0.7"]);
+  const res = await handleOAuthRequest(
+    new Request(`https://worker.example.com/oauth/authorize?client_id=${encodeURIComponent(THIRD_PARTY_CLIENT_ID)}&state=state-private-host`),
+    env,
+  );
+  assert.equal(res!.status, 401);
+  const body = await res!.json() as { error: string; error_description: string };
+  assert.equal(body.error, "invalid_client");
+  assert.match(body.error_description, /special-use/);
+  assert.ok(!fetchLog.includes(THIRD_PARTY_CLIENT_ID));
+});
+
+test("invalid CIMD documents and malformed client_id URLs are refused with invalid_client and not cached", async () => {
+  const env = makeEnv();
+  serveThirdParty(thirdPartyDoc({ client_id: "https://elsewhere.example.org/c.json" }));
+  const mismatch = await handleOAuthRequest(
+    formRequest("https://worker.example.com/oauth/token", {
+      grant_type: WEB_AUTH_POLL_GRANT,
+      state: "state-mismatch-doc",
+      client_id: THIRD_PARTY_CLIENT_ID,
+    }),
+    env,
+  );
+  assert.equal(mismatch!.status, 401);
+  assert.match((await mismatch!.json() as { error_description: string }).error_description, /does not match/);
+  const kv = env.OAUTH_KV as unknown as MockKV;
+  assert.ok(!kv.list().some((k) => k.startsWith("cimd:")));
+
+  for (const clientId of ["http://client.example.org/c.json", "https://127.0.0.1/c.json", "https://client.example.org/c.json#x"]) {
+    const res = await handleOAuthRequest(
+      new Request(`https://worker.example.com/oauth/authorize?client_id=${encodeURIComponent(clientId)}&state=state-bad-url`),
+      env,
+    );
+    assert.equal(res!.status, 401, clientId);
+    assert.equal((await res!.json() as { error: string }).error, "invalid_client");
+  }
+});
+
+test("DCR clients keep working unchanged next to CIMD", async () => {
+  const env = makeEnv();
+  const clientId = await registerClient(env);
+  const issued = await onboardUser(env, clientId, "state-dcr-unchanged", { id: 503, login: "dcr" }, []);
+  assert.ok(!fetchLog.some((u) => u.includes("cloudflare-dns.com")));
+  const rotRes = await handleOAuthRequest(
+    formRequest("https://worker.example.com/oauth/token", {
+      grant_type: "refresh_token",
+      refresh_token: issued.refresh_token,
+      client_id: clientId,
+    }),
+    env,
+  );
+  assert.equal(rotRes!.status, 200);
 });

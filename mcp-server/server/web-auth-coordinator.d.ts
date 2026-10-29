@@ -6,6 +6,7 @@ export interface CoordinatedTokens {
   access_token: string;
   refresh_token?: string;
   expires_at?: number;
+  client_id?: string;
   web_auth?: { scope: string; generation: string };
 }
 export function webAuthScope(workerUrl: string, tokenDir: string): Promise<{

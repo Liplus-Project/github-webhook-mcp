@@ -14,10 +14,17 @@
  *
  * Endpoints served:
  *   GET  /.well-known/oauth-authorization-server   RFC 8414 metadata
- *   POST /oauth/register                           RFC 7591 dynamic registration
+ *   GET  /oauth/client-metadata.json               First-party Client ID Metadata Document (#254)
+ *   POST /oauth/register                           RFC 7591 dynamic registration (deprecated in
+ *                                                  MCP 2026-07-28, kept for compatibility)
  *   GET  /oauth/authorize                          State issuance + GitHub redirect
  *   GET  /oauth/callback                           GitHub code → bearer token exchange
  *   POST /oauth/token                              Web auth polling + refresh_token
+ *
+ * Client identification (#254): a client_id is either an opaque id issued by
+ * /oauth/register or an https URL naming a Client ID Metadata Document
+ * (draft-ietf-oauth-client-id-metadata-document). URL ids are resolved and
+ * validated by client-metadata.ts; opaque ids by the KV client record.
  *
  * GitHub upstream (web flow):
  *   https://github.com/login/oauth/authorize
@@ -47,8 +54,16 @@ import {
   randomToken,
   type ClientRecord,
   type GrantRecord,
+  kvClientMetadataCache,
   type WebAuthStateRecord,
 } from "./oauth-store.js";
+import {
+  CLIENT_METADATA_PATH,
+  ClientMetadataError,
+  firstPartyClientMetadata,
+  isUrlClientId,
+  resolveClientMetadata,
+} from "./client-metadata.js";
 
 /** GitHub web OAuth endpoints. */
 const GITHUB_AUTHORIZE_URL = "https://github.com/login/oauth/authorize";
@@ -122,6 +137,9 @@ export async function handleOAuthRequest(
   if (path === "/.well-known/oauth-authorization-server") {
     return handleMetadata(request);
   }
+  if (path === CLIENT_METADATA_PATH && request.method === "GET") {
+    return handleClientMetadataDocument(request);
+  }
   if (path === "/oauth/register" && request.method === "POST") {
     return handleRegister(request, env);
   }
@@ -144,6 +162,9 @@ function handleMetadata(request: Request): Response {
   const origin = new URL(request.url).origin;
   return jsonResponse({
     issuer: origin,
+    // CIMD is the preferred registration path (MCP 2026-07-28); DCR stays for
+    // clients that predate it.
+    client_id_metadata_document_supported: true,
     registration_endpoint: `${origin}/oauth/register`,
     authorization_endpoint: `${origin}/oauth/authorize`,
     token_endpoint: `${origin}/oauth/token`,
@@ -155,6 +176,69 @@ function handleMetadata(request: Request): Response {
     token_endpoint_auth_methods_supported: ["none", "client_secret_post"],
     scopes_supported: [],
   });
+}
+
+// ── /oauth/client-metadata.json (first-party CIMD) ────────────────
+
+/**
+ * The Client ID Metadata Document of the bridges shipped in this repository.
+ * Its URL is the bridges' client_id against this Worker. The Worker resolves
+ * that client_id locally (resolveClientMetadata), so this endpoint exists for
+ * transparency and for any other party that dereferences the client_id.
+ */
+function handleClientMetadataDocument(request: Request): Response {
+  const origin = new URL(request.url).origin;
+  return new Response(JSON.stringify(firstPartyClientMetadata(origin)), {
+    status: 200,
+    headers: {
+      "Content-Type": "application/json",
+      "Cache-Control": "public, max-age=3600",
+    },
+  });
+}
+
+// ── Client resolution (DCR record or CIMD URL) ────────────────────
+
+/**
+ * Check that `clientId` names a known client allowed to use `grantType`.
+ * Returns null when the client is acceptable, otherwise the error response.
+ *
+ * Opaque ids keep their pre-#254 behaviour exactly: a KV record must exist and
+ * no grant check is applied. URL ids must resolve to a valid metadata document
+ * that declares the grant; this server implements only the web-auth poll grant
+ * and refresh_token, so a document declaring just authorization_code is
+ * refused here instead of failing later in a flow it cannot complete.
+ */
+async function checkClient(
+  env: OAuthEnv,
+  clientId: string,
+  origin: string,
+  grantType: string,
+): Promise<Response | null> {
+  if (!isUrlClientId(clientId)) {
+    const client = await getClient(env.OAUTH_KV, clientId);
+    return client ? null : oauthError("invalid_client", "Unknown client_id", 401);
+  }
+  let grantTypes: string[];
+  try {
+    const doc = await resolveClientMetadata(clientId, origin, kvClientMetadataCache(env.OAUTH_KV));
+    grantTypes = doc.grant_types;
+  } catch (err) {
+    if (err instanceof ClientMetadataError) {
+      console.log(`[oauth] client metadata rejected: ${err.message}`);
+      return oauthError("invalid_client", err.message, 401);
+    }
+    throw err;
+  }
+  if (!grantTypes.includes(grantType)) {
+    return oauthError(
+      "unauthorized_client",
+      `Client metadata does not declare grant_type ${grantType}. ` +
+        `This server supports only ${WEB_AUTH_POLL_GRANT} and refresh_token.`,
+      400,
+    );
+  }
+  return null;
 }
 
 // ── /oauth/register (RFC 7591) ────────────────────────────────────
@@ -220,10 +304,8 @@ async function handleAuthorize(request: Request, env: OAuthEnv): Promise<Respons
     return oauthError("invalid_request", "state parameter is required (min 8 chars)", 400);
   }
 
-  const client = await getClient(env.OAUTH_KV, clientId);
-  if (!client) {
-    return oauthError("invalid_client", "Unknown client_id", 401);
-  }
+  const rejected = await checkClient(env, clientId, url.origin, WEB_AUTH_POLL_GRANT);
+  if (rejected) return rejected;
 
   const now = nowSec();
   const record: WebAuthStateRecord = {
@@ -413,12 +495,13 @@ function escapeHtml(s: string): string {
 async function handleToken(request: Request, env: OAuthEnv): Promise<Response> {
   const form = await readForm(request);
   const grantType = form.get("grant_type");
+  const origin = new URL(request.url).origin;
 
   if (grantType === WEB_AUTH_POLL_GRANT) {
-    return handleTokenWebAuthPoll(form, env);
+    return handleTokenWebAuthPoll(form, env, origin);
   }
   if (grantType === "refresh_token") {
-    return handleTokenRefresh(form, env);
+    return handleTokenRefresh(form, env, origin);
   }
   return oauthError(
     "unsupported_grant_type",
@@ -438,6 +521,7 @@ async function handleToken(request: Request, env: OAuthEnv): Promise<Response> {
 async function handleTokenWebAuthPoll(
   form: URLSearchParams,
   env: OAuthEnv,
+  origin: string,
 ): Promise<Response> {
   const state = form.get("state");
   const clientId = form.get("client_id");
@@ -445,10 +529,8 @@ async function handleTokenWebAuthPoll(
     return oauthError("invalid_request", "state and client_id are required", 400);
   }
 
-  const client = await getClient(env.OAUTH_KV, clientId);
-  if (!client) {
-    return oauthError("invalid_client", "Unknown client_id", 401);
-  }
+  const rejected = await checkClient(env, clientId, origin, WEB_AUTH_POLL_GRANT);
+  if (rejected) return rejected;
 
   const record = await getWebAuthState(env.OAUTH_KV, state);
   if (!record || record.client_id !== clientId) {
@@ -534,17 +616,19 @@ async function issueTokensForNewGrant(
   return { access_token: accessToken, refresh_token: refreshToken };
 }
 
-async function handleTokenRefresh(form: URLSearchParams, env: OAuthEnv): Promise<Response> {
+async function handleTokenRefresh(
+  form: URLSearchParams,
+  env: OAuthEnv,
+  origin: string,
+): Promise<Response> {
   const refreshTokenIn = form.get("refresh_token");
   const clientId = form.get("client_id");
   if (!refreshTokenIn || !clientId) {
     return oauthError("invalid_request", "refresh_token and client_id are required", 400);
   }
 
-  const client = await getClient(env.OAUTH_KV, clientId);
-  if (!client) {
-    return oauthError("invalid_client", "Unknown client_id", 401);
-  }
+  const rejected = await checkClient(env, clientId, origin, "refresh_token");
+  if (rejected) return rejected;
 
   const refresh = await getRefreshToken(env.OAUTH_KV, refreshTokenIn);
   if (!refresh) {

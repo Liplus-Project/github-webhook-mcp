@@ -20,7 +20,7 @@ The proxy's two protocol faces are independent: it still speaks the 2025-era MCP
 - Speaks stdio MCP locally to your client.
 - Forwards `tools/call` to the Worker's Streamable HTTP MCP endpoint (`/mcp`).
 - Optionally maintains a WebSocket connection to the Worker's `/events` endpoint and re-emits incoming webhook events as Claude Code `claude/channel` notifications (real-time push, no polling).
-- Handles **Worker-hosted web OAuth** against the Worker and Dynamic Client Registration (RFC 7591). No localhost callback port is used: GitHub's `redirect_uri` is pinned to the Worker itself, so the flow works reliably across process restarts and concurrent client instances.
+- Handles **Worker-hosted web OAuth** against the Worker. The proxy identifies itself with an OAuth Client ID Metadata Document served by the Worker, and falls back to Dynamic Client Registration (RFC 7591) against Workers that do not advertise support. No localhost callback port is used: GitHub's `redirect_uri` is pinned to the Worker itself, so the flow works reliably across process restarts and concurrent client instances.
 - Caches access and refresh tokens under `~/.github-webhook-mcp/` (mode `0600`) and refreshes them silently before expiry. On `invalid_grant` during refresh, the proxy re-reads the tokens file to adopt any rotation performed by a sibling process before falling back to a full re-authorization.
 
 ## Requirements
@@ -152,8 +152,8 @@ Notifications are one-way: they include event type, repo, action, title, sender,
 
 OAuth client registration and tokens are stored in:
 
-- `~/.github-webhook-mcp/oauth-client.json` (dynamic client registration)
-- `~/.github-webhook-mcp/oauth-tokens.json` (access + refresh tokens)
+- `~/.github-webhook-mcp/oauth-client.json` (dynamic client registration; only written when the Worker does not support Client ID Metadata Documents)
+- `~/.github-webhook-mcp/oauth-tokens.json` (access + refresh tokens, and the `client_id` they were issued to)
 
 Delete these files to force a fresh authorization flow.
 
@@ -215,7 +215,7 @@ The Worker purges stored events automatically so Durable Object storage stays bo
 ## Authentication flow
 
 1. On first tool call (or on startup if cached tokens exist), the proxy discovers OAuth metadata at `${WEBHOOK_WORKER_URL}/.well-known/oauth-authorization-server`.
-2. It performs Dynamic Client Registration (RFC 7591) if no client is cached, declaring support for the `urn:ietf:params:oauth:grant-type:web_authorization_poll` and `refresh_token` grant types (public client, no secret — the Worker itself uses its own `GITHUB_CLIENT_SECRET` to talk to GitHub).
+2. It picks its client_id. If the metadata carries `client_id_metadata_document_supported: true` and an https `issuer`, the client_id is `<issuer>/oauth/client-metadata.json` — a Client ID Metadata Document the Worker serves for this proxy — and no registration request is made. Otherwise it performs Dynamic Client Registration (RFC 7591) if no client is cached, declaring support for the `urn:ietf:params:oauth:grant-type:web_authorization_poll` and `refresh_token` grant types. Either way it is a public client with no secret — the Worker itself uses its own `GITHUB_CLIENT_SECRET` to talk to GitHub. Refresh always presents the client_id the tokens were issued to, so tokens obtained through an earlier registration keep refreshing after the Worker gains CIMD support.
 3. It generates a random `state` and opens `${WEBHOOK_WORKER_URL}/oauth/authorize?client_id=<cid>&state=<state>` in your default browser. The Worker stores a pending state record and 302-redirects to GitHub's standard `https://github.com/login/oauth/authorize`, with `redirect_uri` pinned to the Worker's own `/oauth/callback` (no localhost).
 4. You sign in on GitHub and approve. GitHub redirects back to `${WEBHOOK_WORKER_URL}/oauth/callback?code=<code>&state=<state>`. The Worker exchanges the code for a GitHub access token (confidential client), fetches your GitHub profile + installations, and issues its own opaque access/refresh token pair bound to that grant. The browser tab shows "Authorization complete".
 5. Meanwhile the proxy polls `${WEBHOOK_WORKER_URL}/oauth/token` with `grant_type=urn:ietf:params:oauth:grant-type:web_authorization_poll` against the same state. It receives `authorization_pending` until the callback completes, then receives the Worker-issued token pair on the next poll.
@@ -226,7 +226,7 @@ Concurrent bridges for the same OS user, normalized Worker URL and real authenti
 
 The owner holds an exclusive listener on `127.0.0.1`, on one port derived from that scope's hash. This is private coordination, while the OAuth callback remains on the Worker. Every IPC request requires a random capability from a restrictive `~/.github-webhook-mcp/web-auth-<scope>.json` record. Neither OAuth credentials nor unauthorized URL/state metadata are returned over IPC. Owner exit releases the listener; expiry aborts and fences its writes. A healthy owner repairs a damaged record; a replacement cannot be deleted or overwritten by its predecessor. Unknown listeners, blocked loopback listening and hash-port collisions fail closed with a retryable coordination error, rather than opening another flow on a different port.
 
-Existing global token/client files still lack issuer metadata; this change does not provide general cross-Worker cache isolation or change DCR/refresh semantics.
+Existing global token/client files still lack issuer metadata; this does not provide general cross-Worker cache isolation.
 
 ## Troubleshooting
 
