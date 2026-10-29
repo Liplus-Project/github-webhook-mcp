@@ -9,6 +9,7 @@
  *
  * Routes:
  *   GET  /.well-known/oauth-authorization-server   RFC 8414 metadata (oauth.ts)
+ *   GET  /oauth/client-metadata.json               First-party Client ID Metadata Document (oauth.ts)
  *   POST /oauth/register                           RFC 7591 dynamic registration (oauth.ts)
  *   GET  /oauth/authorize                          State issuance + GitHub redirect (oauth.ts)
  *   GET  /oauth/callback                           GitHub code → bearer token exchange (oauth.ts)

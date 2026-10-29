@@ -13,12 +13,15 @@
  *   token:{access_token}                → TokenRecord (access token → grant ref)
  *   refresh:{refresh_token}             → RefreshRecord (refresh token → grant ref)
  *   grant:{grant_id}                    → GrantRecord (GitHub props + issued tokens)
+ *   cimd:{sha256(client_id URL)}        → CachedClientMetadata (validated Client ID
+ *                                         Metadata Document, bounded TTL, #254)
  *
  * grant_id format = `{userId}:{random}` — same general shape as the legacy provider
  * used, which keeps `wrangler tail` diagnostics familiar.
  */
 
 import type { GitHubUserProps } from "./oauth.js";
+import type { ClientMetadataCache, ClientMetadataDocument } from "./client-metadata.js";
 
 export interface ClientRecord {
   client_id: string;
@@ -130,6 +133,44 @@ export async function putClient(kv: KVNamespace, record: ClientRecord): Promise<
 
 export async function getClient(kv: KVNamespace, clientId: string): Promise<ClientRecord | null> {
   return getJson<ClientRecord>(kv, `client:${clientId}`);
+}
+
+// ── Client ID Metadata Document cache (#254) ─────────────────────
+
+interface CachedClientMetadata {
+  client_id: string;
+  document: ClientMetadataDocument;
+  /** Absolute expiry time (epoch seconds); KV expiry is the backstop. */
+  expires_at: number;
+}
+
+async function clientMetadataKey(clientId: string): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(clientId));
+  const hex = Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, "0")).join("");
+  return `cimd:${hex}`;
+}
+
+/**
+ * KV-backed cache for validated Client ID Metadata Documents. Only documents
+ * that passed validation are written (errors are never cached), and the TTL is
+ * already bounded by the caller (client-metadata.ts cacheTtlFrom).
+ */
+export function kvClientMetadataCache(kv: KVNamespace): ClientMetadataCache {
+  return {
+    async get(clientId) {
+      const record = await getJson<CachedClientMetadata>(kv, await clientMetadataKey(clientId));
+      if (!record || record.client_id !== clientId || record.expires_at <= nowSec()) return null;
+      return record.document;
+    },
+    async put(clientId, document, ttlSeconds) {
+      const record: CachedClientMetadata = {
+        client_id: clientId,
+        document,
+        expires_at: nowSec() + ttlSeconds,
+      };
+      await putJson(kv, await clientMetadataKey(clientId), record, ttlSeconds);
+    },
+  };
 }
 
 // ── Web auth state records (Worker-hosted web OAuth polling) ──────

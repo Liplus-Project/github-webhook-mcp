@@ -17,6 +17,13 @@
  *      a sibling Claude Code process may have refreshed already, so we adopt
  *      its rotation rather than starting a fresh web flow.
  *
+ * Client identity (#254): when the Worker advertises
+ * `client_id_metadata_document_supported`, the bridge's client_id is the URL
+ * of the Client ID Metadata Document the Worker serves for it
+ * (`<issuer>/oauth/client-metadata.json`); otherwise it falls back to Dynamic
+ * Client Registration. The client_id a grant was issued to is saved with the
+ * tokens so refresh keeps presenting it.
+ *
  * The bridge has two independent protocol faces (issue #249):
  *
  *   Claude Desktop -> bridge : SDK v1 stdio server, 2025-era. Unchanged.
@@ -43,6 +50,7 @@ import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { writeFileSync } from "node:fs";
 import { coordinateWebAuth } from "../../mcp-server/server/web-auth-coordinator.js";
+import { refreshClientId, selectOAuthClient } from "../../mcp-server/server/oauth-client.js";
 import { AsyncLocalStorage } from "node:async_hooks";
 
 const WORKER_URL = process.env.WEBHOOK_WORKER_URL || "https://github-webhook.smgjp.com";
@@ -54,6 +62,8 @@ const OBSERVER_ENABLED = process.env.WEBHOOK_OBSERVER === "1";
 interface TokenData {
   /** Flow marker for files produced by this client (v0.11.1+). */
   flow?: string;
+  /** client_id the grant was issued to (CIMD URL or DCR id); absent before #254. */
+  client_id?: string;
   access_token: string;
   refresh_token?: string;
   expires_at?: number; // Unix timestamp in ms
@@ -108,6 +118,8 @@ let _pendingWebAuthError: string | null = null;
 // ── OAuth Discovery & Registration ───────────────────────────────────────────
 
 interface OAuthMetadata {
+  issuer?: string;
+  client_id_metadata_document_supported?: boolean;
   authorization_endpoint?: string;
   token_endpoint: string;
   registration_endpoint?: string;
@@ -264,7 +276,7 @@ interface TokenPollingResponse {
  */
 async function pollForWebAuthToken(
   metadata: OAuthMetadata,
-  client: ClientRegistration,
+  client: { client_id: string },
   state: string,
   expiresInSec: number, signal: AbortSignal,
 ): Promise<TokenPollingResponse> {
@@ -353,7 +365,8 @@ async function performOAuthFlow(): Promise<TokenData> {
     },
     async runOwner({ signal, assertOwner, pending }) {
       const metadata = await discoverOAuthMetadata(signal);
-      const client = await ensureClientRegistration(metadata, signal, assertOwner);
+      const client = await selectOAuthClient(metadata, WORKER_URL,
+        () => ensureClientRegistration(metadata, signal, assertOwner));
       assertOwner();
       const state = generateState();
       const endpoint = metadata.authorization_endpoint || `${WORKER_URL}/oauth/authorize`;
@@ -368,8 +381,8 @@ async function performOAuthFlow(): Promise<TokenData> {
       openBrowser(authorizeUrl);
       const data = await pollForWebAuthToken(metadata, client, state, 600, signal);
       if (!data.access_token) throw new Error("Token response missing access_token");
-      return { flow: TOKENS_FLOW_MARKER, access_token: data.access_token,
-        refresh_token: data.refresh_token,
+      return { flow: TOKENS_FLOW_MARKER, client_id: client.client_id,
+        access_token: data.access_token, refresh_token: data.refresh_token,
         expires_at: data.expires_in ? Date.now() + data.expires_in * 1000 : undefined };
     },
   }).then((tokens) => {
@@ -395,11 +408,12 @@ interface RefreshError extends Error {
   bodyText?: string;
 }
 
-async function refreshAccessToken(refreshToken: string): Promise<TokenData> {
+async function refreshAccessToken(refreshToken: string, tokenClientId?: string): Promise<TokenData> {
   if (OBSERVER_ENABLED) throw new ObserverAuthRequiredError();
   const metadata = await discoverOAuthMetadata();
-  const client = await loadClientRegistration();
-  if (!client) throw new Error("No client registration found");
+  const clientId = refreshClientId(tokenClientId,
+    tokenClientId ? null : await loadClientRegistration());
+  if (!clientId) throw new Error("No client registration found");
 
   const res = await fetch(metadata.token_endpoint, {
     method: "POST",
@@ -407,7 +421,7 @@ async function refreshAccessToken(refreshToken: string): Promise<TokenData> {
     body: new URLSearchParams({
       grant_type: "refresh_token",
       refresh_token: refreshToken,
-      client_id: client.client_id,
+      client_id: clientId,
     }),
   });
 
@@ -438,6 +452,7 @@ async function refreshAccessToken(refreshToken: string): Promise<TokenData> {
 
   const tokens: TokenData = {
     flow: TOKENS_FLOW_MARKER,
+    client_id: clientId,
     access_token: data.access_token,
     refresh_token: data.refresh_token || refreshToken,
     expires_at: data.expires_in ? Date.now() + data.expires_in * 1000 : undefined,
@@ -480,7 +495,7 @@ async function tryRefreshViaDiskReread(previousRefreshToken: string): Promise<To
       }
       attempts++;
       try {
-        return await refreshAccessToken(fresh.refresh_token);
+        return await refreshAccessToken(fresh.refresh_token, fresh.client_id);
       } catch (err) {
         console.error("[oauth] disk-reread refresh also failed:",
           err instanceof Error ? err.message : err);
@@ -495,12 +510,12 @@ async function tryRefreshViaDiskReread(previousRefreshToken: string): Promise<To
   }
 }
 
-function refreshWithRecovery(refreshToken: string): Promise<TokenData> {
+function refreshWithRecovery(refreshToken: string, clientId?: string): Promise<TokenData> {
   if (!_refreshLock) {
     // Capture the failed generation before any caller can replace the cache.
     _refreshLock = (async () => {
       try {
-        return await refreshAccessToken(refreshToken);
+        return await refreshAccessToken(refreshToken, clientId);
       } catch (err) {
         if (isInvalidGrantError(err)) {
           const recovered = await tryRefreshViaDiskReread(refreshToken);
@@ -571,7 +586,7 @@ async function getAccessToken(): Promise<string> {
 
     if (_cachedTokens.refresh_token) {
       try {
-        _cachedTokens = await refreshWithRecovery(_cachedTokens.refresh_token);
+        _cachedTokens = await refreshWithRecovery(_cachedTokens.refresh_token, _cachedTokens.client_id);
         return _cachedTokens.access_token;
       } catch (err) {
         console.error("[oauth] refresh failed, falling back to full OAuth flow:", (err as Error).message || err);
@@ -620,7 +635,7 @@ async function getAccessTokenForToolCall(): Promise<string> {
 
     if (_cachedTokens.refresh_token) {
       try {
-        _cachedTokens = await refreshWithRecovery(_cachedTokens.refresh_token);
+        _cachedTokens = await refreshWithRecovery(_cachedTokens.refresh_token, _cachedTokens.client_id);
         return _cachedTokens.access_token;
       } catch (err) {
         console.error(
