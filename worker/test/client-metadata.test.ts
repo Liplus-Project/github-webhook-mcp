@@ -248,9 +248,16 @@ test("a stalled server is cut off by the fetch timeout", { timeout: 15_000 }, as
   const { fn } = stubFetch((_url, init) => new Promise<Response>((_resolve, reject) => {
     init?.signal?.addEventListener("abort", () => reject(init.signal!.reason), { once: true });
   }));
-  const started = Date.now();
-  await rejects(fetchClientMetadataDocument(CLIENT_ID, { fetch: fn, resolve: publicResolver }), /timed out/);
-  assert.ok(Date.now() - started < 10_000);
+  // AbortSignal.timeout's timer is unref'd in Node; with only the stalled
+  // fetch pending, the event loop would drain before it fires.
+  const keepAlive = setInterval(() => {}, 1000);
+  try {
+    const started = Date.now();
+    await rejects(fetchClientMetadataDocument(CLIENT_ID, { fetch: fn, resolve: publicResolver }), /timed out/);
+    assert.ok(Date.now() - started < 10_000);
+  } finally {
+    clearInterval(keepAlive);
+  }
 });
 
 test("cache lifetime honours Cache-Control within the configured bounds", () => {
